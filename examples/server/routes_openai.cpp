@@ -261,7 +261,7 @@ void register_openai_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
         try {
             if (!runtime_supports_generation_mode(*runtime, IMG_GEN)) {
                 res.status = 400;
-                res.set_content(json({{"error", unsupported_generation_mode_error(IMG_GEN)}}).dump(), "application/json");
+                res.set_content(json({{"error", unsupported_generation_mode_error(*runtime, IMG_GEN)}}).dump(), "application/json");
                 return;
             }
 
@@ -335,7 +335,7 @@ void register_openai_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
         try {
             if (!runtime_supports_generation_mode(*runtime, IMG_GEN)) {
                 res.status = 400;
-                res.set_content(json({{"error", unsupported_generation_mode_error(IMG_GEN)}}).dump(), "application/json");
+                res.set_content(json({{"error", unsupported_generation_mode_error(*runtime, IMG_GEN)}}).dump(), "application/json");
                 return;
             }
 

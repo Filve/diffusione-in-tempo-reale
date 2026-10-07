@@ -349,6 +349,8 @@ void sd_ctx_params_init(sd_ctx_params_t* sd_ctx_params) {
     sd_ctx_params->rpc_servers               = nullptr;
     sd_ctx_params->model_args                = nullptr;
     sd_ctx_params->pulid_weights_path        = nullptr;
+    sd_ctx_params->memory_guard              = 0;
+    sd_ctx_params->disable_backend_fallback  = false;
 }
 
 char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
@@ -385,6 +387,7 @@ char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
              "sampler_rng_type: %s\n"
              "prediction: %s\n"
              "max_vram: %s\n"
+             "memory_guard: %d\n"
              "disable_prefetch: %s\n"
              "disable_segmented_compute: %s\n"
              "eager_load: %s\n"
@@ -393,6 +396,7 @@ char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
              "split_mode: %s\n"
              "model_args: %s\n"
              "auto_fit: %s\n"
+             "disable_backend_fallback: %s\n"
              "flash_attn: %s\n"
              "diffusion_flash_attn: %s\n"
              "sage_attn: %s\n"
@@ -426,6 +430,7 @@ char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
              sd_rng_type_name(sd_ctx_params->sampler_rng_type),
              sd_prediction_name(sd_ctx_params->prediction),
              SAFE_STR(sd_ctx_params->max_vram),
+             sd_ctx_params->memory_guard,
              BOOL_STR(sd_ctx_params->disable_prefetch),
              BOOL_STR(sd_ctx_params->disable_segmented_compute),
              BOOL_STR(sd_ctx_params->eager_load),
@@ -434,6 +439,7 @@ char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
              SAFE_STR(sd_ctx_params->split_mode),
              SAFE_STR(sd_ctx_params->model_args),
              BOOL_STR(sd_ctx_params->auto_fit),
+             BOOL_STR(sd_ctx_params->disable_backend_fallback),
              BOOL_STR(sd_ctx_params->flash_attn),
              BOOL_STR(sd_ctx_params->diffusion_flash_attn),
              BOOL_STR(sd_ctx_params->sage_attn),

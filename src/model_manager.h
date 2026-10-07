@@ -10,6 +10,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "core/memory_watchdog.h"
 #include "device_residency_manager.h"
 #include "model_component.h"
 #include "model_loader.h"
@@ -114,6 +115,7 @@ private:
     bool writable_mmap_              = false;
     bool segmented_compute_disabled_ = false;
     bool prefetch_disabled_          = false;
+    sd::MemoryWatchdog memory_watchdog_;
 
     void finish_compute_backend_usage(const std::vector<TensorState*>& states);
     void release_all();
@@ -161,6 +163,9 @@ private:
                                  const std::vector<TensorState*>& states,
                                  bool log_details = false) const;
 
+    sd::MemoryWatchdog::Sample memory_guard_sample(const DeviceMemoryRequest& request) const;
+    bool memory_guard_ok(const DeviceMemoryRequest& request) const;
+
     ggml_backend_buffer_type_t params_buffer_type_for(const TensorState& state) const;
     ggml_backend_buffer_type_t split_buffer_type_for(const TensorState& state) const;
     void release_compute_staging_blocks(bool force                                            = false,
@@ -200,6 +205,7 @@ public:
         segmented_compute_disabled_ = disabled;
     }
     void set_prefetch_disabled(bool disabled) { prefetch_disabled_ = disabled; }
+    void set_memory_guard_percent(int percent) { memory_watchdog_.set_threshold_percent(percent); }
     void set_enable_mmap(bool enable_mmap) { enable_mmap_ = enable_mmap; }
     void set_writable_mmap(bool writable_mmap) { writable_mmap_ = writable_mmap; }
     void set_common_ignore_tensors(std::set<std::string> ignore_tensors);
@@ -275,7 +281,9 @@ public:
     bool fits_compute_backend_capacity(const DeviceMemoryRequest& request,
                                        const std::vector<ggml_tensor*>& required_params) const override;
     bool segmented_compute_enabled() const override { return !segmented_compute_disabled_; }
-    bool prefetch_enabled() const override { return !prefetch_disabled_; }
+    bool prefetch_enabled() const override {
+        return !prefetch_disabled_ && !memory_watchdog_.prefetch_suspended();
+    }
     void release_compute_backend_params(const std::vector<ggml_tensor*>& tensors) override;
     void evict_compute_backend_params(const std::vector<ggml_tensor*>& tensors) override;
     WeightResidencyInfo inspect_compute_backend_params(

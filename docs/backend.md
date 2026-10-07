@@ -89,7 +89,20 @@ single-device segmented execution and next-segment prefetch are disabled for
 the split module. `--max-vram` can still provide the per-device limits used by
 layer split and auto-fit.
 
-Use `--list-devices` to see the device names available on the system.
+Use `--list-devices` to see the device names available on the system. Each line
+reports `name`, device type (`cpu`, `gpu`, `igpu`, `accel`), description, and
+free/total memory when the backend reports it. Host applications can query the
+same information through `sd_get_device_count()` / `sd_get_device_info()` in
+the C API.
+
+## CPU fallback
+
+If a requested backend is unavailable at context creation (for example a
+binary built with CUDA running on a machine without a CUDA device, or a device
+that fails to initialize), the context falls back to the `cpu` backend with a
+warning instead of failing. Explicit `--params-backend` and `--split-mode`
+assignments are discarded in that case. Pass `--disable-backend-fallback`
+(or set `disable_backend_fallback` in `sd_ctx_params_t`) to fail instead.
 
 ### Row split (`--split-mode row`)
 

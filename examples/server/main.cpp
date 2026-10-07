@@ -50,7 +50,7 @@ static void parse_args(int argc,
     const bool random_seed_requested = default_gen_params.seed < 0;
 
     if (!svr_params.resolve_and_validate() ||
-        !ctx_params.resolve_and_validate(IMG_GEN) ||
+        !ctx_params.resolve_and_validate(IMG_GEN, /*require_model=*/false) ||
         !default_gen_params.resolve_and_validate(IMG_GEN,
                                                  ctx_params.lora_model_dir,
                                                  ctx_params.hires_upscalers_dir)) {
@@ -66,6 +66,47 @@ static void parse_args(int argc,
 void sd_log_cb(enum sd_log_level_t level, const char* log, void* data) {
     SDSvrParams* svr_params = (SDSvrParams*)data;
     log_print(level, log, svr_params->log_level, svr_params->color);
+}
+
+static bool equals_constant_time(const std::string& a, const std::string& b) {
+    if (a.size() != b.size()) {
+        return false;
+    }
+    unsigned char diff = 0;
+    for (size_t i = 0; i < a.size(); i++) {
+        diff |= static_cast<unsigned char>(a[i] ^ b[i]);
+    }
+    return diff == 0;
+}
+
+static bool request_authorized(const httplib::Request& req, const std::string& api_key) {
+    const std::string bearer = req.get_header_value("Authorization");
+    if (bearer.rfind("Bearer ", 0) == 0 && equals_constant_time(bearer.substr(7), api_key)) {
+        return true;
+    }
+    return equals_constant_time(req.get_header_value("X-API-Key"), api_key);
+}
+
+static bool origin_allowed(const std::string& allowed_csv, const std::string& origin) {
+    if (allowed_csv.empty()) {
+        return true;
+    }
+    size_t start = 0;
+    while (start <= allowed_csv.size()) {
+        size_t end      = allowed_csv.find(',', start);
+        size_t len      = (end == std::string::npos ? allowed_csv.size() : end) - start;
+        std::string one = allowed_csv.substr(start, len);
+        one.erase(0, one.find_first_not_of(" \t"));
+        one.erase(one.find_last_not_of(" \t") + 1);
+        if (!one.empty() && one == origin) {
+            return true;
+        }
+        if (end == std::string::npos) {
+            break;
+        }
+        start = end + 1;
+    }
+    return false;
 }
 
 int main(int argc, const char** argv) {
@@ -87,11 +128,19 @@ int main(int argc, const char** argv) {
     LOG_VERBOSE("%s", default_gen_params.to_string().c_str());
 
     sd_ctx_params_t sd_ctx_params = ctx_params.to_sd_ctx_params_t(false);
-    SDCtxPtr sd_ctx(new_sd_ctx(&sd_ctx_params));
+    const bool model_requested    = !ctx_params.model_path.empty() || !ctx_params.diffusion_model_path.empty();
+    SDCtxPtr sd_ctx(model_requested ? new_sd_ctx(&sd_ctx_params) : nullptr);
 
-    if (sd_ctx == nullptr) {
-        LOG_ERROR("new_sd_ctx_t failed");
+    if (model_requested && sd_ctx == nullptr) {
+        LOG_ERROR("the model could not be loaded: '%s'; check the model file and the logs above, then restart the server",
+                  !ctx_params.model_path.empty() ? ctx_params.model_path.c_str()
+                                                 : ctx_params.diffusion_model_path.c_str());
         return 1;
+    }
+    if (!model_requested) {
+        LOG_WARN("starting without a model: device and upscale endpoints work, "
+                 "generation endpoints will report that no model is loaded "
+                 "(restart with -m/--diffusion-model to enable generation)");
     }
 
     std::mutex sd_ctx_mutex;
@@ -118,18 +167,25 @@ int main(int argc, const char** argv) {
 
     httplib::Server svr;
 
-    svr.set_pre_routing_handler([](const httplib::Request& req, httplib::Response& res) {
+    svr.set_pre_routing_handler([&svr_params](const httplib::Request& req, httplib::Response& res) {
         std::string origin = req.get_header_value("Origin");
         if (origin.empty()) {
             origin = "*";
         }
-        res.set_header("Access-Control-Allow-Origin", origin);
-        res.set_header("Access-Control-Allow-Credentials", "true");
-        res.set_header("Access-Control-Allow-Methods", "*");
-        res.set_header("Access-Control-Allow-Headers", "*");
+        if (origin_allowed(svr_params.cors_origins, origin)) {
+            res.set_header("Access-Control-Allow-Origin", origin);
+            res.set_header("Access-Control-Allow-Credentials", "true");
+            res.set_header("Access-Control-Allow-Methods", "*");
+            res.set_header("Access-Control-Allow-Headers", "*");
+        }
 
         if (req.method == "OPTIONS") {
             res.status = 204;
+            return httplib::Server::HandlerResponse::Handled;
+        }
+        if (!svr_params.api_key.empty() && !request_authorized(req, svr_params.api_key)) {
+            res.status = 401;
+            res.set_content(R"({"error":"unauthorized: missing or invalid API key"})", "application/json");
             return httplib::Server::HandlerResponse::Handled;
         }
         return httplib::Server::HandlerResponse::Unhandled;

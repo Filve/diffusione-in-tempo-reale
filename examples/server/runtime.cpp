@@ -176,7 +176,10 @@ bool runtime_supports_generation_mode(const ServerRuntime& runtime, SDMode mode)
     return true;
 }
 
-std::string unsupported_generation_mode_error(SDMode mode) {
+std::string unsupported_generation_mode_error(const ServerRuntime& runtime, SDMode mode) {
+    if (runtime.sd_ctx == nullptr) {
+        return "no model loaded; restart the server with -m/--diffusion-model";
+    }
     if (mode == VID_GEN) {
         return "loaded model does not support vid_gen";
     }
@@ -192,6 +195,8 @@ ArgOptions SDSvrParams::get_options() {
     options.string_options = {
         {"-l", "--listen-ip", "server listen ip (default: 127.0.0.1)", 0, &listen_ip},
         {"", "--serve-html-path", "path to HTML file to serve at root (optional)", 0, &serve_html_path},
+        {"", "--api-key", "require this API key on every request, via 'Authorization: Bearer <key>' or 'X-API-Key: <key>' (default: empty, no authentication)", 0, &api_key},
+        {"", "--cors-origins", "comma-separated list of allowed CORS origins, e.g. http://localhost:3000 (default: empty, any origin is reflected)", 0, &cors_origins},
     };
 
     options.int_options = {
@@ -247,6 +252,8 @@ std::string SDSvrParams::to_string() const {
         << "  listen_ip: " << listen_ip << ",\n"
         << "  listen_port: \"" << listen_port << "\",\n"
         << "  serve_html_path: \"" << serve_html_path << "\",\n"
+        << "  api_key: " << (api_key.empty() ? "(not set)" : "(set)") << ",\n"
+        << "  cors_origins: \"" << cors_origins << "\",\n"
         << "}";
     return oss.str();
 }

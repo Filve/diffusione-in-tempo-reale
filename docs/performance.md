@@ -143,6 +143,30 @@ sd-cli --diffusion-model flux1-dev.safetensors ... \
 
 Use `--params-backend diffusion=disk` instead when reducing system RAM residency is more important than avoiding repeated model-file reads.
 
+## Keep device memory below a pressure threshold (`--memory-guard`).
+
+`--memory-guard <percent>` (e.g. `--memory-guard 90`) makes capacity management
+act before allocations approach device limits instead of only when a graph no
+longer fits. For every managed device, usage is measured against the
+device-reported memory and, when set, the `--max-vram` budget — whichever is
+more pressed:
+
+- At or above the threshold, capacity checks evict unpinned weight replicas
+  (later segments first, then least recently used) until usage drops below the
+  threshold, and asynchronous next-segment prefetch is suspended until pressure
+  recovers.
+- At 5 points above the threshold the same reduction runs and is reported as
+  critical pressure.
+- The target is best effort: a graph that still fits is never failed just
+  because the threshold cannot be reached, and a warning is logged once per
+  device instead.
+
+The guard covers memory managed by the runners (weights, compute workspaces,
+caches). Driver contexts and allocations made outside the managed runners stay
+invisible to it, so it is not a hard physical cap. On backends that do not
+report device memory the guard only tracks the managed `--max-vram` budget,
+and it does not apply to CPU backends. `0` (the default) disables the guard.
+
 ## Use quantization to reduce memory usage.
 
 [quantization](./quantization_and_gguf.md)

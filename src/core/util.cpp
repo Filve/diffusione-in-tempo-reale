@@ -1131,3 +1131,60 @@ size_t sd_list_devices(char* buffer, size_t buffer_size) {
     }
     return devices.size();
 }
+
+size_t sd_get_device_count(void) {
+    if (ggml_backend_dev_count() == 0) {
+        // dynamic-backend builds discover their backend modules at runtime
+        ggml_backend_load_all();
+    }
+    return ggml_backend_dev_count();
+}
+
+bool sd_get_device_info(size_t index, sd_device_info_t* info) {
+    if (info == nullptr || index >= sd_get_device_count()) {
+        return false;
+    }
+    *info                  = sd_device_info_t{};
+    ggml_backend_dev_t dev = ggml_backend_dev_get(index);
+    const char* name       = ggml_backend_dev_name(dev);
+    const char* desc       = ggml_backend_dev_description(dev);
+    snprintf(info->name, sizeof(info->name), "%s", name ? name : "");
+    snprintf(info->description, sizeof(info->description), "%s", desc ? desc : "");
+    switch (ggml_backend_dev_type(dev)) {
+        case GGML_BACKEND_DEVICE_TYPE_CPU:
+            info->type = SD_DEVICE_TYPE_CPU;
+            break;
+        case GGML_BACKEND_DEVICE_TYPE_GPU:
+            info->type = SD_DEVICE_TYPE_GPU;
+            break;
+        case GGML_BACKEND_DEVICE_TYPE_IGPU:
+            info->type = SD_DEVICE_TYPE_IGPU;
+            break;
+        case GGML_BACKEND_DEVICE_TYPE_ACCEL:
+            info->type = SD_DEVICE_TYPE_ACCEL;
+            break;
+        default:
+            info->type = SD_DEVICE_TYPE_UNKNOWN;
+            break;
+    }
+    size_t free_bytes = 0, total_bytes = 0;
+    ggml_backend_dev_memory(dev, &free_bytes, &total_bytes);
+    info->free_memory_bytes  = free_bytes;
+    info->total_memory_bytes = total_bytes;
+    return true;
+}
+
+const char* sd_device_type_name(enum sd_device_type_t type) {
+    switch (type) {
+        case SD_DEVICE_TYPE_CPU:
+            return "cpu";
+        case SD_DEVICE_TYPE_GPU:
+            return "gpu";
+        case SD_DEVICE_TYPE_IGPU:
+            return "igpu";
+        case SD_DEVICE_TYPE_ACCEL:
+            return "accel";
+        default:
+            return "unknown";
+    }
+}

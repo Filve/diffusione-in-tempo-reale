@@ -1790,12 +1790,55 @@ ModelManager::CapacityCheck ModelManager::check_capacity(
     return result;
 }
 
+sd::MemoryWatchdog::Sample ModelManager::memory_guard_sample(const DeviceMemoryRequest& request) const {
+    sd::MemoryWatchdog::Sample sample;
+    if (!memory_watchdog_.enabled() || request.compute_backend == nullptr ||
+        sd_backend_is_cpu(request.compute_backend)) {
+        return sample;
+    }
+    auto add             = [](size_t a, size_t b) { return b > SIZE_MAX - a ? SIZE_MAX : a + b; };
+    const size_t tracked = add(compute_backend_resident_bytes(request.compute_backend),
+                               add(other_runtime_resident_bytes(request.owner_id, request.compute_backend),
+                                   request.runtime_resident_bytes));
+    auto usage_ratio     = [](const sd::MemoryWatchdog::Sample& candidate) {
+        return candidate.valid() ? static_cast<double>(candidate.used_bytes) / static_cast<double>(candidate.limit_bytes) : -1.0;
+    };
+    auto device = ggml_backend_get_device(request.compute_backend);
+    if (device != nullptr) {
+        size_t free_bytes = 0, total_bytes = 0;
+        ggml_backend_dev_memory(device, &free_bytes, &total_bytes);
+        if (total_bytes > 0) {
+            sd::MemoryWatchdog::Sample device_sample;
+            device_sample.limit_bytes = total_bytes;
+            // A free > total report (Vulkan budget underflow) means the device is exhausted.
+            device_sample.used_bytes = free_bytes > total_bytes
+                                           ? total_bytes
+                                           : add(total_bytes - free_bytes, request.pending_allocation_bytes);
+            sample                   = device_sample;
+        }
+    }
+    if (request.max_backend_bytes > 0 && request.max_backend_bytes != SIZE_MAX) {
+        sd::MemoryWatchdog::Sample budget_sample;
+        budget_sample.limit_bytes = request.max_backend_bytes;
+        budget_sample.used_bytes  = add(tracked, request.pending_allocation_bytes);
+        if (usage_ratio(budget_sample) > usage_ratio(sample)) {
+            sample = budget_sample;
+        }
+    }
+    return sample;
+}
+
+bool ModelManager::memory_guard_ok(const DeviceMemoryRequest& request) const {
+    return memory_watchdog_.classify(memory_guard_sample(request)) ==
+           sd::MemoryWatchdog::Pressure::None;
+}
+
 bool ModelManager::fits_compute_backend_capacity(
     const DeviceMemoryRequest& request,
     const std::vector<ggml_tensor*>& required_params) const {
     std::vector<TensorState*> states;
     return resolve_required_tensor_states(required_params, states, request.compute_backend) &&
-           check_capacity(request, states).fits();
+           check_capacity(request, states).fits() && memory_guard_ok(request);
 }
 
 bool ModelManager::ensure_compute_backend_capacity(
@@ -1817,14 +1860,16 @@ bool ModelManager::ensure_compute_backend_capacity(
         return true;
     }
 
-    auto fits = [&]() { return check_capacity(request, required_states).fits(); };
-    if (fits()) {
+    memory_watchdog_.observe(compute_backend, memory_guard_sample(request));
+    auto fits      = [&]() { return check_capacity(request, required_states).fits(); };
+    auto satisfied = [&]() { return fits() && memory_guard_ok(request); };
+    if (satisfied()) {
         return true;
     }
     for (const auto& entry : workspace_reclaimers_) {
         if (entry.first != request.owner_id) {
             entry.second();
-            if (fits()) {
+            if (satisfied()) {
                 return true;
             }
         }
@@ -1860,7 +1905,7 @@ bool ModelManager::ensure_compute_backend_capacity(
     auto release_eviction_states = [&]() {
         release_compute_staging_blocks(false, &eviction_states);
         release_params_storage_blocks(false, &eviction_states);
-        return fits();
+        return satisfied();
     };
 
     for (const auto& candidate_params : preferred_eviction_order) {
@@ -1893,6 +1938,16 @@ bool ModelManager::ensure_compute_backend_capacity(
         if (release_eviction_states()) {
             return true;
         }
+    }
+
+    // The guard target is best effort: never fail a graph that still fits.
+    if (fits()) {
+        memory_watchdog_.observe(compute_backend, memory_guard_sample(request));
+        if (memory_watchdog_.should_log_unreachable(compute_backend)) {
+            LOG_WARN("memory guard: cannot reduce %s below %d%% usage, continuing under pressure",
+                     ggml_backend_name(compute_backend), memory_watchdog_.threshold_percent());
+        }
+        return true;
     }
 
     const auto capacity                = check_capacity(request, required_states, true);

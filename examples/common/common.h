@@ -154,6 +154,8 @@ struct SDContextParams {
     rng_type_t sampler_rng_type    = RNG_TYPE_COUNT;
     bool offload_params_to_cpu     = false;
     std::string max_vram           = "0";
+    int memory_guard               = 0;
+    bool disable_backend_fallback  = false;
     bool disable_prefetch          = false;
     bool disable_segmented_compute = false;
     bool eager_load                = false;
@@ -187,8 +189,8 @@ struct SDContextParams {
     void build_embedding_map();
     void prepare_backend_assignments();
     bool resolve(SDMode mode);
-    bool validate(SDMode mode);
-    bool resolve_and_validate(SDMode mode);
+    bool validate(SDMode mode, bool require_model = true);
+    bool resolve_and_validate(SDMode mode, bool require_model = true);
     std::string to_string() const;
     sd_ctx_params_t to_sd_ctx_params_t(bool taesd_preview);
 };

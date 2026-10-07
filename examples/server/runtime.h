@@ -22,6 +22,8 @@ struct SDSvrParams {
     std::string listen_ip = "127.0.0.1";
     int listen_port       = 1234;
     std::string serve_html_path;
+    std::string api_key;       // empty = no authentication
+    std::string cors_origins;  // comma-separated allowlist; empty = reflect any origin
     bool normal_exit = false;
     sd_log_level_t log_level = SD_LOG_INFO;
     bool color       = false;
@@ -97,7 +99,7 @@ bool assign_output_options(VidGenJobRequest& request,
                            std::string& error_message);
 std::string video_mime_type(const std::string& output_format);
 bool runtime_supports_generation_mode(const ServerRuntime& runtime, SDMode mode);
-std::string unsupported_generation_mode_error(SDMode mode);
+std::string unsupported_generation_mode_error(const ServerRuntime& runtime, SDMode mode);
 void refresh_lora_cache(ServerRuntime& rt);
 std::string get_lora_full_path(ServerRuntime& rt, const std::string& path);
 void refresh_upscaler_cache(ServerRuntime& rt);

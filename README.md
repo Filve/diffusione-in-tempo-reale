@@ -189,6 +189,14 @@ These projects use `stable-diffusion.cpp` as a backend for their image generatio
 - [Neural-Pixel](https://github.com/Luiz-Alcantara/Neural-Pixel)
 - [KoboldCpp](https://github.com/LostRuins/koboldcpp)
 
+## Fork e autori (Italiano)
+
+Questo repository è un fork di stable-diffusion.cpp con modifiche per
+retrocompatibilità hardware (rilevamento device, fallback CPU, memory guard,
+build portabile). Il progetto originale è di leejet e dei suoi contributori;
+le modifiche del fork sono di Francesco Simeoni, tutto sotto licenza MIT.
+Guida di integrazione, sicurezza e autori: [docs/integrazione_progetti.md](./docs/integrazione_progetti.md).
+
 ## Contributors
 
 Thank you to all the people who have already contributed to stable-diffusion.cpp!

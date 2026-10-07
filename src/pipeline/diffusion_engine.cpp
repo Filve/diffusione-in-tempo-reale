@@ -631,11 +631,28 @@ bool StableDiffusionGGML::load_control_net_from_file(const std::string& path) {
 
 bool StableDiffusionGGML::init_backend() {
     std::string error;
-    if (!backend_manager.init(backend_spec.c_str(),
-                              params_backend_spec.c_str(),
-                              split_mode_spec.c_str(),
-                              &error)) {
+    if (backend_manager.init(backend_spec.c_str(),
+                             params_backend_spec.c_str(),
+                             split_mode_spec.c_str(),
+                             &error)) {
+        if (ensure_backend_pair(SDBackendModule::DIFFUSION)) {
+            return true;
+        }
+        error = "backend initialization failed";
+    }
+    const bool already_cpu = backend_spec == "cpu" && params_backend_spec.empty();
+    if (backend_fallback_disabled || already_cpu) {
         LOG_ERROR("backend config failed: %s", error.c_str());
+        return false;
+    }
+    LOG_WARN("backend config failed (%s); falling back to the cpu backend "
+             "(use --disable-backend-fallback to fail instead)",
+             error.c_str());
+    backend_spec = "cpu";
+    params_backend_spec.clear();
+    split_mode_spec.clear();
+    if (!backend_manager.init("cpu", "", "", &error)) {
+        LOG_ERROR("cpu fallback failed: %s", error.c_str());
         return false;
     }
     return ensure_backend_pair(SDBackendModule::DIFFUSION);
@@ -954,6 +971,7 @@ bool StableDiffusionGGML::init(const sd_ctx_params_t* sd_ctx_params) {
     params_backend_spec       = SAFE_STR(sd_ctx_params->params_backend);
     split_mode_spec           = SAFE_STR(sd_ctx_params->split_mode);
     auto_fit_enabled          = sd_ctx_params->auto_fit && params_backend_spec.empty();
+    backend_fallback_disabled = sd_ctx_params->disable_backend_fallback;
     max_vram_assignment.reset(0.f);
     {
         std::string error;
@@ -980,6 +998,7 @@ bool StableDiffusionGGML::init(const sd_ctx_params_t* sd_ctx_params) {
     model_manager->set_enable_mmap(enable_mmap);
     model_manager->set_segmented_compute_disabled(disable_segmented_compute);
     model_manager->set_prefetch_disabled(disable_prefetch);
+    model_manager->set_memory_guard_percent(sd_ctx_params->memory_guard);
     ModelLoader model_loader;
 
     if (!init_model_loader(model_loader, *configuration)) {

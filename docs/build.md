@@ -80,6 +80,30 @@ cmake ..
 cmake --build . --config Release
 ```
 
+## Build a portable package (dynamic backends)
+
+Backends can be built as dynamic libraries that are discovered at runtime, so a
+single package runs on machines with different accelerators: each backend
+module loads only if its driver/runtime is available, and missing modules
+simply remove the corresponding devices instead of breaking the binary.
+
+```shell
+mkdir build && cd build
+cmake .. -DSD_BUILD_SHARED_GGML_LIB=ON -DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON \
+         -DSD_VULKAN=ON   # plus any other SD_* backends to include
+cmake --build . --config Release
+```
+
+The build output contains one module per backend (e.g. `libggml-cpu.so`,
+`libggml-vulkan.so`) next to the executables; ship them together. On x86,
+`-DGGML_CPU_ALL_VARIANTS=ON` additionally builds one CPU module per
+microarchitecture level (SSE/AVX/AVX2/AVX-512) and picks the best supported one
+at runtime, which keeps the same package working on very old CPUs.
+
+`scripts/package_portable.sh <build_dir>` collects the executables, backend
+modules, and license files from a portable build into a relocatable zip under
+`dist/`.
+
 ## Build with OpenBLAS
 
 ```shell

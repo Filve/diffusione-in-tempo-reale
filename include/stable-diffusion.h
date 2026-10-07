@@ -249,7 +249,9 @@ typedef struct {
     float attn_scale;                // Override flash-attention K/V scaling; 0 keeps the model default
     const char* tokenizer;           // tokenizer.json path or main=FILE,clip-l=FILE,clip-g=FILE assignments; required for PiD and Lens
     bool sage_attn;
-    int conditioning_cache_size;  // Maximum cached conditioning entries per context; 0 disables caching (default: 4)
+    int conditioning_cache_size;    // Maximum cached conditioning entries per context; 0 disables caching (default: 4)
+    int memory_guard;               // Device memory usage percent that triggers pressure reduction (weight eviction, prefetch pause); 0 disables (default)
+    bool disable_backend_fallback;  // Fail context creation instead of falling back to the CPU backend when the requested backend is unavailable
 } sd_ctx_params_t;
 
 typedef struct {
@@ -623,6 +625,27 @@ SD_API const char* sd_version(void);
 // assignment specs. Returns the number of bytes required, excluding the null
 // terminator. Passing nullptr or buffer_size 0 only queries the required size.
 SD_API size_t sd_list_devices(char* buffer, size_t buffer_size);
+
+enum sd_device_type_t {
+    SD_DEVICE_TYPE_CPU,
+    SD_DEVICE_TYPE_GPU,
+    SD_DEVICE_TYPE_IGPU,
+    SD_DEVICE_TYPE_ACCEL,
+    SD_DEVICE_TYPE_UNKNOWN,
+};
+
+typedef struct {
+    char name[64];  // device name accepted by the --backend / --params-backend assignment specs
+    char description[128];
+    enum sd_device_type_t type;
+    uint64_t free_memory_bytes;   // 0 when the backend does not report memory
+    uint64_t total_memory_bytes;  // 0 when the backend does not report memory
+} sd_device_info_t;
+
+// Structured device enumeration for host applications.
+SD_API size_t sd_get_device_count(void);
+SD_API bool sd_get_device_info(size_t index, sd_device_info_t* info);
+SD_API const char* sd_device_type_name(enum sd_device_type_t type);
 
 // for C API, caller needs to call free_sd_images to free the memory after use
 // This helps avoid CRT problems on Windows when memory is allocated in the library but freed in the caller, which may use a different CRT.

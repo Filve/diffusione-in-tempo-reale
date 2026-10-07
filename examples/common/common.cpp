@@ -304,7 +304,7 @@ bool parse_options(int argc, const char** argv, const std::vector<ArgOptions>& o
                     }
                     try {
                         *option.target = std::stoi(argv[i]);
-                    } catch (const std::invalid_argument&) {
+                    } catch (const std::logic_error&) {
                         invalid_arg = true;
                     }
                     found_arg = true;
@@ -318,7 +318,7 @@ bool parse_options(int argc, const char** argv, const std::vector<ArgOptions>& o
                     }
                     try {
                         *option.target = std::stof(argv[i]);
-                    } catch (const std::invalid_argument&) {
+                    } catch (const std::logic_error&) {
                         invalid_arg = true;
                     }
                     found_arg = true;
@@ -576,9 +576,17 @@ ArgOptions SDContextParams::get_options() {
          "--conditioning-cache-size",
          "maximum number of conditioning results cached per model context (default: " + std::to_string(conditioning_cache_size) + ", 0 disables caching)",
          &conditioning_cache_size},
+        {"",
+         "--memory-guard",
+         "device memory usage percent that triggers pressure reduction (weight eviction, prefetch pause) before allocations fail, e.g. 90 (default: 0, disabled)",
+         &memory_guard},
     };
 
     options.bool_options = {
+        {"",
+         "--disable-backend-fallback",
+         "fail instead of falling back to the cpu backend when the requested backend is unavailable (defaults to false)",
+         true, &disable_backend_fallback},
         {"",
          "--disable-prefetch",
          "disable asynchronous next-segment weight prefetch (defaults to false)",
@@ -770,13 +778,24 @@ ArgOptions SDContextParams::get_options() {
          on_lora_apply_mode_arg},
         {"",
          "--list-devices",
-         "list available ggml backend devices (one 'name<TAB>description' per line) and exit; "
+         "list available ggml backend devices (one 'name<TAB>type<TAB>description<TAB>memory' per line) and exit; "
          "the names are the device names accepted by --backend and --params-backend",
          [](int /*argc*/, const char** /*argv*/, int /*index*/) {
-             size_t device_list_size = sd_list_devices(nullptr, 0);
-             std::vector<char> devices(device_list_size + 1);
-             sd_list_devices(devices.data(), devices.size());
-             fputs(devices.data(), stdout);
+             const size_t count = sd_get_device_count();
+             for (size_t i = 0; i < count; ++i) {
+                 sd_device_info_t info;
+                 if (!sd_get_device_info(i, &info)) {
+                     continue;
+                 }
+                 printf("%s\t%s\t%s\t", info.name, sd_device_type_name(info.type), info.description);
+                 if (info.total_memory_bytes > 0) {
+                     printf("%.2f GiB free / %.2f GiB total\n",
+                            info.free_memory_bytes / (1024.0 * 1024.0 * 1024.0),
+                            info.total_memory_bytes / (1024.0 * 1024.0 * 1024.0));
+                 } else {
+                     printf("memory not reported\n");
+                 }
+             }
              std::exit(0);
              return 0;
          }},
@@ -826,7 +845,7 @@ bool SDContextParams::resolve(SDMode mode) {
     return true;
 }
 
-bool SDContextParams::validate(SDMode mode) {
+bool SDContextParams::validate(SDMode mode, bool require_model) {
     if (conditioning_cache_size < 0) {
         LOG_ERROR("error: conditioning-cache-size must be non-negative");
         return false;
@@ -843,8 +862,11 @@ bool SDContextParams::validate(SDMode mode) {
             return false;
         }
     } else if (mode != UPSCALE && mode != METADATA && model_path.length() == 0 && diffusion_model_path.length() == 0) {
-        LOG_ERROR("error: the following arguments are required: model_path/diffusion_model\n");
-        return false;
+        if (require_model) {
+            LOG_ERROR("error: the following arguments are required: model_path/diffusion_model\n");
+            return false;
+        }
+        LOG_WARN("no model specified: generation will be unavailable until a model is provided");
     }
 
     if (mode == UPSCALE) {
@@ -862,11 +884,11 @@ bool SDContextParams::validate(SDMode mode) {
     return true;
 }
 
-bool SDContextParams::resolve_and_validate(SDMode mode) {
+bool SDContextParams::resolve_and_validate(SDMode mode, bool require_model) {
     if (!resolve(mode)) {
         return false;
     }
-    if (!validate(mode)) {
+    if (!validate(mode, require_model)) {
         return false;
     }
     return true;
@@ -938,6 +960,8 @@ std::string SDContextParams::to_string() const {
         << "  sampler_rng_type: " << sd_rng_type_name(sampler_rng_type) << ",\n"
         << "  offload_params_to_cpu: " << (offload_params_to_cpu ? "true" : "false") << ",\n"
         << "  max_vram: \"" << max_vram << "\",\n"
+        << "  memory_guard: " << memory_guard << ",\n"
+        << "  disable_backend_fallback: " << (disable_backend_fallback ? "true" : "false") << ",\n"
         << "  disable_prefetch: " << (disable_prefetch ? "true" : "false") << ",\n"
         << "  disable_segmented_compute: " << (disable_segmented_compute ? "true" : "false") << ",\n"
         << "  eager_load: " << (eager_load ? "true" : "false") << ",\n"
@@ -1020,6 +1044,8 @@ sd_ctx_params_t SDContextParams::to_sd_ctx_params_t(bool taesd_preview) {
     sd_ctx_params.force_sdxl_vae_conv_scale       = force_sdxl_vae_conv_scale;
     sd_ctx_params.vae_format                      = str_to_vae_format(vae_format);
     sd_ctx_params.max_vram                        = max_vram.c_str();
+    sd_ctx_params.memory_guard                    = memory_guard;
+    sd_ctx_params.disable_backend_fallback        = disable_backend_fallback;
     sd_ctx_params.disable_prefetch                = disable_prefetch;
     sd_ctx_params.disable_segmented_compute       = disable_segmented_compute;
     sd_ctx_params.eager_load                      = eager_load;
@@ -1360,7 +1386,11 @@ ArgOptions SDGenerationParams::get_options() {
         if (++index >= argc) {
             return -1;
         }
-        seed = std::stoll(argv[index]);
+        try {
+            seed = std::stoll(argv[index]);
+        } catch (const std::logic_error&) {
+            return -1;
+        }
         return 1;
     };
 
@@ -1425,7 +1455,7 @@ ArgOptions SDGenerationParams::get_options() {
         for (const auto& token : tokens) {
             try {
                 layers.push_back(std::stoi(token));
-            } catch (const std::invalid_argument&) {
+            } catch (const std::logic_error&) {
                 return -1;
             }
         }
@@ -1452,7 +1482,7 @@ ArgOptions SDGenerationParams::get_options() {
         for (const auto& token : tokens) {
             try {
                 layers.push_back(std::stoi(token));
-            } catch (const std::invalid_argument&) {
+            } catch (const std::logic_error&) {
                 return -1;
             }
         }
