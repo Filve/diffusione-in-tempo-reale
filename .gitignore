@@ -1,6 +1,12 @@
 build*/
 cmake-build-*/
-test/
+dist/
+# Fork: the curated robustness suite is tracked; everything else in test/ stays local.
+test/*
+!test/README.md
+!test/security_smoke.sh
+!test/api_robustness.cpp
+!test/fuzz_model_loader.py
 tests/
 .vscode/
 .idea/
