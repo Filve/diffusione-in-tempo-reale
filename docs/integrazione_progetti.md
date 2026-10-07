@@ -169,6 +169,56 @@ Configurare con `-DCMAKE_PREFIX_PATH=/percorso/di/installazione`.
 
 ### 3.2 Sequenza di inizializzazione consigliata
 
+Il ciclo di vita completo, nell'ordine tecnico corretto:
+
+1. **Logging** (prima di tutto): `sd_set_log_callback(cb, user_data)` — senza
+   callback la libreria non stampa nulla; ogni messaggio arriva con livello
+   (`SD_LOG_DEBUG/INFO/WARN/ERROR`), testo e il puntatore `user_data`.
+2. **Rilevamento hardware** (facoltativo ma consigliato):
+   `sd_get_device_count()` + `sd_get_device_info(i, &info)` — non caricano
+   nulla, si possono chiamare subito e da più thread. Alla prima chiamata
+   vengono scoperti i backend dinamici (`libggml-*`) accanto all'eseguibile.
+3. **Parametri del contesto**: `sd_ctx_params_init(&cp)` — azzera e imposta i
+   default; poi valorizzare solo i campi necessari (tabella sotto).
+4. **Creazione del contesto**: `new_sd_ctx(&cp)` — carica il modello, sceglie
+   e inizializza i backend (auto-fit + fallback CPU); è l'operazione costosa
+   (secondi–minuti). Restituisce `NULL` in caso di errore (motivo nei log).
+5. **Avanzamento** (facoltativo): `sd_set_progress_callback(cb, data)` riceve
+   `(step, steps, time, data)` a ogni passo di campionamento — è ciò che serve
+   per una progress bar.
+6. **Parametri di generazione**: `sd_img_gen_params_init(&gp)`; poi prompt e
+   dimensioni. Default reali: 512×512, `strength` 0.75, `seed` -1 (= casuale),
+   `batch_count` 1, 20 passi.
+7. **Generazione**: `generate_image(ctx, &gp, &images, &count)` — bloccante;
+   chiamarla da un worker thread se l'app ha una UI.
+8. **Annullamento** (facoltativo, da un altro thread):
+   `sd_cancel_generation(ctx, SD_CANCEL_ALL)` interrompe appena possibile;
+   `SD_CANCEL_NEW_LATENTS` finisce l'immagine in corso e salta le successive.
+9. **Lettura del risultato**: ogni `sd_image_t` ha `width`, `height`,
+   `channel` (3 = RGB) e `data` — buffer di `width*height*channel` byte, righe
+   contigue senza padding, ordine RGB. Copiarlo o convertirlo subito.
+10. **Rilascio**: `free_sd_images(images, count)` e poi `free_sd_ctx(ctx)` —
+    sempre le funzioni della libreria, mai `free()` del chiamante (su Windows
+    CRT diversi causerebbero corruzione).
+
+Campi principali di `sd_ctx_params_t` (tutti gli altri possono restare ai
+default):
+
+| Campo | Significato | Default |
+|---|---|---|
+| `model_path` | checkpoint completo (`.safetensors`/`.gguf`/`.ckpt`) | obbligatorio* |
+| `diffusion_model_path` | in alternativa: solo modello di diffusione (componenti separati) | — |
+| `n_threads` | thread CPU; `<= 0` = core fisici | auto |
+| `backend` | assegnazione backend, es. `"cpu"`, `"vulkan0"`, `"diffusion=cuda0,te=cpu"`; vuoto = migliore disponibile | auto |
+| `params_backend` | dove risiedono i pesi: `"cpu"` (RAM), `"disk"`, per modulo | auto-fit |
+| `max_vram` | budget per device in GiB, es. `"6"` o `"cuda0=6,vulkan0=4"`; `-1` = riserva 1 GiB | memoria libera |
+| `memory_guard` | soglia % del guardiano di memoria (50–99); `0` = spento | `0` |
+| `disable_backend_fallback` | `true` = fallire invece di ripiegare sulla CPU | `false` |
+| `enable_mmap` | mappa i pesi dal file invece di copiarli in RAM | `false` |
+| `wtype` | forza il tipo dei pesi (quantizzazione a caricamento) | tipo del file |
+
+*uno tra `model_path` e `diffusion_model_path` è obbligatorio.
+
 Esempio compilato e collaudato con il percorso `find_package` qui sopra:
 
 ```c
@@ -219,25 +269,57 @@ int main(int argc, char** argv) {
 Regole importanti per chi integra:
 
 - Chiamare sempre `sd_ctx_params_init()` e `sd_img_gen_params_init()` prima di
-  valorizzare i campi.
+  valorizzare i campi: senza init i campi contengono valori casuali.
 - Controllare sempre il valore di ritorno di `new_sd_ctx()` e `generate_image()`.
-- Un contesto non è thread-safe: serializzare gli accessi (come fa `sd-server`
-  con un mutex) oppure usare un contesto per thread. Le funzioni di
-  enumerazione dei device sono state provate da più thread in parallelo.
-- Le stringhe passate nei parametri (`model_path`, ...) devono restare valide
-  finché serve il contesto.
+- **Threading**: un contesto non è thread-safe; serializzare gli accessi (come
+  fa `sd-server` con un mutex) oppure usare un contesto per thread.
+  `sd_cancel_generation()` è pensata per essere chiamata da un altro thread.
+  Le funzioni di enumerazione dei device sono state provate da più thread in
+  parallelo. I callback (log, progress) arrivano dal thread che sta generando.
+- **Durata delle stringhe**: i campi `const char*` dei parametri non vengono
+  copiati al momento dell'assegnazione; devono restare validi fino alla
+  chiamata (`new_sd_ctx`/`generate_image`) che li consuma. Da linguaggi con
+  garbage collector (FFI), ancorare i buffer finché la chiamata non ritorna.
+- **Un contesto, molte generazioni**: il modello resta caricato; chiamare
+  `generate_image()` più volte sullo stesso contesto è il modo corretto di
+  servire più richieste (ricrearlo a ogni richiesta ricarica il modello).
+- **Processo e working directory**: con i backend dinamici i moduli
+  `libggml-*` vengono cercati accanto all'eseguibile, non nella working
+  directory.
 
 ### 3.3 Altri linguaggi (TypeScript/Electron, Python, Rust, Go, C#, ...)
 
 L'API è C pura (`include/stable-diffusion.h`), quindi si può usare tramite FFI
-o binding. Binding esistenti sono elencati nel [README](../README.md). Per
-un'app Electron/Node: modulo nativo (N-API) oppure processo separato (3.4/3.5).
+o binding. Binding esistenti sono elencati nel [README](../README.md).
+
+Indicazioni tecniche per un binding FFI fatto in casa:
+
+- servono la libreria **dinamica** (`-DSD_BUILD_SHARED_LIBS=ON`) oppure il
+  binding N-API/ctypes contro la statica ricompilata PIC;
+- dichiarare le strutture esattamente nell'ordine dei campi dell'header (sono
+  struct C semplici); dopo ogni aggiornamento del fork rigenerare le
+  dichiarazioni, perché i campi possono crescere in coda;
+- chiamare sempre `sd_ctx_params_init()` via FFI invece di costruire la struct
+  a mano: imposta i default corretti anche per i campi futuri;
+- i callback FFI (log/progress) arrivano da thread nativi: nel runtime del
+  linguaggio usare il meccanismo apposito (es. `ThreadSafeFunction` in N-API).
+
+Per un'app Electron/Node la via più robusta resta il **processo separato**
+(3.4/3.5): isolamento totale dai crash e nessun binding da mantenere.
 
 ### 3.4 Come processo: `sd-cli`
 
 Isola il motore dall'applicazione: un crash del motore non abbatte l'app.
-Utile: `sd-cli --list-devices`, `--memory-guard 90`, `--backend`,
-`--max-vram`, `--disable-backend-fallback`.
+
+- avviare `sd-cli` con gli argomenti della generazione e leggere l'exit code:
+  `0` = successo, `1` = errore (dettagli su stderr), `>= 128` = crash;
+- `-o out_%d.png` scrive i file di output; l'app li legge a fine processo;
+- `--list-devices` dà l'inventario hardware in formato tabellare
+  (`nome<TAB>tipo<TAB>descrizione<TAB>memoria`), facile da parsare;
+- opzioni chiave: `--memory-guard 90`, `--backend`, `--max-vram`,
+  `--offload-to-cpu`, `--disable-backend-fallback`;
+- per annullare: terminare il processo (SIGTERM); il motore non lascia stato
+  persistente.
 
 ### 3.5 Come servizio HTTP: `sd-server`
 
