@@ -2,13 +2,44 @@
   <img src="./assets/logo.png" width="360x">
 </p>
 
-# stable-diffusion.cpp
+# diffusione-in-tempo-reale
 
-<div align="center">
-<a href="https://trendshift.io/repositories/9714" target="_blank"><img src="https://trendshift.io/api/badge/repositories/9714" alt="leejet%2Fstable-diffusion.cpp | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
-</div>
+Generazione di immagini e video con modelli di diffusione in C/C++ puro,
+progettata per funzionare su più hardware possibile e degradare con grazia
+quando le risorse mancano.
 
-Diffusion model(SD,Flux,Wan,...) inference in pure C/C++
+Fork di [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp)
+di **leejet** e contributori (licenza MIT); non è affiliato né approvato dal
+progetto originale. Modifiche del fork di **Francesco Simeoni**
+([@filve](https://github.com/filve)).
+
+## Perché questo fork
+
+- **Rilevamento hardware**: API C `sd_get_device_count()` / `sd_get_device_info()` e `--list-devices` con tipo e memoria di ogni device
+- **Fallback CPU automatico**: se il backend richiesto manca o non si inizializza, il contesto degrada alla CPU invece di fallire
+- **Memory guard** (`--memory-guard 90`): sopra la soglia riduce la pressione di memoria (eviction dei pesi, prefetch sospeso) prima dell'out-of-memory
+- **Server robusto**: parte anche senza modello, autenticazione opzionale (`--api-key`) e allowlist CORS (`--cors-origins`)
+- **Pacchetto portabile**: backend ggml come librerie dinamiche caricate a runtime — un solo zip per macchine vecchie e nuove (`scripts/package_portable.sh`)
+- **Suite di test di sicurezza** in [test/](./test/): file modello ostili, fuzzing, sanitizer
+
+Tutti i dettagli, passo per passo: **[guida completa in italiano](./docs/integrazione_progetti.md)**
+(installazione, primo utilizzo, integrazione in altri progetti, sicurezza, autori).
+
+## Avvio rapido
+
+```sh
+git submodule update --init ggml thirdparty/libwebp thirdparty/libwebm
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+./build/bin/sd-cli --list-devices
+./build/bin/sd-cli -m modello.safetensors -p "un gatto adorabile" -o gatto.png
+```
+
+Guide principali: [build](./docs/build.md) · [prestazioni e memoria](./docs/performance.md) · [selezione backend](./docs/backend.md) · [risoluzione problemi](./docs/troubleshooting.md)
+
+---
+
+# Documentazione del motore (ereditata da upstream)
 
 ***Note that this project is under active development. \
 API and command-line option may change frequently.***
@@ -193,11 +224,10 @@ These projects use `stable-diffusion.cpp` as a backend for their image generatio
 
 ## Fork e autori (Italiano)
 
-Questo repository è un fork di stable-diffusion.cpp con modifiche per
-retrocompatibilità hardware (rilevamento device, fallback CPU, memory guard,
-build portabile). Il progetto originale è di leejet e dei suoi contributori;
-le modifiche del fork sono di Francesco Simeoni, tutto sotto licenza MIT.
-Guida di integrazione, sicurezza e autori: [docs/integrazione_progetti.md](./docs/integrazione_progetti.md).
+Il progetto originale è di leejet e dei suoi contributori; le modifiche del
+fork sono di Francesco Simeoni, tutto sotto licenza MIT (vedi `LICENSE`).
+Guida di integrazione, sicurezza e autori:
+[docs/integrazione_progetti.md](./docs/integrazione_progetti.md).
 
 ## Contributors
 
