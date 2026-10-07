@@ -39,7 +39,8 @@ CPU (prima un backend non disponibile causava un errore). Si disattiva con
 
 ### 2.1 Prerequisiti
 
-- **CMake** >= 3.12 e un compilatore **C++17**:
+- **CMake** >= 3.12 e un compilatore **C++17** (CMake >= 3.15 per usare il
+  comando `cmake --install` riportato sotto):
   - macOS: `xcode-select --install` (Apple clang) e `brew install cmake`
   - Linux (Debian/Ubuntu): `sudo apt install build-essential cmake git`
   - Windows: Visual Studio 2022 (workload "Sviluppo di applicazioni desktop con C++") oppure MSYS2; CMake incluso o da cmake.org
@@ -50,36 +51,79 @@ CPU (prima un backend non disponibile causava un errore). Si disattiva con
 ### 2.2 Clonazione
 
 ```shell
-git clone <URL-del-fork> diffusione-in-tempo-reale
+git clone https://github.com/Filve/diffusione-in-tempo-reale.git
 cd diffusione-in-tempo-reale
 git submodule update --init ggml thirdparty/libwebp thirdparty/libwebm
 ```
 
 Senza i sottomoduli la configurazione CMake fallisce. Il sottomodulo
 `examples/server/frontend` serve solo per l'interfaccia web del server ed è
-facoltativo.
+facoltativo. Eseguire i comandi dalla cartella principale del repository; in
+Windows usare PowerShell, il Developer PowerShell/Prompt di Visual Studio o
+Git Bash, con `git` e `cmake` disponibili nel `PATH`.
 
 ### 2.3 Build e installazione passo-passo
 
+I comandi cambiano leggermente in base alla shell e al generatore CMake.
+L'opzione `-DCMAKE_BUILD_TYPE=Release` seleziona la configurazione per
+generatori a configurazione singola (per esempio Ninja o Make); con Visual
+Studio la configurazione si sceglie invece in fase di build con
+`--config Release`.
+
+#### Linux e macOS (Ninja o Make)
+
 ```shell
-# 1. Configura (scegli i backend: nessuno = CPU; su macOS Metal è attivo di default)
-cmake -B build -DCMAKE_BUILD_TYPE=Release        # es. -DSD_VULKAN=ON, -DSD_CUDA=ON
+# Dalla radice del repository. Senza backend GPU esplicito si compila la CPU.
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+# Aggiungere alla configurazione, se richiesto e se l'SDK è installato:
+# -DSD_VULKAN=ON oppure -DSD_CUDA=ON
 
-# 2. Compila (usa tutti i core)
-cmake --build build -j
+cmake --build build --parallel
 
-# 3. Verifica subito che funzioni
+# Verifica
 ./build/bin/sd-cli --list-devices
-
-# 4. (Facoltativo) installa in un prefisso per usarlo da altri progetti
-cmake --install build --prefix "$HOME/.local/sd"   # o /usr/local con sudo
 ```
 
-L'installazione contiene `include/stable-diffusion.h`, le librerie
-(`libstable-diffusion.a`, `libggml*.a`), la configurazione CMake
-(`lib/cmake/stable-diffusion`) e gli eseguibili `sd-cli` e `sd-server`.
-Su Windows usare `cmake --build build --config Release` e il prompt
-"x64 Native Tools" di Visual Studio.
+#### Windows con Visual Studio
+
+Aprire un Developer PowerShell/Prompt di Visual Studio con gli strumenti C++
+installati, quindi eseguire dalla radice del repository:
+
+```powershell
+cmake -S . -B build -A x64
+# Aggiungere alla configurazione, se richiesto e se l'SDK è installato:
+# -DSD_VULKAN=ON oppure -DSD_CUDA=ON
+
+cmake --build build --config Release --parallel
+& ".\build\bin\Release\sd-cli.exe" --list-devices
+```
+
+La build Visual Studio è multi-config: se si è compilato `Debug`, l'eseguibile
+è invece `.\build\bin\Debug\sd-cli.exe`. Con Ninja su Windows, impostando
+`-G Ninja -DCMAKE_BUILD_TYPE=Release` in fase di configurazione, il percorso è
+`.\build\bin\sd-cli.exe`. Se il file non viene trovato, verificare la
+configurazione selezionata e il percorso stampato da MSBuild, senza spostare
+la working directory dentro `build\bin`.
+
+Per installare la libreria e usarla da un altro progetto CMake (facoltativo):
+
+```shell
+# Linux/macOS
+cmake --install build --prefix "$HOME/.local/sd"
+```
+
+```powershell
+# Windows; usare un percorso di installazione a cui l'utente può scrivere.
+cmake --install build --config Release --prefix "$HOME\sd-install"
+```
+
+L'installazione fornisce l'header pubblico `stable-diffusion.h`, le librerie e
+i file di configurazione CMake/pkg-config. Non installa gli eseguibili di
+esempio: `sd-cli` e `sd-server` restano nella directory di build. Il formato
+della libreria dipende dalla piattaforma e dal tipo di build (statica per
+default); per usarla da un altro progetto seguire la sezione 3 e mantenere
+coerenti architettura, compilatore e configurazione. La directory di
+installazione non viene aggiunta automaticamente al `PATH`.
 
 ### 2.4 Primo utilizzo: generare un'immagine
 
@@ -103,6 +147,18 @@ versioni quantizzate `.gguf`, vedi
     -i foto.png --strength 0.6 -o acquerello.png
 ```
 
+Con Visual Studio su Windows, eseguire dalla radice del repository usando
+PowerShell e il percorso della configurazione compilata:
+
+```powershell
+& ".\build\bin\Release\sd-cli.exe" -m ".\modello.safetensors" `
+    -p "un gatto astronauta" -o ".\gatto.png"
+```
+
+Se si è usato Ninja, rimuovere `Release` dal percorso:
+`.\build\bin\sd-cli.exe`. I percorsi relativi ai modelli e ai file di output
+sono risolti rispetto alla working directory corrente.
+
 Opzioni utili: `--steps`, `--cfg-scale`, `-W`/`-H` (dimensioni), `--seed`,
 `-v` (log dettagliati). Elenco completo: `sd-cli --help`.
 
@@ -111,6 +167,17 @@ Opzioni utili: `--steps`, `--cfg-scale`, `-W`/`-H` (dimensioni), `--seed`,
 ```shell
 ./build/bin/sd-server -m modello.safetensors --api-key mia-chiave
 ```
+
+Con Visual Studio su Windows, da PowerShell:
+
+```powershell
+& ".\build\bin\Release\sd-server.exe" -m ".\modello.safetensors" `
+    --api-key "mia-chiave"
+```
+
+Con Ninja usare `.\build\bin\sd-server.exe`. Per richieste HTTP da PowerShell
+usare `curl.exe` (non l'alias `curl` presente in alcune versioni di
+PowerShell), oppure `Invoke-RestMethod`.
 
 Da un client qualsiasi:
 
@@ -122,18 +189,38 @@ curl -s -X POST http://127.0.0.1:1234/sdcpp/v1/img_gen \
      -d '{"prompt": "un gatto astronauta", "width": 512, "height": 512}'
 ```
 
+Da una seconda finestra PowerShell su Windows, sostituire `curl` con
+`curl.exe`, per esempio:
+
+```powershell
+curl.exe -s "http://127.0.0.1:1234/sdcpp/v1/capabilities" `
+    -H "X-API-Key: mia-chiave"
+```
+
 Sono disponibili anche endpoint compatibili OpenAI (`/v1/images/generations`)
 e AUTOMATIC1111 (`/sdapi/v1/txt2img`). Dettagli di sicurezza in sezione 5.
 
 ### Pacchetto portabile (consigliato per la distribuzione)
 ```shell
-cmake -B build -DCMAKE_BUILD_TYPE=Release \
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
       -DSD_BUILD_SHARED_GGML_LIB=ON -DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON
-# su x86 aggiungere -DGGML_CPU_ALL_VARIANTS=ON per una build CPU per ogni livello (AVX, AVX2, ...)
-cmake --build build -j
+# Per una distribuzione x86 che includa varianti CPU selezionabili a runtime:
+# aggiungere -DGGML_CPU_ALL_VARIANTS=ON -DGGML_NATIVE=OFF.
+cmake --build build --config Release --parallel
 ```
 
-Distribuire insieme all'eseguibile i moduli `libggml-*` generati: i backend
+Su Windows il pacchetto richiede una build a configurazione singola per
+produrre i file nel percorso atteso dallo script. Da un Developer
+PowerShell/Prompt con Ninja installato, usare una directory di build nuova:
+
+```powershell
+cmake -S . -B build-portable -G Ninja -DCMAKE_BUILD_TYPE=Release `
+    -DSD_BUILD_SHARED_GGML_LIB=ON -DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON
+cmake --build build-portable --parallel
+```
+
+Distribuire insieme all'eseguibile i moduli backend dinamici ggml generati
+(per esempio `.dll`, `.so` o `.dylib`, a seconda della piattaforma): i backend
 non utilizzabili sulla macchina vengono semplicemente ignorati. L'opzione
 `SD_BUILD_SHARED_GGML_LIB=ON` è necessaria: senza di essa il CMake del
 progetto forza ggml statico.
@@ -142,18 +229,33 @@ Per creare lo zip distribuibile (binari + moduli backend + licenze +
 LEGGIMI) da una build portabile:
 
 ```shell
-./scripts/package_portable.sh build    # risultato in dist/
+./scripts/package_portable.sh build    # Linux/macOS/Git Bash; risultato in dist/
 ```
 
-Il pacchetto è rilocabile: si scompatta e si usa, senza installazione.
+Lo script di packaging è Bash; su Windows avviarlo da Git Bash o da WSL dalla
+radice del repository, passando la directory di build usata sopra:
+
+```bash
+./scripts/package_portable.sh build-portable
+```
+
+Il workflow usa Ninja proprio per mantenere gli eseguibili in `build/bin`;
+con il generatore Visual Studio finiscono invece in `build/bin/Release` e lo
+script non li trova. Il pacchetto è rilocabile all'interno della stessa
+piattaforma e architettura: si scompatta e si usa, senza installazione.
 Il workflow GitHub Actions `release-portable.yml` produce automaticamente gli
 zip per Linux x86-64, macOS arm64 e Windows x86-64 (con varianti CPU
 SSE/AVX/AVX2/AVX-512 su x86 per le macchine più vecchie) a ogni tag
-`portable-v*` o avvio manuale.
+`portable-v*` o avvio manuale. I pacchetti di release non sono un singolo
+binario multipiattaforma: scegliere quello corrispondente al sistema operativo
+e all'architettura del computer di destinazione.
 
 ## 3. Come collegarlo a un progetto
 
 ### 3.1 Libreria C/C++ con CMake
+
+Questo esempio usa la libreria installata al punto 2.3. Sostituire il prefisso
+con il percorso effettivamente scelto sulla propria macchina.
 
 ```cmake
 cmake_minimum_required(VERSION 3.14)
@@ -165,7 +267,14 @@ target_link_libraries(mia_app PRIVATE stable-diffusion)
 set_target_properties(mia_app PROPERTIES LINKER_LANGUAGE CXX)
 ```
 
-Configurare con `-DCMAKE_PREFIX_PATH=/percorso/di/installazione`.
+Configurare passando `CMAKE_PREFIX_PATH` alla directory di installazione:
+`-DCMAKE_PREFIX_PATH=/percorso/di/installazione` su Linux/macOS oppure, in
+PowerShell, `-DCMAKE_PREFIX_PATH="$HOME\sd-install"` se si è usato il prefisso
+Windows dell'esempio. La libreria installata deve essere stata compilata per
+la stessa piattaforma, architettura e configurazione ABI dell'applicazione.
+Dopo aver aggiornato il fork, ricompilare l'applicazione contro l'header e la
+libreria corrispondenti; non mescolare header di una revisione con librerie
+precompilate di un'altra.
 
 ### 3.2 Sequenza di inizializzazione consigliata
 
@@ -177,7 +286,7 @@ Il ciclo di vita completo, nell'ordine tecnico corretto:
 2. **Rilevamento hardware** (facoltativo ma consigliato):
    `sd_get_device_count()` + `sd_get_device_info(i, &info)` — non caricano
    nulla, si possono chiamare subito e da più thread. Alla prima chiamata
-   vengono scoperti i backend dinamici (`libggml-*`) accanto all'eseguibile.
+   vengono scoperti i moduli backend dinamici ggml accanto all'eseguibile.
 3. **Parametri del contesto**: `sd_ctx_params_init(&cp)` — azzera e imposta i
    default; poi valorizzare solo i campi necessari (tabella sotto).
 4. **Creazione del contesto**: `new_sd_ctx(&cp)` — carica il modello, sceglie
@@ -283,9 +392,8 @@ Regole importanti per chi integra:
 - **Un contesto, molte generazioni**: il modello resta caricato; chiamare
   `generate_image()` più volte sullo stesso contesto è il modo corretto di
   servire più richieste (ricrearlo a ogni richiesta ricarica il modello).
-- **Processo e working directory**: con i backend dinamici i moduli
-  `libggml-*` vengono cercati accanto all'eseguibile, non nella working
-  directory.
+- **Processo e working directory**: con i backend dinamici i moduli ggml
+  vengono cercati accanto all'eseguibile, non nella working directory.
 
 ### 3.3 Altri linguaggi (TypeScript/Electron, Python, Rust, Go, C#, ...)
 
@@ -312,14 +420,16 @@ Per un'app Electron/Node la via più robusta resta il **processo separato**
 Isola il motore dall'applicazione: un crash del motore non abbatte l'app.
 
 - avviare `sd-cli` con gli argomenti della generazione e leggere l'exit code:
-  `0` = successo, `1` = errore (dettagli su stderr), `>= 128` = crash;
+  `0` = successo, valore diverso da zero = errore (dettagli su stderr); il
+  modo in cui il sistema operativo segnala un crash non è portabile;
 - `-o out_%d.png` scrive i file di output; l'app li legge a fine processo;
 - `--list-devices` dà l'inventario hardware in formato tabellare
   (`nome<TAB>tipo<TAB>descrizione<TAB>memoria`), facile da parsare;
 - opzioni chiave: `--memory-guard 90`, `--backend`, `--max-vram`,
   `--offload-to-cpu`, `--disable-backend-fallback`;
-- per annullare: terminare il processo (SIGTERM); il motore non lascia stato
-  persistente.
+- per annullare: terminare il processo con il meccanismo previsto dal sistema
+  operativo e attendere che termini; le modalità di terminazione non sono
+  uniformi tra POSIX e Windows.
 
 ### 3.5 Come servizio HTTP: `sd-server`
 
@@ -338,9 +448,51 @@ Il server **parte anche senza modello** (niente loop né uscita silenziosa):
 
 ## 4. Retrocompatibilità e risorse
 
-- **Macchine senza GPU o con GPU non funzionante**: fallback automatico alla
-  CPU. Per modelli grandi su macchine piccole combinare `--offload-to-cpu`,
-  `--params-backend disk` e `--max-vram` (vedi [performance.md](./performance.md)).
+La compatibilità va considerata su più livelli: sistema operativo, architettura
+CPU, backend/driver GPU, runtime del compilatore e formato del modello. Un
+pacchetto compilato per un sistema operativo non è riutilizzabile direttamente
+su un altro; la modalità "portabile" significa rilocabile sulla piattaforma
+per cui è stato creato, non universale.
+
+| Piattaforma del pacchetto di release | Architettura prevista | Note |
+|---|---|---|
+| Linux | x86-64 | La release include varianti CPU x86 selezionabili. Non abilita CUDA o Vulkan. La compatibilità con distribuzioni Linux meno recenti dipende anche dalla versione di glibc e dalle librerie di sistema: verificare sul sistema minimo di destinazione. |
+| macOS | arm64 (Apple Silicon) | La release automatica corrente è per macOS arm64; non è un binario Intel/x86-64. Include Metal, che richiede hardware e sistema Apple compatibili. |
+| Windows | x86-64 | La release include varianti CPU x86 selezionabili, ma non abilita CUDA o Vulkan. Verificare la presenza dei runtime richiesti dal compilatore; driver GPU e backend GPU vanno predisposti separatamente nelle build personalizzate. |
+
+Questa tabella descrive gli artefatti generati dall'attuale workflow di release,
+non una garanzia di compatibilità con tutte le versioni storiche dei sistemi
+operativi. Per Windows ARM64, macOS Intel, Linux ARM o Android occorre una
+build distinta con toolchain e dipendenze adatte; tali target non fanno parte
+dei pacchetti portabili automatici descritti sopra.
+
+- **CPU meno recenti**: per x86, `GGML_CPU_ALL_VARIANTS=ON` con
+  `GGML_NATIVE=OFF` produce varianti CPU che il runtime può selezionare in
+  base alle istruzioni supportate dal processore. Non permette di eseguire un
+  binario x86-64 su CPU a 32 bit né garantisce compatibilità con ogni sistema
+  operativo. Evitare `GGML_NATIVE=ON` per pacchetti generici: può ottimizzare
+  per il computer di build e renderli incompatibili con CPU più vecchie.
+- **Macchine senza GPU o con GPU non funzionante**: il fallback alla CPU è
+  attivo per default se il backend richiesto non è disponibile o non si
+  inizializza. Per modelli grandi su macchine piccole combinare
+  `--offload-to-cpu`, `--params-backend disk` e `--max-vram` (vedi
+  [performance.md](./performance.md)).
+- **Driver e backend GPU**: i moduli dinamici consentono di includere più
+  backend, ma non includono i driver del produttore né rendono compatibili
+  GPU non supportate. Installare il runtime/driver richiesto sulla macchina
+  finale; se il backend non può avviarsi, il fallback CPU può essere usato,
+  con prestazioni potenzialmente molto inferiori.
+- **Libreria per integrazioni**: una libreria C/C++ compilata è legata a
+  sistema operativo, architettura, ABI e dipendenze usate in compilazione.
+  Distribuire build separate per ogni target e non copiare DLL, `.so`, `.dylib`
+  o librerie statiche tra sistemi o architetture differenti. Per FFI mantenere
+  coerenti dichiarazioni e header della stessa revisione e rilasciare ogni
+  risorsa con le funzioni della libreria, non con l'allocatore del linguaggio.
+- **Modelli**: i pesi non sono inclusi nel pacchetto portabile; vanno
+  distribuiti/scaricati separatamente e la loro licenza va verificata.
+  Compatibilità e fabbisogno di memoria dipendono dall'architettura del modello
+  e dalle funzionalità supportate dalla build.
+
 - **Memory guard** (`memory_guard` / `--memory-guard <percentuale>`): la
   soglia valida è 50-99 (valori fuori scala vengono riportati nell'intervallo);
   a soglia +5 punti la pressione è "critica". È best effort: non fa fallire
