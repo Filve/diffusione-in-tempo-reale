@@ -340,7 +340,8 @@ public:
 
     bool build_runners(const RunnerGroups& groups);
 
-    bool is_using_v_parameterization_for_sd2(bool is_inpaint = false);
+    // Returns 1 for v-prediction, 0 for eps, -1 when the probe compute fails.
+    int check_v_parameterization_for_sd2(bool is_inpaint = false);
 
     static std::string lora_log_id(const ModelManager::LoraSpec& lora);
 

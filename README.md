@@ -27,13 +27,32 @@ Tutti i dettagli, passo per passo: **[guida completa in italiano](./docs/integra
 
 ## Avvio rapido
 
+Linux/macOS:
+
 ```sh
 git submodule update --init ggml thirdparty/libwebp thirdparty/libwebm
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
 ./build/bin/sd-cli --list-devices
 ./build/bin/sd-cli -m modello.safetensors -p "un gatto adorabile" -o gatto.png
 ```
+
+Windows (Developer PowerShell; con Visual Studio gli eseguibili sono in
+`build\bin\Release`):
+
+```powershell
+git submodule update --init ggml thirdparty/libwebp thirdparty/libwebm
+cmake -S . -B build -A x64
+cmake --build build --config Release --parallel
+& ".\build\bin\Release\sd-cli.exe" --list-devices
+```
+
+Per una build guidata (CPU, Vulkan, CUDA, Metal) con verifica dei dispositivi
+e installazione con backup: `scripts/build-engine.ps1` su Windows,
+`scripts/build-engine.sh` su macOS/Linux. Gli SDK GPU (Vulkan SDK, CUDA
+Toolkit) vanno installati a parte, una tantum: nessuno script li scarica.
+Tutti i dettagli nella [guida in italiano](./docs/integrazione_progetti.md),
+sezioni 2.6-2.8.
 
 Guide principali: [build](./docs/build.md) · [prestazioni e memoria](./docs/performance.md) · [selezione backend](./docs/backend.md) · [risoluzione problemi](./docs/troubleshooting.md)
 

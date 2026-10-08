@@ -1374,7 +1374,12 @@ bool StableDiffusionGGML::build_denoiser() {
 
     if (pred_type == PREDICTION_COUNT) {
         if (sd_version_is_sd2(version)) {
-            pred_type = is_using_v_parameterization_for_sd2(sd_version_is_inpaint(version)) ? V_PRED : EPS_PRED;
+            const int v_pred_check = check_v_parameterization_for_sd2(sd_version_is_inpaint(version));
+            if (v_pred_check < 0) {
+                LOG_ERROR("SD2 parameterization probe failed; cannot determine prediction type");
+                return false;
+            }
+            pred_type = v_pred_check == 1 ? V_PRED : EPS_PRED;
         } else if (sd_version_is_sdxl(version)) {
             if (tensor_storage_map.find("edm_vpred.sigma_max") != tensor_storage_map.end()) {
                 // CosXL models
@@ -1574,7 +1579,7 @@ bool StableDiffusionGGML::build_runners(const RunnerGroups& groups) {
     return groups.count(RunnerGroup::Core) == 0 || build_denoiser();
 }
 
-bool StableDiffusionGGML::is_using_v_parameterization_for_sd2(bool is_inpaint) {
+int StableDiffusionGGML::check_v_parameterization_for_sd2(bool is_inpaint) {
     struct RunnerEndOnExit {
         GGMLRunner* runner = nullptr;
         ~RunnerEndOnExit() {
@@ -1604,13 +1609,16 @@ bool StableDiffusionGGML::is_using_v_parameterization_for_sd2(bool is_inpaint) {
         diffusion_params.c_concat = &concat;
     }
     auto out_opt = diffusion_model->compute(n_threads, diffusion_params);
-    GGML_ASSERT(!out_opt.empty());
+    if (out_opt.empty()) {
+        LOG_ERROR("SD2 parameterization probe compute failed (see previous errors)");
+        return -1;
+    }
     out = std::move(out_opt);
 
     double result = static_cast<double>((out - x_t).mean());
     int64_t t1    = ggml_time_ms();
-    LOG_VERBOSE("check is_using_v_parameterization_for_sd2, taking %.2fs", (t1 - t0) * 1.0f / 1000);
-    return result < -1;
+    LOG_VERBOSE("check_v_parameterization_for_sd2, taking %.2fs", (t1 - t0) * 1.0f / 1000);
+    return result < -1 ? 1 : 0;
 }
 
 std::string StableDiffusionGGML::lora_log_id(const ModelManager::LoraSpec& lora) {
