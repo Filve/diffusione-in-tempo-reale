@@ -200,6 +200,66 @@ curl.exe -s "http://127.0.0.1:1234/sdcpp/v1/capabilities" `
 Sono disponibili anche endpoint compatibili OpenAI (`/v1/images/generations`)
 e AUTOMATIC1111 (`/sdapi/v1/txt2img`). Dettagli di sicurezza in sezione 5.
 
+### 2.6 Windows: preparare un motore CPU + GPU per un'applicazione
+
+Una build Windows produce eseguibili e librerie Windows, non librerie macOS
+(`Darwin`) o Linux. Il nome `win32` usato da Node/Electron indica Windows,
+anche se l'eseguibile è a 64 bit; non descrive il backend GPU. Vulkan, CUDA e
+Metal sono backend differenti: non si attivano soltanto copiando file in una
+cartella chiamata `vulkan` o `darwin`.
+
+Per scegliere la build con un menu interattivo: `scripts/build-engine.ps1`
+su Windows, `scripts/build-engine.sh` su macOS/Linux. Ogni sistema compila
+solo i propri binari; per gli altri sistemi gli script rimandano alla build
+su quella macchina o al workflow `release-portable.yml` (tag `portable-v*`).
+
+Per una build Windows con CPU e GPU:
+
+1. Installare Visual Studio Build Tools con C++ e Windows SDK, CMake e Ninja.
+2. Per Vulkan, installare [Vulkan SDK](https://vulkan.lunarg.com/sdk/home) e
+   riaprire il Developer PowerShell per rendere disponibile `VULKAN_SDK`.
+   Per CUDA, installare un [CUDA Toolkit](https://developer.nvidia.com/cuda-downloads)
+   compatibile con GPU e compilatore MSVC; `nvidia-smi` da solo non è il
+   compilatore CUDA. Il Toolkit deve rendere `nvcc` disponibile nel `PATH`.
+3. Verificare/aggiornare i driver della GPU. Un SDK serve alla compilazione;
+   il driver serve all'esecuzione.
+4. Chiudere il motore nell'applicazione ospite prima di sostituirlo.
+5. Dalla radice del repository, nel Developer PowerShell x64, eseguire:
+
+```powershell
+# CPU con varianti x86 e backend Vulkan dinamico
+.\scripts\build-windows-gpu.ps1 -Backend Vulkan -Destination "$HOME\sd-install\bin"
+
+# In alternativa, per NVIDIA con CUDA Toolkit:
+# .\scripts\build-windows-gpu.ps1 -Backend CUDA -BuildDirectory build-windows-cuda -Destination "$HOME\sd-install\bin"
+
+# Per includere entrambi i backend, servono entrambi gli SDK:
+# .\scripts\build-windows-gpu.ps1 -Backend "CUDA,Vulkan" -BuildDirectory build-windows-multi -Destination "$HOME\sd-install\bin"
+```
+
+Lo script configura una build Ninja Release separata con backend dinamici e
+varianti CPU, compila con parallelismo limitato, verifica `--list-devices` e
+copia l'intera directory dei binari solo se rileva un acceleratore. Verifica
+anche la copia temporanea e conserva la vecchia installazione in una cartella
+di backup, evitando di mescolare DLL di revisioni diverse. Senza `Destination`
+compila e verifica soltanto. Non scarica gli SDK, non modifica le protezioni
+di Windows e non include pesi di modelli.
+
+La verifica deve mostrare almeno un device di tipo `gpu`, `igpu` o `accel`,
+non soltanto `CPU`. Ripetere `--list-devices` nella cartella effettivamente
+usata dall'applicazione; un'etichetta di log come "GPU" non prova che quel
+backend venga eseguito. Per forzare un device, usare il nome restituito
+dall'inventario con `--backend`; aggiungere `--disable-backend-fallback` se
+si preferisce un errore esplicito al ripiego sulla CPU.
+
+CPU, RAM, GPU/VRAM e disco hanno ruoli diversi. Il disco conserva i pesi;
+`--params-backend cpu` li colloca in RAM e `--backend` sceglie dove calcolare.
+L'auto-fit può scegliere collocazioni diverse per modulo; forzare un
+`--params-backend` disattiva l'auto-fit. Non è garantito che tutte le unità
+lavorino contemporaneamente o al 90%: trasferimenti, modello e memoria
+disponibile determinano il piano di esecuzione. Prima provare una risoluzione
+contenuta e verificare nei log i backend effettivamente scelti.
+
 ### Pacchetto portabile (consigliato per la distribuzione)
 ```shell
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
@@ -498,6 +558,10 @@ dei pacchetti portabili automatici descritti sopra.
   a soglia +5 punti la pressione è "critica". È best effort: non fa fallire
   un grafo che ci sta comunque e non è un limite fisico assoluto, perché le
   allocazioni dei driver fuori dalla gestione del motore non sono visibili.
+  Non si applica ai backend CPU: non è un guardiano della RAM di sistema.
+  Gli avvisi di pressione alta/critica e di recupero sono accessibili tramite
+  il callback di log; l'applicazione ospite può mostrarli senza interrompere
+  la generazione. Un monitor RAM nell'applicazione resta un controllo separato.
 - **Elenco dispositivi** per scegliere la strategia nell'app: tipo `cpu`,
   `gpu`, `igpu`, `accel`; memoria 0 = non riportata dal backend.
 - **Altri motori** (MNN, ncnn, ONNX Runtime): non sono integrati in questo
