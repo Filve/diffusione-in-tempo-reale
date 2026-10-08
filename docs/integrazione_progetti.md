@@ -7,7 +7,7 @@ altri progetti (app desktop, server, altre applicazioni AI).
 Indice:
 
 1. [Cosa aggiunge questo fork](#1-cosa-aggiunge-questo-fork)
-2. [Installazione](#2-installazione) (prerequisiti, build, primo utilizzo, pacchetto portabile)
+2. [Installazione](#2-installazione) (prerequisiti, build, primo utilizzo, build GPU guidata, riepilogo da zero, problemi comuni, pacchetto portabile)
 3. [Come collegarlo a un progetto](#3-come-collegarlo-a-un-progetto) (CMake, API C, FFI, processo, HTTP)
 4. [Retrocompatibilità e risorse](#4-retrocompatibilità-e-risorse)
 5. [Sicurezza e test](#5-sicurezza-cosa-sapere-e-cosa-fare)
@@ -216,14 +216,36 @@ su quella macchina o al workflow `release-portable.yml` (tag `portable-v*`).
 Per una build Windows con CPU e GPU:
 
 1. Installare Visual Studio Build Tools con C++ e Windows SDK, CMake e Ninja.
-2. Per Vulkan, installare [Vulkan SDK](https://vulkan.lunarg.com/sdk/home) e
-   riaprire il Developer PowerShell per rendere disponibile `VULKAN_SDK`.
-   Per CUDA, installare un [CUDA Toolkit](https://developer.nvidia.com/cuda-downloads)
-   compatibile con GPU e compilatore MSVC; `nvidia-smi` da solo non è il
-   compilatore CUDA. Il Toolkit deve rendere `nvcc` disponibile nel `PATH`.
+2. Installare gli SDK dei backend desiderati. **Questa installazione è sempre
+   manuale e una tantum**: né gli script di build né le applicazioni ospiti
+   scaricano SDK automaticamente (per sicurezza e trasparenza; se mancano, lo
+   script si ferma con un messaggio chiaro e non tocca nulla). Da un
+   PowerShell **come amministratore**:
+
+   ```powershell
+   winget install LunarG.VulkanSDK     # backend Vulkan (NVIDIA/AMD/Intel)
+   winget install -e --id KhronosGroup.VulkanSDK
+   winget install Nvidia.CUDA          # backend CUDA (solo NVIDIA)
+   winget install -e --id Nvidia.CUDA
+   ```
+
+   In alternativa, gli installer grafici: [Vulkan SDK](https://vulkan.lunarg.com/sdk/home)
+   e [CUDA Toolkit](https://developer.nvidia.com/cuda-downloads).
+   `nvidia-smi` da solo non basta: è un'utilità del driver, non il compilatore
+   CUDA (`nvcc`). **Dopo l'installazione aprire un terminale nuovo**: le
+   variabili d'ambiente (`VULKAN_SDK`, il `PATH` di `nvcc`) esistono solo
+   nelle finestre aperte dopo.
+
+   Avvertenza CUDA: `nvcc` supporta solo le versioni MSVC testate da NVIDIA;
+   con un Visual Studio molto recente la configurazione CUDA può fallire
+   finché NVIDIA non pubblica un Toolkit compatibile. Vulkan non ha questo
+   vincolo ed è la scelta più sicura per iniziare; copre anche le GPU AMD e
+   Intel con driver Vulkan.
 3. Verificare/aggiornare i driver della GPU. Un SDK serve alla compilazione;
-   il driver serve all'esecuzione.
-4. Chiudere il motore nell'applicazione ospite prima di sostituirlo.
+   il driver serve all'esecuzione. Su un altro computer senza SDK il motore
+   compilato funziona: all'utente finale serve solo il driver.
+4. Chiudere l'applicazione ospite e ogni `sd-cli`/`sd-server` in esecuzione
+   prima di compilare e soprattutto prima di sostituire il motore.
 5. Dalla radice del repository, nel Developer PowerShell x64, eseguire:
 
 ```powershell
@@ -260,7 +282,52 @@ lavorino contemporaneamente o al 90%: trasferimenti, modello e memoria
 disponibile determinano il piano di esecuzione. Prima provare una risoluzione
 contenuta e verificare nei log i backend effettivamente scelti.
 
-### Pacchetto portabile (consigliato per la distribuzione)
+### 2.7 Riepilogo: da zero al primo disegno (Windows)
+
+Checklist completa per chi parte da un computer vuoto. Ogni passo rimanda
+alla sezione con i dettagli.
+
+1. **Strumenti di build** (manuale, una tantum): Visual Studio Build Tools
+   con C++, CMake, Ninja, Git (sezione 2.1).
+2. **SDK GPU** (manuale, una tantum, facoltativo ma consigliato): Vulkan SDK
+   e/o CUDA Toolkit con i comandi `winget` della sezione 2.6; poi aprire un
+   terminale nuovo. Senza SDK si compila comunque il motore solo-CPU.
+3. **Codice**: clonare il repository e i sottomoduli (sezione 2.2).
+4. **Build**: `.\scripts\build-engine.ps1` e scegliere la voce dal menu
+   (sezione 2.6). Con `-Destinazione` il motore verificato viene installato
+   con backup di quello precedente.
+5. **Verifica**: l'output di `--list-devices` deve elencare la GPU attesa
+   (`gpu`/`igpu`/`accel`), non soltanto `CPU`. Lo script GPU si rifiuta di
+   installare un motore che non supera questa verifica.
+6. **Modelli**: scaricare un file `.safetensors`/`.gguf` da una fonte
+   affidabile (sezione 2.4); i pesi non sono mai inclusi.
+7. **Primo disegno**: sezione 2.4 (CLI) o 2.5 (server HTTP). Partire con una
+   risoluzione contenuta e verificare nei log i backend scelti.
+
+Che cosa è automatico e che cosa no:
+
+| Operazione | Chi la fa |
+|---|---|
+| Installazione di Build Tools, CMake, Ninja, SDK GPU, driver | **l'utente, a mano** (una tantum) |
+| Download di SDK o modifiche alle protezioni di Windows | nessuno: gli script non lo fanno mai |
+| Scelta dei backend in build, verifica dispositivi, backup e sostituzione del motore | gli script, dopo conferma |
+| Collocazione dei pesi tra GPU/RAM/disco a runtime | il motore (auto-fit), salvo scelte esplicite |
+| Riduzione della residenza pesi sotto pressione di memoria | il motore (`--memory-guard`) |
+| Pesi lasciati su disco quando la RAM libera non copre il modello | l'applicazione ospite che integra questa logica (es. auto-calibrazione in Aletheia), mai contro una scelta esplicita |
+
+### 2.8 Problemi comuni e come leggerli
+
+| Sintomo | Causa tipica | Che cosa fare |
+|---|---|---|
+| `--list-devices` mostra solo `CPU` | build senza backend GPU, SDK assente in build, driver mancante, o DLL dei backend non accanto all'eseguibile | ricompilare con l'SDK installato; verificare driver; controllare la cartella davvero usata dall'applicazione |
+| `auto-fit: no GPU devices` nei log | come sopra: il motore non vede acceleratori | stessa verifica; un'etichetta "GPU" nei log dell'applicazione non prova nulla |
+| HTTP **502** da un proxy durante una generazione lunga | il proxy ha un timeout (es. la `fetch` di Node abbandona dopo ~5 minuti senza risposta) mentre il motore sta ancora calcolando | non reinviare alla cieca; usare API a job asincroni con polling; controllare i log del servizio |
+| Il motore si chiude durante il caricamento pesi con `read tensor data failed` | pressione di memoria estrema durante letture grandi, oppure file del modello incompleto | liberare RAM o usare `--params-backend disk`; verificare l'integrità del file (dimensione attesa vs reale) |
+| Windows impedisce l'avvio dell'eseguibile (EACCES/EPERM) | policy di sicurezza, es. Smart App Control, o binario bloccato | controllare Sicurezza di Windows e i registri CodeIntegrity; usare binari attendibili; **non** disattivare le protezioni |
+| Generazione lentissima (minuti per passo) | esecuzione sulla CPU, risoluzione alta, o modello troppo grande per la memoria | verificare i device; ridurre risoluzione/passi; modello quantizzato; build GPU |
+| Avviso "memory guard: pressure" nei log | la memoria del device ha superato la soglia `--memory-guard` | è un avviso con riduzione automatica della residenza: evitare nuove richieste finché non segnala il recupero |
+
+### 2.9 Pacchetto portabile (consigliato per la distribuzione)
 ```shell
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
       -DSD_BUILD_SHARED_GGML_LIB=ON -DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON
