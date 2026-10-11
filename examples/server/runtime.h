@@ -17,6 +17,7 @@ using json = nlohmann::json;
 struct ArgOptions;
 struct SDContextParams;
 struct AsyncJobManager;
+class ContextKeeper;
 
 struct SDSvrParams {
     std::string listen_ip = "127.0.0.1";
@@ -24,6 +25,8 @@ struct SDSvrParams {
     std::string serve_html_path;
     std::string api_key;       // empty = no authentication
     std::string cors_origins;  // comma-separated allowlist; empty = reflect any origin
+    bool disable_degradation = false;
+    int degradation_cooldown = 300;  // seconds before the server tries a heavier profile again; 0 = never
     bool normal_exit = false;
     sd_log_level_t log_level = SD_LOG_INFO;
     bool color       = false;
@@ -52,8 +55,7 @@ struct UpscalerEntry {
 };
 
 struct ServerRuntime {
-    sd_ctx_t* sd_ctx;
-    std::mutex* sd_ctx_mutex;
+    ContextKeeper* keeper;
     const SDSvrParams* svr_params;
     const SDContextParams* ctx_params;
     const SDGenerationParams* default_gen_params;

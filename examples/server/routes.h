@@ -3,6 +3,7 @@
 #include <string>
 
 #include "httplib.h"
+#include "recovery.h"
 #include "runtime.h"
 
 void register_index_endpoints(httplib::Server& svr, const SDSvrParams& svr_params, const std::string& index_html);

@@ -9,6 +9,10 @@ sezione "Sicurezza".
 |---|---|---|
 | `security_smoke.sh` | file modello ostili + opzioni CLI estreme → mai crash (exit < 128) | `./test/security_smoke.sh build/bin/sd-cli` |
 | `api_robustness.cpp` | API C: puntatori nulli, indici fuori range, buffer piccoli, stress multi-thread (con ASan/UBSan) | vedi intestazione del file |
+| `pe_imports_test.cpp` | lettore della tabella di importazione dei file PE (diagnostica delle DLL mancanti su Windows): file validi, troncati e corrotti (con ASan/UBSan) | vedi intestazione del file |
+| `file_handle_pool_test.cpp` | pool dei flussi aperti sui file modello: riuso, file modificato o sostituito, flussi in errore, limiti, uso concorrente (con ASan/UBSan e TSan) | vedi intestazione del file |
+| `profile_test.cpp` | profili di risorse (`--profile`): scelta automatica da dimensione del modello e memoria, ordine dei livelli, opzioni esplicite che vincono sul profilo | vedi intestazione del file |
+| `server_recovery_test.cpp` | custode del contesto del server (`examples/server/recovery.*`): scala dei profili, discesa su memoria insufficiente, risalita dopo una pausa, ricarica dopo un errore, risposte HTTP 503/400/500 con `Retry-After`, uso da più thread. Non serve nessun modello: libreria e orologio sono simulati | vedi intestazione del file |
 | `fuzz_model_loader.py` | fuzzing a mutazione del caricamento modelli (safetensors/GGUF) | `python3 test/fuzz_model_loader.py <sd-cli> --seconds 300` |
 
 Per il fuzzing è consigliata una build con AddressSanitizer:

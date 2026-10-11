@@ -1,60 +1,237 @@
 name: Release portable package
 
-# Builds relocatable packages with dynamic ggml backends
-# (see docs/build.md, "Build a portable package").
+# Builds relocatable packages with dynamic ggml backends (see docs/build.md,
+# "Build a portable package"). Every package carries the CPU backend plus the
+# GPU module listed below. A module whose driver is missing on the user's
+# machine is skipped at runtime, so the same zip still runs without a GPU.
+#
+#   linux-x86_64            CPU + Vulkan
+#   darwin-arm64            CPU + Metal
+#   windows-x86_64          CPU + Vulkan (NVIDIA, AMD and Intel GPUs)
+#   windows-x86_64-cuda12   CPU + CUDA 12 (NVIDIA), CUDA runtime DLLs included
+#
+# Run it by hand from the Actions tab (on any branch) or push a "portable-v*"
+# tag, which also attaches the zips to a release.
 
 on:
   workflow_dispatch:
+    inputs:
+      targets:
+        description: "Packages to build: 'all' or a comma-separated list of the names above"
+        type: string
+        default: all
+      cuda_architectures:
+        description: "CUDA architectures of the cuda12 package (a single one, such as 86, builds much faster)"
+        type: string
+        default: "61;70;75;80;86;89;90;100;120"
   push:
     tags:
       - "portable-v*"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      include: ${{ steps.plan.outputs.include }}
+    steps:
+      - name: Select the packages
+        id: plan
+        shell: bash
+        env:
+          TARGETS: ${{ inputs.targets }}
+          CUDA_ARCHITECTURES: ${{ inputs.cuda_architectures }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import sys
+
+          packages = [
+              {"name": "linux-x86_64", "os": "ubuntu-latest", "gpu": "vulkan", "variant": "vulkan"},
+              {"name": "darwin-arm64", "os": "macos-14", "gpu": "metal", "variant": "metal"},
+              {"name": "windows-x86_64", "os": "windows-2022", "gpu": "vulkan", "variant": "vulkan"},
+              {"name": "windows-x86_64-cuda12", "os": "windows-2022", "gpu": "cuda", "variant": "cuda12"},
+          ]
+
+          wanted = [w.strip() for w in os.environ.get("TARGETS", "").split(",") if w.strip()]
+          if not wanted or "all" in wanted:
+              chosen = packages
+          else:
+              known = [p["name"] for p in packages]
+              unknown = [w for w in wanted if w not in known]
+              if unknown:
+                  sys.exit("unknown package(s): %s (known: %s)" % (", ".join(unknown), ", ".join(known)))
+              chosen = [p for p in packages if p["name"] in wanted]
+
+          # Same default as the workflow_dispatch input; tag pushes have no inputs.
+          archs = os.environ.get("CUDA_ARCHITECTURES", "").strip() or "61;70;75;80;86;89;90;100;120"
+          arch = r"[0-9]+[a-z]?(-real|-virtual)?"
+          if not re.fullmatch("%s(;%s)*" % (arch, arch), archs):
+              sys.exit("invalid CUDA architectures: " + archs)
+          for p in chosen:
+              if p["gpu"] == "cuda":
+                  p["cuda_architectures"] = archs
+
+          print(json.dumps(chosen, indent=2))
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write("include=" + json.dumps(chosen) + "\n")
+          PY
+
   package:
+    needs: plan
+    name: ${{ matrix.name }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-latest
-            name: linux-x86_64
-            cmake_args: >-
-              -DGGML_CPU_ALL_VARIANTS=ON -DGGML_NATIVE=OFF
-          - os: macos-14
-            name: darwin-arm64
-            cmake_args: >-
-              -DSD_METAL=ON
-          - os: windows-latest
-            name: windows-x86_64
-            cmake_args: >-
-              -DGGML_CPU_ALL_VARIANTS=ON -DGGML_NATIVE=OFF
+        include: ${{ fromJSON(needs.plan.outputs.include) }}
 
     runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: false
+          submodules: recursive
 
-      - name: Checkout required submodules
-        run: git submodule update --init ggml thirdparty/libwebp thirdparty/libwebm
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.15.1
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential ninja-build libvulkan-dev glslc spirv-headers
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja
+
+      - name: Install the CUDA toolkit (Windows)
+        id: cuda-toolkit
+        if: runner.os == 'Windows' && matrix.gpu == 'cuda'
+        uses: Jimver/cuda-toolkit@v0.2.22
+        with:
+          cuda: "12.8.1"
+          method: "network"
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "thrust", "visual_studio_integration"]'
+
+      - name: Install the Vulkan SDK (Windows)
+        if: runner.os == 'Windows' && matrix.gpu == 'vulkan'
+        shell: pwsh
+        env:
+          VULKAN_VERSION: 1.4.328.1
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP 'VulkanSDK-Installer.exe'
+          curl.exe -o $installer -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Start-Process -FilePath $installer -ArgumentList '--accept-licenses', '--default-answer', '--confirm-command', 'install' -Wait
+          $sdk = "C:\VulkanSDK\${env:VULKAN_VERSION}"
+          for ($i = 0; $i -lt 60 -and -not ((Test-Path "$sdk\Bin\glslc.exe") -and (Test-Path "$sdk\Lib\vulkan-1.lib")); $i++) { Start-Sleep -Seconds 5 }
+          if (-not (Test-Path "$sdk\Bin\glslc.exe")) { throw "The Vulkan SDK was not installed in $sdk" }
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=$sdk"
+          Add-Content $env:GITHUB_PATH "$sdk\Bin"
 
       - name: Setup MSVC (Windows)
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
 
-      - name: Configure
-        shell: bash
-        run: >-
-          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-          -DSD_BUILD_SHARED_GGML_LIB=ON -DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON
-          ${{ matrix.cmake_args }}
+      - name: Configure and build (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          GPU: ${{ matrix.gpu }}
+          CUDA_ARCHITECTURES: ${{ matrix.cuda_architectures }}
+        run: |
+          $cmakeArgs = @(
+              '-G', 'Ninja',
+              '-DCMAKE_BUILD_TYPE=Release',
+              '-DCMAKE_C_COMPILER=cl.exe',
+              '-DCMAKE_CXX_COMPILER=cl.exe',
+              '-DCMAKE_CXX_FLAGS=/bigobj',
+              '-DGGML_NATIVE=OFF',
+              '-DSD_BUILD_SHARED_LIBS=ON',
+              '-DSD_BUILD_SHARED_GGML_LIB=ON',
+              '-DGGML_BACKEND_DL=ON',
+              '-DGGML_CPU_ALL_VARIANTS=ON'
+          )
+          if ($env:GPU -eq 'vulkan') { $cmakeArgs += '-DSD_VULKAN=ON' }
+          if ($env:GPU -eq 'cuda') {
+              $cmakeArgs += '-DSD_CUDA=ON'
+              $cmakeArgs += "-DCMAKE_CUDA_ARCHITECTURES=$env:CUDA_ARCHITECTURES"
+          }
+          cmake -S . -B build @cmakeArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Build
+      - name: Configure and build (Linux, macOS)
+        if: runner.os != 'Windows'
         shell: bash
-        run: cmake --build build -j
+        env:
+          GPU: ${{ matrix.gpu }}
+        run: |
+          args=(
+            -G Ninja
+            -DCMAKE_BUILD_TYPE=Release
+            -DSD_BUILD_SHARED_LIBS=ON
+            -DSD_BUILD_SHARED_GGML_LIB=ON
+            -DBUILD_SHARED_LIBS=ON
+            -DGGML_BACKEND_DL=ON
+          )
+          case "$GPU" in
+            vulkan) args+=(-DSD_VULKAN=ON) ;;
+            metal) args+=(-DSD_METAL=ON) ;;
+          esac
+          if [ "$RUNNER_OS" = Linux ]; then
+            # $ORIGIN keeps the shared libraries found after the zip is unpacked elsewhere.
+            args+=(-DGGML_NATIVE=OFF -DGGML_CPU_ALL_VARIANTS=ON -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON '-DCMAKE_INSTALL_RPATH=$ORIGIN')
+          fi
+          cmake -S . -B build "${args[@]}"
+          cmake --build build
+
+      - name: Bundle the CUDA runtime (Windows)
+        if: runner.os == 'Windows' && matrix.gpu == 'cuda'
+        shell: pwsh
+        env:
+          CUDA_ROOT: ${{ steps.cuda-toolkit.outputs.CUDA_PATH }}
+        run: |
+          foreach ($pattern in 'cudart64_*.dll', 'cublas64_*.dll', 'cublasLt64_*.dll') {
+              $files = @(Get-ChildItem -Path (Join-Path $env:CUDA_ROOT 'bin') -Filter $pattern)
+              if ($files.Count -eq 0) { throw "CUDA runtime library not found: $pattern in $env:CUDA_ROOT" }
+              Copy-Item -Path $files.FullName -Destination 'build\bin\'
+          }
+
+      - name: Smoke test
+        shell: bash
+        run: |
+          exe=build/bin/sd-cli
+          [ -x "$exe" ] || exe="$exe.exe"
+          status=0
+          "$exe" --list-devices || status=$?
+          if [ "$status" -ne 0 ] && [ "$RUNNER_OS" = Windows ]; then
+            # Git Bash reports a program that cannot start because a DLL is missing as status 127, without a message.
+            echo "::error::$exe --list-devices exited with status $status"
+            system32="$(cygpath -u "${SYSTEMROOT:-${SystemRoot:-/c/Windows}}")/System32"
+            for file in "$exe" build/bin/stable-diffusion.dll build/bin/ggml.dll build/bin/ggml-base.dll; do
+              echo "::group::DLLs imported by $file"
+              dumpbin -dependents "$file" | tr -d '\r' | grep -i -E '^ +[^ ]+\.dll$' | while read -r dll; do
+                case "$dll" in api-ms-win-* | ext-ms-win-*) continue ;; esac
+                if [ -e "build/bin/$dll" ] || [ -e "$system32/$dll" ]; then echo "  $dll"; else echo "  $dll   <-- NOT FOUND"; fi
+              done || true
+              echo "::endgroup::"
+            done
+          fi
+          exit "$status"
 
       - name: Security smoke test
         if: runner.os != 'Windows'
@@ -63,15 +240,32 @@ jobs:
 
       - name: Package
         shell: bash
+        env:
+          PORTABLE_VARIANT: ${{ matrix.variant }}
+          PORTABLE_REQUIRE_BACKENDS: ${{ matrix.gpu }}
         run: ./scripts/package_portable.sh build dist
 
       - uses: actions/upload-artifact@v4
         with:
           name: portable-${{ matrix.name }}
           path: dist/*.zip
+          compression-level: 0
+          if-no-files-found: error
 
-      - name: Attach to release
-        if: startsWith(github.ref, 'refs/tags/')
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: portable-*
+          path: dist
+          merge-multiple: true
+
+      - name: Attach to the release
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*.zip

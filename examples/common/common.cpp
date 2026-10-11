@@ -10,6 +10,7 @@
 #include <iomanip>
 #include <iostream>
 #include <regex>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <type_traits>
@@ -259,14 +260,25 @@ void add_log_options(ArgOptions& options, sd_log_level_t& level) {
                                       }});
 }
 
+static std::set<std::string>& options_given() {
+    static std::set<std::string> given;
+    return given;
+}
+
+bool option_was_given(const std::string& name) {
+    return options_given().count(name) > 0;
+}
+
 bool parse_options(int argc, const char** argv, const std::vector<ArgOptions>& options_list) {
     bool invalid_arg = false;
     std::string arg;
+    options_given().clear();
 
     auto match_and_apply = [&](auto& opts, auto&& apply_fn) -> bool {
         for (auto& option : opts) {
             if ((option.short_name.size() > 0 && arg == option.short_name) ||
                 (option.long_name.size() > 0 && arg == option.long_name)) {
+                options_given().insert(option.long_name.empty() ? option.short_name : option.long_name);
                 apply_fn(option);
                 return true;
             }
@@ -373,6 +385,23 @@ static int parse_scale_override(int argc, const char** argv, int index, float& s
         }
         scale = parsed;
     } catch (const std::exception&) {
+        return -1;
+    }
+    return 1;
+}
+
+static int parse_on_off_arg(int argc, const char** argv, int index, const char* option, bool& value) {
+    if (++index >= argc) {
+        LOG_ERROR("%s requires 'on' or 'off'", option);
+        return -1;
+    }
+    const std::string arg = argv[index];
+    if (arg == "on") {
+        value = true;
+    } else if (arg == "off") {
+        value = false;
+    } else {
+        LOG_ERROR("invalid %s value '%s'; expected 'on' or 'off'", option, argv[index]);
         return -1;
     }
     return 1;
@@ -564,6 +593,12 @@ ArgOptions SDContextParams::get_options() {
          "optional per-device budget in GiB for managed weights and runner buffers during automatic graph-cut execution. Accepts a single value or assignments by backend/device, e.g. 6 or cuda0=6,vulkan0=4. 0 uses live free VRAM without an explicit budget; a negative value reserves that much free VRAM",
          0,
          &max_vram},
+        {"",
+         "--profile",
+         "resource profile: max (engine defaults), balanced (memory guard at 90), lite (also text encoder on the CPU, tiled VAE, unbatched CFG, guard at 85) "
+         "or auto (picks one from the model size, the free RAM and the free GPU memory). Options given explicitly on the command line always win",
+         0,
+         &profile},
     };
 
     options.int_options = {
@@ -578,7 +613,9 @@ ArgOptions SDContextParams::get_options() {
          &conditioning_cache_size},
         {"",
          "--memory-guard",
-         "device memory usage percent that triggers pressure reduction (weight eviction, prefetch pause) before allocations fail, e.g. 90 (default: 0, disabled)",
+         "memory usage percent (device memory, or system RAM on CPU backends) that triggers pressure reduction (weight eviction, prefetch pause) before allocations fail, e.g. 90 (default: 0, disabled). "
+         "On CPU backends, weights still to be read from disk count before they are loaded, and the graph runs in segments when they would not fit. "
+         "With no GPU, --auto-fit enables it at 90 when some weights do not fit in RAM",
          &memory_guard},
     };
 
@@ -643,23 +680,6 @@ ArgOptions SDContextParams::get_options() {
          "--vae-conv-direct",
          "use direct 2D and 3D convolutions in the vae model",
          true, &vae_conv_direct},
-    };
-
-    auto on_auto_fit_arg = [&](int argc, const char** argv, int index) {
-        if (++index >= argc) {
-            LOG_ERROR("--auto-fit requires 'on' or 'off'");
-            return -1;
-        }
-        const std::string arg = argv[index];
-        if (arg == "on") {
-            auto_fit = true;
-        } else if (arg == "off") {
-            auto_fit = false;
-        } else {
-            LOG_ERROR("invalid --auto-fit value '%s'; expected 'on' or 'off'", argv[index]);
-            return -1;
-        }
-        return 1;
     };
 
     auto on_type_arg = [&](int argc, const char** argv, int index) {
@@ -749,8 +769,17 @@ ArgOptions SDContextParams::get_options() {
          "--auto-fit",
          "on|off (default: on). Preserve --backend (otherwise select one GPU) and place weights on the compute GPU, "
          "RAM, another GPU, or disk in that order, according to available memory (--max-vram limits GPU budgets). "
+         "With no GPU, each component stays in RAM if it fits in the available RAM and is read from disk otherwise. "
          "Disabled by explicit --params-backend; uses automatic graph segmentation when needed",
-         on_auto_fit_arg},
+         [this](int argc, const char** argv, int index) {
+             return parse_on_off_arg(argc, argv, index, "--auto-fit", auto_fit);
+         }},
+        {"",
+         "--batched-cfg",
+         "on|off (default: on). Run the conditional and unconditional CFG branches in one batched UNet forward when supported",
+         [this](int argc, const char** argv, int index) {
+             return parse_on_off_arg(argc, argv, index, "--batched-cfg", batched_cfg);
+         }},
         {"",
          "--type",
          "weight type (examples: f32, f16, q4_0, q4_1, q5_0, q5_1, q8_0, q2_K, q3_K, q4_K). "
@@ -961,9 +990,11 @@ std::string SDContextParams::to_string() const {
         << "  offload_params_to_cpu: " << (offload_params_to_cpu ? "true" : "false") << ",\n"
         << "  max_vram: \"" << max_vram << "\",\n"
         << "  memory_guard: " << memory_guard << ",\n"
+        << "  profile: \"" << profile << "\",\n"
         << "  disable_backend_fallback: " << (disable_backend_fallback ? "true" : "false") << ",\n"
         << "  disable_prefetch: " << (disable_prefetch ? "true" : "false") << ",\n"
         << "  disable_segmented_compute: " << (disable_segmented_compute ? "true" : "false") << ",\n"
+        << "  batched_cfg: " << (batched_cfg ? "true" : "false") << ",\n"
         << "  eager_load: " << (eager_load ? "true" : "false") << ",\n"
         << "  backend: \"" << backend << "\",\n"
         << "  params_backend: \"" << params_backend << "\",\n"
@@ -1048,6 +1079,7 @@ sd_ctx_params_t SDContextParams::to_sd_ctx_params_t(bool taesd_preview) {
     sd_ctx_params.disable_backend_fallback        = disable_backend_fallback;
     sd_ctx_params.disable_prefetch                = disable_prefetch;
     sd_ctx_params.disable_segmented_compute       = disable_segmented_compute;
+    sd_ctx_params.batched_cfg                     = batched_cfg;
     sd_ctx_params.eager_load                      = eager_load;
     sd_ctx_params.backend                         = effective_backend.c_str();
     sd_ctx_params.params_backend                  = effective_params_backend.c_str();
@@ -2982,6 +3014,15 @@ std::string SDGenerationParams::to_string() const {
 
 std::string version_string() {
     return std::string("stable-diffusion.cpp version ") + sd_version() + ", commit " + sd_commit();
+}
+
+std::string last_error_text() {
+    char message[512];
+    const sd_error_code_t code = sd_get_last_error(message, sizeof(message));
+    if (code == SD_ERROR_NONE) {
+        return "";
+    }
+    return std::string(sd_error_code_name(code)) + ": " + message;
 }
 
 static std::string safe_json_string(const char* value) {

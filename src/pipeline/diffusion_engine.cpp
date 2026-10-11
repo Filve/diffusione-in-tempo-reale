@@ -17,6 +17,7 @@
 #include "core/ggml_graph_cut.h"
 #include "core/ggml_runner.h"
 #include "core/ggml_tensor_utils.h"
+#include "core/last_error.h"
 #include "core/layer_split_partition.h"
 #include "model.h"
 
@@ -108,6 +109,7 @@ const char* model_version_to_str[] = {
     "PixArt",
     "Ming-Image",
     "Z-Image L2P",
+    "Iris-3B",
 };
 
 static_assert(VERSION_COUNT == sizeof(model_version_to_str) / sizeof(model_version_to_str[0]),
@@ -314,7 +316,7 @@ bool StableDiffusionGGML::apply_model_update(ModelLoader candidate,
 ggml_backend_t StableDiffusionGGML::backend_for(SDBackendModule module) {
     ggml_backend_t module_backend = backend_manager.runtime_backend(module);
     if (module_backend == nullptr) {
-        LOG_ERROR("failed to initialize %s backend", sd_backend_module_name(module));
+        LOG_ERROR_CODE(SD_ERROR_BACKEND, "failed to initialize %s backend", sd_backend_module_name(module));
     }
     return module_backend;
 }
@@ -322,7 +324,7 @@ ggml_backend_t StableDiffusionGGML::backend_for(SDBackendModule module) {
 ggml_backend_t StableDiffusionGGML::params_backend_for(SDBackendModule module) {
     ggml_backend_t module_backend = backend_manager.params_backend(module);
     if (module_backend == nullptr) {
-        LOG_ERROR("failed to initialize %s params backend", sd_backend_module_name(module));
+        LOG_ERROR_CODE(SD_ERROR_BACKEND, "failed to initialize %s params backend", sd_backend_module_name(module));
     }
     return module_backend;
 }
@@ -644,7 +646,7 @@ bool StableDiffusionGGML::init_backend() {
     }
     const bool already_cpu = backend_spec == "cpu" && params_backend_spec.empty();
     if (backend_fallback_disabled || already_cpu) {
-        LOG_ERROR("backend config failed: %s", error.c_str());
+        LOG_ERROR_CODE(SD_ERROR_BACKEND, "backend config failed: %s", error.c_str());
         return false;
     }
     LOG_WARN("backend config failed (%s); falling back to the cpu backend "
@@ -654,7 +656,7 @@ bool StableDiffusionGGML::init_backend() {
     params_backend_spec.clear();
     split_mode_spec.clear();
     if (!backend_manager.init("cpu", "", "", &error)) {
-        LOG_ERROR("cpu fallback failed: %s", error.c_str());
+        LOG_ERROR_CODE(SD_ERROR_BACKEND, "cpu fallback failed: %s", error.c_str());
         return false;
     }
     return ensure_backend_pair(SDBackendModule::DIFFUSION);
@@ -742,7 +744,7 @@ bool StableDiffusionGGML::init_model_loader(ModelLoader& model_loader, ModelConf
     if (strlen(SAFE_STR(sd_ctx_params->model_path)) > 0) {
         LOG_INFO("loading model from '%s'", sd_ctx_params->model_path);
         if (!model_loader.init_from_file(sd_ctx_params->model_path)) {
-            LOG_ERROR("init model loader from file failed: '%s'", sd_ctx_params->model_path);
+            LOG_ERROR_CODE(SD_ERROR_MODEL_FILE, "init model loader from file failed: '%s'", sd_ctx_params->model_path);
         }
     }
 
@@ -1009,19 +1011,24 @@ bool StableDiffusionGGML::init(const sd_ctx_params_t* sd_ctx_params) {
 
     version = model_loader.get_sd_version();
     if (version == VERSION_COUNT) {
-        LOG_ERROR("get sd version from file failed: '%s'", SAFE_STR(sd_ctx_params->model_path));
+        LOG_ERROR_CODE(SD_ERROR_MODEL_FILE, "get sd version from file failed: '%s'", SAFE_STR(sd_ctx_params->model_path));
         return false;
     } else {
         LOG_INFO("Version: %s ", model_version_to_str[version]);
     }
 
     if (auto_fit_enabled) {
+        int memory_guard_percent = sd_ctx_params->memory_guard;
         if (!sd::backend_fit::derive_backend_specs(model_loader,
                                                    sd_type_to_ggml_type(sd_ctx_params->wtype),
                                                    max_vram_assignment,
                                                    backend_spec,
-                                                   params_backend_spec)) {
+                                                   params_backend_spec,
+                                                   memory_guard_percent)) {
             return false;
+        }
+        if (memory_guard_percent != sd_ctx_params->memory_guard) {
+            model_manager->set_memory_guard_percent(memory_guard_percent);
         }
     }
 
@@ -1287,7 +1294,7 @@ bool StableDiffusionGGML::validate_and_load_runners() {
 
     model_manager->set_common_ignore_tensors(ignore_tensors);
     if (!model_manager->validate_registered_tensors()) {
-        LOG_ERROR("model metadata validation failed");
+        LOG_ERROR_CODE(SD_ERROR_MODEL_FILE, "model metadata validation failed");
         return false;
     }
 
@@ -1406,7 +1413,8 @@ bool StableDiffusionGGML::build_denoiser() {
                    sd_version_is_llada_image(version) ||
                    sd_version_is_boogu_image(version) ||
                    sd_version_is_pid(version) ||
-                   sd_version_is_ideogram4(version)) {
+                   sd_version_is_ideogram4(version) ||
+                   version == VERSION_IRIS) {
             pred_type = FLOW_PRED;
             if (sd_version_is_wan(version)) {
                 default_flow_shift = 5.f;
@@ -1414,7 +1422,7 @@ bool StableDiffusionGGML::build_denoiser() {
                 default_flow_shift = 7.f;
             } else if (sd_version_is_minimax_h3(version)) {
                 default_flow_shift = 12.f;
-            } else if (sd_version_is_ernie_image(version)) {
+            } else if (sd_version_is_ernie_image(version) || version == VERSION_IRIS) {
                 default_flow_shift = 4.f;
             } else if (sd_version_is_pid(version)) {
                 default_flow_shift = 1.5f;
@@ -2252,6 +2260,27 @@ void StableDiffusionGGML::report_sample_progress(int step,
     }
 }
 
+static sd::Tensor<float> batch_two_condition_tensors(const sd::Tensor<float>& a, const sd::Tensor<float>& b) {
+    if (a.empty() || b.empty() || a.dim() != b.dim()) {
+        return {};
+    }
+    if (a.dim() == 1) {
+        if (a.shape() != b.shape()) {
+            return {};
+        }
+        auto batched = sd::ops::concat(a, b, 0);
+        batched.reshape_({a.shape()[0], 2});
+        return batched;
+    }
+    const int64_t batch_dim = a.dim() - 1;
+    for (int64_t d = 0; d < batch_dim; d++) {
+        if (a.shape()[d] != b.shape()[d]) {
+            return {};
+        }
+    }
+    return sd::ops::concat(a, b, static_cast<size_t>(batch_dim));
+}
+
 void StableDiffusionGGML::compute_sample_controls(const sd::Tensor<float>& control_image,
                                                   const sd::Tensor<float>& noised_input,
                                                   const sd::Tensor<float>& timesteps_tensor,
@@ -2629,6 +2658,57 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
             return output_opt;
         };
 
+        auto run_batched_condition = [&](const SDCondition& condition,
+                                         const sd::Tensor<float>* c_concat_override) -> sd::Tensor<float> {
+            const sd::Tensor<float>& condition_concat =
+                c_concat_override != nullptr ? *c_concat_override : condition.c_concat;
+
+            sd::Tensor<float> batched_context = batch_two_condition_tensors(condition.c_crossattn, uncond.c_crossattn);
+            sd::Tensor<float> batched_y       = batch_two_condition_tensors(condition.c_vector, uncond.c_vector);
+            sd::Tensor<float> batched_concat  = batch_two_condition_tensors(condition_concat, uncond.c_concat);
+            if (!condition.c_crossattn.empty() && batched_context.empty()) {
+                return {};
+            }
+            if ((!condition.c_vector.empty() || !uncond.c_vector.empty()) && batched_y.empty()) {
+                return {};
+            }
+            if ((!condition_concat.empty() || !uncond.c_concat.empty()) && batched_concat.empty()) {
+                return {};
+            }
+
+            std::vector<sd::Tensor<float>> uncond_controls;
+            compute_sample_controls(control_image, noised_input, timesteps_tensor, uncond, &uncond_controls);
+            if (controls.size() != uncond_controls.size()) {
+                return {};
+            }
+            std::vector<sd::Tensor<float>> batched_controls;
+            batched_controls.reserve(controls.size());
+            for (size_t i = 0; i < controls.size(); i++) {
+                sd::Tensor<float> batched_control = batch_two_condition_tensors(controls[i], uncond_controls[i]);
+                if (batched_control.empty()) {
+                    return {};
+                }
+                batched_controls.push_back(std::move(batched_control));
+            }
+
+            sd::Tensor<float> batched_x =
+                sd::ops::concat(noised_input, noised_input, static_cast<size_t>(noised_input.dim() - 1));
+
+            DiffusionParams batched_params = diffusion_params;
+            batched_params.x               = &batched_x;
+            batched_params.context         = batched_context.empty() ? nullptr : &batched_context;
+            batched_params.c_concat        = batched_concat.empty() ? nullptr : &batched_concat;
+            batched_params.y               = batched_y.empty() ? nullptr : &batched_y;
+            batched_params.ref_latents     = nullptr;
+            batched_params.extra           = UNetDiffusionExtra{1, &batched_controls, control_strength};
+
+            sd::Tensor<float> output = work_diffusion_model->compute(n_threads, batched_params);
+            if (output.empty()) {
+                LOG_ERROR("batched diffusion model compute failed");
+            }
+            return output;
+        };
+
         const SDCondition* positive_condition      = &cond;
         const sd::Tensor<float>* c_concat_override = nullptr;
         for (const auto& extension : generation_extensions) {
@@ -2668,12 +2748,40 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
             }
         }
 
-        cond_out = run_condition(*positive_condition, c_concat_override);
-        if (cond_out.empty()) {
-            return {};
+        const bool batch_cfg_ok = config_->params.batched_cfg &&
+                                  sd_version_is_unet(version) &&
+                                  !uncond.empty() &&
+                                  img_uncond.empty() &&
+                                  !skip_uncond &&
+                                  !cache_runtime.ucache_enabled() &&
+                                  !(is_skiplayer_step && slg_uncond) &&
+                                  ip_adapter_tokens.empty() &&
+                                  ip_adapter_uncond_tokens.empty() &&
+                                  !config_->animatediff_loaded &&
+                                  (noised_input.dim() < 4 || noised_input.shape()[3] <= 1) &&
+                                  std::none_of(generation_extensions.begin(),
+                                               generation_extensions.end(),
+                                               [](const std::shared_ptr<GenerationExtension>& extension) {
+                                                   return extension->is_enabled();
+                                               });
+
+        if (batch_cfg_ok) {
+            sd::Tensor<float> batched_out = run_batched_condition(*positive_condition, c_concat_override);
+            if (!batched_out.empty() && batched_out.dim() >= 4 && batched_out.shape()[3] == 2) {
+                auto parts    = sd::ops::chunk(batched_out, 2, 3);
+                cond_out      = std::move(parts[0]);
+                uncond_out    = std::move(parts[1]);
+            }
         }
 
-        if (!uncond.empty()) {
+        if (cond_out.empty()) {
+            cond_out = run_condition(*positive_condition, c_concat_override);
+            if (cond_out.empty()) {
+                return {};
+            }
+        }
+
+        if (uncond_out.empty() && !uncond.empty()) {
             if (!skip_uncond) {
                 const std::vector<int>* uncond_skip_layers = nullptr;
                 if (is_skiplayer_step && slg_uncond) {
@@ -2792,7 +2900,7 @@ int StableDiffusionGGML::get_diffusion_model_down_factor() {
     if (sd_version_is_dit(version)) {
         if (sd_version_is_sensenova_u1(version)) {
             down_factor = 32;
-        } else if (sd_version_is_z_image_l2p(version)) {
+        } else if (sd_version_is_z_image_l2p(version) || version == VERSION_IRIS) {
             down_factor = 16;
         } else if (version == VERSION_QWEN_IMAGE_2_1 || version == VERSION_MING_IMAGE || sd_version_is_wan(version) || sd_version_is_lingbot_video(version) || sd_version_is_minimax_h3(version) || sd_version_is_pixart(version)) {
             down_factor = 2;
@@ -2826,7 +2934,7 @@ int StableDiffusionGGML::get_latent_channel() {
             latent_channel = 3;
         } else if (sd_version_is_z_image_l2p(version)) {
             latent_channel = 3;
-        } else if (sd_version_is_pid(version)) {
+        } else if (sd_version_is_pid(version) || version == VERSION_IRIS) {
             latent_channel = 3;
         } else if (sd_version_is_sefi_image(version)) {
             latent_channel = 144;
@@ -2927,7 +3035,7 @@ sd::Tensor<float> StableDiffusionGGML::encode_first_stage(const sd::Tensor<float
 }
 
 sd::Tensor<float> StableDiffusionGGML::decode_first_stage(const sd::Tensor<float>& x, bool decode_video) {
-    if (sd_version_is_pid(version) || sd_version_is_minit2i(version)) {
+    if (sd_version_is_pid(version) || sd_version_is_minit2i(version) || version == VERSION_IRIS) {
         return sd::ops::clamp((x + 1.f) * 0.5f, 0.0f, 1.0f);
     }
     auto latents                      = first_stage_model->diffusion_to_vae_latents(x);

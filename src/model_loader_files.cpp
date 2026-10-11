@@ -209,9 +209,13 @@ bool ModelLoader::del_file(FileId id) {
     if (it == files_.end()) {
         return false;
     }
+    const std::vector<FileStamp> released = it->dependencies;
     files_.erase(it);
     ++revision_;
     rebuild_catalog();
+    for (const auto& stamp : released) {
+        file_pool_.close_idle(stamp.path);
+    }
     return true;
 }
 
@@ -311,6 +315,7 @@ ModelLoader ModelLoader::file_reader(FileId id, SDVersion version) const {
     ModelLoader reader;
     reader.file_paths_      = file_paths_;
     reader.n_threads_       = n_threads_;
+    reader.file_pool_       = file_pool_;
     reader.version_         = version;
     reader.names_converted_ = true;
     for (const auto& file : files_) {

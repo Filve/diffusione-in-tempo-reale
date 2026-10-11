@@ -109,6 +109,9 @@ struct ArgOptions {
 
 void add_log_options(ArgOptions& options, sd_log_level_t& level);
 bool parse_options(int argc, const char** argv, const std::vector<ArgOptions>& options_list);
+// Whether the last parse_options() call found the option on the command line. Pass the long name
+// (e.g. "--memory-guard"), or the short one for an option that has no long name.
+bool option_was_given(const std::string& name);
 bool decode_base64_image(const std::string& encoded_input,
                          int target_channels,
                          int expected_width,
@@ -155,10 +158,12 @@ struct SDContextParams {
     bool offload_params_to_cpu     = false;
     std::string max_vram           = "0";
     int memory_guard               = 0;
+    std::string profile;
     bool disable_backend_fallback  = false;
     bool disable_prefetch          = false;
     bool disable_segmented_compute = false;
     bool eager_load                = false;
+    bool batched_cfg               = true;
     std::string backend;
     std::string params_backend;
     std::string split_mode;
@@ -282,7 +287,7 @@ struct SDGenerationParams {
     // Derived and normalized fields.
     std::string prompt_with_lora;  // for metadata record only
     std::vector<sd_lora_t> lora_vec;
-    sd_hires_upscaler_t resolved_hires_upscaler;
+    sd_hires_upscaler_t resolved_hires_upscaler = SD_HIRES_UPSCALER_NONE;
 
     // Owned execution payload.
     SDImageOwner init_image;
@@ -332,6 +337,8 @@ struct SDGenerationParams {
 };
 
 std::string version_string();
+// "<code name>: <message>" for the latest failed library call of this thread; empty when it did not fail.
+std::string last_error_text();
 std::string build_sdcpp_image_metadata_json(const SDContextParams& ctx_params,
                                             const SDGenerationParams& gen_params,
                                             int64_t seed,

@@ -1,4 +1,5 @@
-// Robustness test for the public C API (device enumeration, param defaults).
+// Robustness test for the public C API (device enumeration, param defaults, error reporting,
+// system memory).
 // Build (from the repository root, after building the static library):
 //   clang++ -std=c++17 -g -fsanitize=address,undefined -Iinclude test/api_robustness.cpp \
 //       build/libstable-diffusion.a build/ggml/src/libggml.a build/ggml/src/libggml-cpu.a \
@@ -83,6 +84,65 @@ int main() {
     CHECK(s != nullptr && strstr(s, "memory_guard") && strstr(s, "disable_backend_fallback"),
           "to_str includes new fields");
     free(s);
+
+    sd_system_memory_t memory;
+    CHECK(!sd_get_system_memory(nullptr), "system_memory(null out) rejected");
+    memset(&memory, 0xAB, sizeof(memory));
+    const bool have_memory = sd_get_system_memory(&memory);
+#if defined(__linux__) || defined(_WIN32) || defined(__APPLE__)
+    CHECK(have_memory && memory.total_bytes > 0 && memory.available_bytes > 0, "system memory is reported");
+#endif
+    CHECK(!have_memory || memory.total_bytes == 0 || memory.available_bytes <= memory.total_bytes,
+          "available RAM never exceeds the total");
+    CHECK(!have_memory || memory.total_bytes == 0 || memory.process_bytes <= memory.total_bytes,
+          "process RAM never exceeds the total");
+    for (size_t i = 0; i < n; i++) {
+        if (sd_get_device_info(i, &info) && info.type == SD_DEVICE_TYPE_CPU && have_memory && memory.available_bytes > 0) {
+            const uint64_t spread = info.free_memory_bytes > memory.available_bytes
+                                        ? info.free_memory_bytes - memory.available_bytes
+                                        : memory.available_bytes - info.free_memory_bytes;
+            CHECK(spread < (uint64_t)1 << 30, "CPU device reports the available RAM as free memory");
+        }
+    }
+
+    char message[256];
+    CHECK(sd_get_last_error(nullptr, 0) == SD_ERROR_NONE, "no error before any failure; null buffer accepted");
+    CHECK(new_sd_ctx(nullptr) == nullptr, "new_sd_ctx(null) fails");
+    CHECK(sd_get_last_error(message, sizeof(message)) == SD_ERROR_INVALID_ARGUMENT && message[0] != '\0',
+          "null parameters are an invalid argument, with a message");
+    char tiny_message[8];
+    memset(tiny_message, 'x', sizeof(tiny_message));
+    CHECK(sd_get_last_error(tiny_message, sizeof(tiny_message)) == SD_ERROR_INVALID_ARGUMENT &&
+              memchr(tiny_message, 0, sizeof(tiny_message)) != nullptr,
+          "a small message buffer is truncated and terminated");
+    CHECK(sd_get_last_error(message, 0) == SD_ERROR_INVALID_ARGUMENT, "a zero-size buffer is accepted");
+
+    sd_ctx_params_t missing;
+    sd_ctx_params_init(&missing);
+    missing.model_path = "/nonexistent/diffusione/model.safetensors";
+    CHECK(new_sd_ctx(&missing) == nullptr, "new_sd_ctx(missing model) fails");
+    CHECK(sd_get_last_error(message, sizeof(message)) == SD_ERROR_MODEL_FILE && strstr(message, "nonexistent") != nullptr,
+          "a missing model is a model file error that names the file");
+
+    sd_image_t* images = (sd_image_t*)0x1;
+    int image_count    = 7;
+    CHECK(!generate_image(nullptr, nullptr, &images, &image_count) && images == nullptr && image_count == 0,
+          "generate_image(null) fails and clears the outputs");
+    CHECK(sd_get_last_error(message, sizeof(message)) == SD_ERROR_INVALID_ARGUMENT, "generate_image(null) is an invalid argument");
+
+    std::thread other([&] {
+        CHECK(sd_get_last_error(nullptr, 0) == SD_ERROR_NONE, "the error state belongs to the thread that made the call");
+    });
+    other.join();
+
+    CHECK(strcmp(sd_error_code_name(SD_ERROR_OUT_OF_MEMORY), "out_of_memory") == 0 &&
+              strcmp(sd_error_code_name(SD_ERROR_MODEL_FILE), "model_file") == 0 &&
+              strcmp(sd_error_code_name(SD_ERROR_BACKEND), "backend") == 0 &&
+              strcmp(sd_error_code_name(SD_ERROR_BUSY), "busy") == 0 &&
+              strcmp(sd_error_code_name(SD_ERROR_CANCELLED), "cancelled") == 0 &&
+              strcmp(sd_error_code_name(SD_ERROR_NONE), "none") == 0 &&
+              strcmp(sd_error_code_name((sd_error_code_t)9999), "unknown") == 0,
+          "error code names");
 
     printf("\n%s (%d failures)\n", failures ? "TEST FAILED" : "ALL TESTS PASSED", failures);
     return failures ? 1 : 0;

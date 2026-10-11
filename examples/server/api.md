@@ -53,11 +53,76 @@ Native async API for `stable-diffusion.cpp`.
 Current endpoints include:
 
 - `GET /sdcpp/v1/capabilities`
+- `GET /sdcpp/v1/health`
+- `GET /sdcpp/v1/resources`
 - `POST /sdcpp/v1/img_gen`
 - `GET /sdcpp/v1/jobs/{id}`
 - `POST /sdcpp/v1/jobs/{id}/cancel`
 - `POST /sdcpp/v1/vid_gen`
 - `POST /sdcpp/v1/upscale`
+
+## Failures and recovery
+
+A generation that cannot be served is answered the same way by all three API families
+(for `sdcpp API` jobs, the same `code` is reported in the `error` of the failed job).
+
+| Status | `code` | Meaning |
+| --- | --- | --- |
+| `503 Service Unavailable` | `out_of_memory` | The machine ran out of memory, even after the server tried the lighter configurations described below. Retry later, or send a smaller request. |
+| `503 Service Unavailable` | `unavailable` | The server has no usable model at this moment, for example because loading it again after a failure did not succeed yet. `cause` holds the reason. |
+| `503 Service Unavailable` | `busy` | The model was in use. |
+| `400 Bad Request` | `invalid_argument` | The request cannot be generated as it is (for example a size the model cannot handle). Retrying it unchanged will not help. |
+| `500 Internal Server Error` | `model_file`, `backend`, `generation_failed` | A model file could not be read, a compute device failed, or the generation failed without a more specific reason. |
+
+The body is a JSON object, and a `503` also carries a `Retry-After` header:
+
+```json
+{
+  "error": "unet compute buffer allocation failed (out of memory)",
+  "code": "out_of_memory",
+  "retry_after_seconds": 30
+}
+```
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `error` | `string` | Human-readable reason |
+| `code` | `string` | One of the codes above |
+| `cause` | `string` | Only with `unavailable`: the code of the failure that left the server without a model |
+| `retry_after_seconds` | `integer` | Only with `503`: how long to wait before trying again; mirrors the `Retry-After` header |
+
+Other `4xx` answers (`400` for a malformed request, `429` when the job queue is full, `401` for a missing API key, ...)
+keep their meaning. A `429` carries `Retry-After: 10`.
+
+### Stepping down
+
+A request that fails because the machine ran out of memory (or because a compute device failed) does not end the
+server and is not simply refused. The server frees the model, loads it again with the next lighter profile of the
+ladder `max > balanced > lite > lite-disk > lite-cpu`, and runs the same request again:
+
+| Profile | What changes |
+| --- | --- |
+| `balanced` | `--memory-guard 90` |
+| `lite` | memory guard 85, text encoder on the CPU, VAE decoded in tiles, no batched CFG |
+| `lite-disk` | weights are streamed from disk (`--params-backend disk`) instead of being kept in memory; `--eager-load` is switched off |
+| `lite-cpu` | everything is computed on the CPU (only when the machine has another device) |
+
+Steps that would load the same configuration as the previous one are skipped, so the ladder is shorter when
+the server was started with some of these options already. The profile the server was started with
+(`--profile`, default `max`) is the top of the ladder. From `lite` on, the VAE is decoded in tiles whatever the
+request asked. A device failure goes straight to the last profile of the ladder, `lite-cpu`.
+
+A request served after a step-down is a normal `200`. When even the lightest profile does not fit, the request
+fails with the `503` above, and the server stays up, on the lightest profile that could load the model.
+
+After `--degradation-cooldown` seconds (default `300`) the server climbs back one profile, at the beginning of the next
+request, which pays for loading the model again. A climb that does not work is undone and the wait doubles (up to an
+hour); a climb that works resets it. With `--degradation-cooldown 0` the server stays where it stepped down,
+and with `--disable-degradation` it never steps down: such a request is answered with the error at once.
+`GET /sdcpp/v1/health` reports the profile in use.
+
+If the model cannot be loaded again after a failure, requests are answered with `503` / `unavailable` and
+the server tries again from the next request on, no more often than every 15 seconds.
 
 ## `sd_cpp_extra_args`
 
@@ -649,6 +714,99 @@ Fields returned in `features_by_mode.vid_gen`:
 - `cancel_generating`
 - `preview`
 
+#### `GET /sdcpp/v1/health`
+
+Reports whether the server can generate and how it is coping with the memory of the machine. It never waits for a
+generation in progress, so it answers quickly even while the server is busy. It needs the API key when one is set.
+
+Example response:
+
+```json
+{
+  "status": "degraded",
+  "model_loaded": true,
+  "profile": "lite",
+  "base_profile": "max",
+  "degradation": true,
+  "busy": false,
+  "counters": {
+    "requests": 12,
+    "succeeded": 11,
+    "failed": 1,
+    "recovered": 2,
+    "step_downs": 3,
+    "promotions": 1,
+    "failed_promotions": 0,
+    "rebuilds": 4
+  },
+  "last_error": {
+    "code": "out_of_memory",
+    "message": "unet compute buffer allocation failed (out of memory)",
+    "at": 1775401204
+  },
+  "next_promotion_seconds": 214,
+  "uptime_seconds": 3601,
+  "version": "stable-diffusion.cpp ...",
+  "queue": {
+    "pending": 0,
+    "waiting": 0,
+    "max": 64
+  }
+}
+```
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `status` | `string` | `ok`, `degraded` (running on a lighter profile than the one it was started with), `recovering` (the model is being loaded), `unavailable` (no usable model at the moment), or `no_model` (started without a model) |
+| `model_loaded` | `boolean` | |
+| `profile` | `string \| null` | Profile in use: `max`, `balanced`, `lite`, `lite-disk` or `lite-cpu`; `null` without a model |
+| `base_profile` | `string` | Profile the server was started with |
+| `degradation` | `boolean` | `false` with `--disable-degradation` |
+| `busy` | `boolean` | A generation is running |
+| `counters` | `object` | Since the start. `requests`, `succeeded`, `failed`; `recovered` is the number of requests served after a step-down; `step_downs`, `promotions`, `failed_promotions` and `rebuilds` (times the model was loaded again) |
+| `last_error` | `object \| null` | Last failure the server saw (`code`, `message`, `at` as a Unix time). Invalid requests are not recorded |
+| `next_promotion_seconds` | `integer \| null` | Seconds until the next attempt to climb back; `null` when the server is on its base profile or does not climb |
+| `uptime_seconds` | `integer` | |
+| `version` | `string` | |
+| `queue` | `object` | Jobs of the async API: `pending` (queued or generating), `waiting` (queued) and `max` (limit before `429`) |
+
+Typical status codes:
+
+- `200 OK`
+- `503 Service Unavailable` only when `status` is `unavailable`; the body is the same
+
+#### `GET /sdcpp/v1/resources`
+
+Reports the memory the server can see right now, for clients that want to size a request before sending it.
+It needs the API key when one is set.
+
+Example response:
+
+```json
+{
+  "system_memory": {
+    "total_bytes": 17179869184,
+    "available_bytes": 9126805504,
+    "process_bytes": 3221225472
+  },
+  "devices": [
+    {
+      "name": "CUDA0",
+      "description": "NVIDIA GeForce RTX ...",
+      "type": "gpu",
+      "free_memory_bytes": 3758096384,
+      "total_memory_bytes": 6442450944
+    }
+  ]
+}
+```
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `system_memory` | `object \| null` | RAM of the machine (`total_bytes`, `available_bytes`) and the memory used by the server process (`process_bytes`); `null` where the platform does not report it |
+| `devices` | `array<object>` | The compute devices, as listed by `--list-devices` |
+| `devices[].type` | `string` | `cpu`, `gpu`, `igpu`, `accel` or `unknown` |
+
 #### `POST /sdcpp/v1/img_gen`
 
 Submits an async image generation job.
@@ -725,6 +883,7 @@ Typical status codes:
 - `200 OK`
 - `400 Bad Request` (invalid request, unsupported output format, unreadable image, incompatible upscaler, or output dimensions exceeding the limit)
 - `500 Internal Server Error`
+- `503 Service Unavailable` when the machine runs out of memory (see [Failures and recovery](#failures-and-recovery))
 
 Notes:
 
@@ -1028,6 +1187,10 @@ Example failed job:
 }
 ```
 
+`error.code` is `generation_failed` when the cause is not known, or one of `out_of_memory`, `model_file`,
+`backend`, `invalid_argument`, `busy` or `unavailable` (see [Failures and recovery](#failures-and-recovery)).
+A job that failed for lack of memory has already been tried on every lighter profile the server could use.
+
 ### Cancelled Result
 
 Example cancelled job:
@@ -1055,7 +1218,7 @@ Example cancelled job:
 
 - `202 Accepted` when the job is created
 - `400 Bad Request` for an empty body, unsupported model mode, invalid JSON, or invalid generation parameters
-- `429 Too Many Requests` when the job queue is full
+- `429 Too Many Requests` when the job queue is full (with `Retry-After: 10`)
 - `500 Internal Server Error` for unexpected server exceptions during submission
 
 ### `vid_gen`
@@ -1441,6 +1604,8 @@ Example failed job:
 }
 ```
 
+`error.code` takes the same values as for `img_gen` jobs.
+
 ### Cancelled Result
 
 Example cancelled job:
@@ -1468,5 +1633,5 @@ Example cancelled job:
 
 - `202 Accepted` when the job is created
 - `400 Bad Request` for an empty body, unsupported model mode, invalid JSON, invalid generation parameters, or an unsupported output format
-- `429 Too Many Requests` when the job queue is full
+- `429 Too Many Requests` when the job queue is full (with `Retry-After: 10`)
 - `500 Internal Server Error` for unexpected server exceptions during submission

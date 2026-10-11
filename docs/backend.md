@@ -95,6 +95,17 @@ free/total memory when the backend reports it. Host applications can query the
 same information through `sd_get_device_count()` / `sd_get_device_info()` in
 the C API.
 
+## Diagnosing a GPU that does not show up
+
+With dynamic backends (`GGML_BACKEND_DL`), ggml loads the GPU modules silently in
+Release builds, and on Windows it never reports the operating system error. After
+the first load, this fork logs on stderr, for each GPU module found next to the
+executable or in the working directory that provides no device, why it could not be
+used (the `dlopen` error on Linux/macOS; on Windows the error code plus the DLLs the
+module imports that cannot be found, such as `cublas64_12.dll`), with a hint. When no
+GPU module is present at all it says where it looked. These are warnings and notes,
+not errors: the CPU backend keeps working.
+
 ## CPU fallback
 
 If a requested backend is unavailable at context creation (for example a
@@ -199,6 +210,17 @@ weight to be copied again at every step.
 RAM and GPU budgets are shared across components. Each component uses a single
 parameter backend; several other GPUs' capacities are not combined to store
 one component. If available RAM cannot be queried, RAM residency is skipped.
+
+Without a GPU (a CPU-only machine, or every GPU backend unavailable) the same
+planning runs against the CPU: the diffusion model, text encoder and VAE are
+considered in the usual order, and each one stays in RAM if its weights fit in
+what is left of the available RAM after the 2 GiB / 10% margin and the largest
+compute reserve (computation also needs RAM). A component that does not fit
+reads its weights from disk, and auto-fit then turns the memory guard on at 90%
+(unless `--memory-guard` is set) so that the graph runs in segments and weights
+are released between them. When everything fits, the plan changes nothing and
+the log says `auto-fit: CPU only; the weights fit in RAM`. If available RAM
+cannot be queried, the default backend and placement are used.
 Weights stored on another GPU are copied to the component's compute devices for
 execution. CPU modules use RAM or disk. Compute reserves and cache priority are
 accounted for separately on each device, so a CPU module does not reserve GPU

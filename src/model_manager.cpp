@@ -7,7 +7,9 @@
 #include <tuple>
 #include <unordered_set>
 
+#include "core/backend_fit.h"
 #include "core/ggml_extend_backend.h"
+#include "core/last_error.h"
 #include "core/util.h"
 #include "model/adapter/lora.hpp"
 
@@ -567,8 +569,8 @@ bool ModelManager::stage_tensors_to_compute_backend(const std::vector<TensorStat
             ggml_backend_buffer_t compute_buffer =
                 ggml_backend_alloc_ctx_tensors_from_buft(staging_ctx, staging_buft);
             if (compute_buffer == nullptr) {
-                LOG_ERROR("model manager alloc compute params backend buffer failed, num_tensors = %zu",
-                              staged_tensors.size());
+                LOG_ERROR_CODE(SD_ERROR_OUT_OF_MEMORY, "model manager alloc compute params backend buffer failed, num_tensors = %zu",
+                               staged_tensors.size());
                 ggml_free(staging_ctx);
                 return false;
             }
@@ -896,8 +898,8 @@ bool ModelManager::alloc_params_buffers(const std::vector<TensorState*>& states,
 
             ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(params_buft, chunk_size);
             if (buffer == nullptr) {
-                LOG_ERROR("model manager alloc params backend buffer failed, size = %.2fMB",
-                          chunk_size / (1024.0 * 1024.0));
+                LOG_ERROR_CODE(SD_ERROR_OUT_OF_MEMORY, "model manager alloc params backend buffer failed, size = %.2fMB",
+                               chunk_size / (1024.0 * 1024.0));
                 return false;
             }
             ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
@@ -1799,11 +1801,31 @@ ModelManager::CapacityCheck ModelManager::check_capacity(
     return result;
 }
 
+// On the CPU backend system RAM stands in for device memory. ggml reports no usable
+// free figure for the CPU device outside Windows, so availability comes from the OS probe.
+static sd::MemoryWatchdog::Sample system_ram_sample(ggml_backend_t backend, size_t pending_allocation_bytes) {
+    sd::MemoryWatchdog::Sample sample;
+    size_t free_bytes = 0, total_bytes = 0;
+    if (auto device = ggml_backend_get_device(backend)) {
+        ggml_backend_dev_memory(device, &free_bytes, &total_bytes);
+    }
+    const int64_t available = sd::backend_fit::available_ram_bytes();
+    if (total_bytes == 0 || available < 0) {
+        return sample;
+    }
+    const size_t used  = total_bytes - std::min(static_cast<size_t>(available), total_bytes);
+    sample.limit_bytes = total_bytes;
+    sample.used_bytes  = pending_allocation_bytes > SIZE_MAX - used ? SIZE_MAX : used + pending_allocation_bytes;
+    return sample;
+}
+
 sd::MemoryWatchdog::Sample ModelManager::memory_guard_sample(const DeviceMemoryRequest& request) const {
     sd::MemoryWatchdog::Sample sample;
-    if (!memory_watchdog_.enabled() || request.compute_backend == nullptr ||
-        sd_backend_is_cpu(request.compute_backend)) {
+    if (!memory_watchdog_.enabled() || request.compute_backend == nullptr) {
         return sample;
+    }
+    if (sd_backend_is_cpu(request.compute_backend)) {
+        return system_ram_sample(request.compute_backend, request.pending_allocation_bytes);
     }
     auto add             = [](size_t a, size_t b) { return b > SIZE_MAX - a ? SIZE_MAX : a + b; };
     const size_t tracked = add(compute_backend_resident_bytes(request.compute_backend),
@@ -1842,12 +1864,52 @@ bool ModelManager::memory_guard_ok(const DeviceMemoryRequest& request) const {
            sd::MemoryWatchdog::Pressure::None;
 }
 
+// Weights read from disk into host memory become resident in system RAM, but the guard only
+// sees RAM that is already in use. Counting the weights this graph still has to load lets it
+// tell before loading whether the whole graph fits or has to run in segments.
+DeviceMemoryRequest ModelManager::with_streamed_weights(DeviceMemoryRequest request,
+                                                        const std::vector<TensorState*>& states) const {
+    std::vector<TensorState*> streamed;
+    for (TensorState* state : states) {
+        if (state != nullptr && state->residency_mode == ResidencyMode::Disk) {
+            streamed.push_back(state);
+        }
+    }
+    const size_t missing             = compute_backend_alloc_size(streamed, true);
+    request.pending_allocation_bytes = missing > SIZE_MAX - request.pending_allocation_bytes
+                                           ? SIZE_MAX
+                                           : request.pending_allocation_bytes + missing;
+    return request;
+}
+
+bool ModelManager::segmenting_can_save_memory(const std::vector<ggml_tensor*>& params,
+                                              ggml_backend_t compute_backend) const {
+    if (compute_backend == nullptr || !sd_backend_is_cpu(compute_backend)) {
+        return true;
+    }
+    if (!memory_watchdog_.enabled()) {
+        return false;
+    }
+    std::vector<TensorState*> states;
+    if (!resolve_required_tensor_states(params, states, compute_backend)) {
+        return false;
+    }
+    return std::any_of(states.begin(), states.end(), [](const TensorState* state) {
+        return state != nullptr && state->residency_mode == ResidencyMode::Disk;
+    });
+}
+
 bool ModelManager::fits_compute_backend_capacity(
     const DeviceMemoryRequest& request,
     const std::vector<ggml_tensor*>& required_params) const {
     std::vector<TensorState*> states;
-    return resolve_required_tensor_states(required_params, states, request.compute_backend) &&
-           check_capacity(request, states).fits() && memory_guard_ok(request);
+    if (!resolve_required_tensor_states(required_params, states, request.compute_backend)) {
+        return false;
+    }
+    if (request.compute_backend != nullptr && sd_backend_is_cpu(request.compute_backend)) {
+        return memory_guard_ok(with_streamed_weights(request, states));
+    }
+    return check_capacity(request, states).fits() && memory_guard_ok(request);
 }
 
 bool ModelManager::ensure_compute_backend_capacity(
@@ -1865,13 +1927,16 @@ bool ModelManager::ensure_compute_backend_capacity(
         LOG_ERROR("model manager cannot reclaim memory for a null compute backend");
         return false;
     }
-    if (sd_backend_is_cpu(compute_backend)) {
+    const bool host_backend = sd_backend_is_cpu(compute_backend);
+    if (host_backend && !memory_watchdog_.enabled()) {
         return true;
     }
 
-    memory_watchdog_.observe(compute_backend, memory_guard_sample(request));
-    auto fits      = [&]() { return check_capacity(request, required_states).fits(); };
-    auto satisfied = [&]() { return fits() && memory_guard_ok(request); };
+    const DeviceMemoryRequest guard_request = host_backend ? with_streamed_weights(request, required_states) : request;
+    memory_watchdog_.observe(compute_backend, memory_guard_sample(guard_request), !host_backend);
+    // System RAM has no managed capacity on the CPU: only the memory guard applies there.
+    auto fits      = [&]() { return host_backend || check_capacity(request, required_states).fits(); };
+    auto satisfied = [&]() { return fits() && memory_guard_ok(guard_request); };
     if (satisfied()) {
         return true;
     }
@@ -1950,12 +2015,64 @@ bool ModelManager::ensure_compute_backend_capacity(
     }
 
     // The guard target is best effort: never fail a graph that still fits.
-    if (fits()) {
-        memory_watchdog_.observe(compute_backend, memory_guard_sample(request));
+    auto accept_if_fits = [&]() {
+        if (!fits()) {
+            return false;
+        }
+        memory_watchdog_.observe(compute_backend, memory_guard_sample(guard_request), !host_backend);
         if (memory_watchdog_.should_log_unreachable(compute_backend)) {
             LOG_WARN("memory guard: cannot reduce %s below %d%% usage, continuing under pressure",
                      ggml_backend_name(compute_backend), memory_watchdog_.threshold_percent());
         }
+        return true;
+    };
+    if (accept_if_fits()) {
+        return true;
+    }
+
+    // The loader retains mmap buffers after storage blocks are released, so
+    // demoting mapped states would only force duplicate allocations on reload.
+    std::unordered_set<TensorState*> mapped_states;
+    for (const auto& block : params_storage_blocks_) {
+        if (!block->mmap_tensor_stores.empty()) {
+            mapped_states.insert(block->states.begin(), block->states.end());
+        }
+    }
+    std::unordered_set<TensorState*> required_set(required_states.begin(), required_states.end());
+    std::vector<TensorState*> demoted_states;
+    auto revert_demotions = [&]() {
+        for (TensorState* state : demoted_states) {
+            if (state->loaded_to_params_backend) {
+                state->residency_mode = ResidencyMode::ParamBackend;
+            }
+        }
+    };
+    auto can_demote_to_disk = [&](TensorState* state) {
+        return state != nullptr && state->tensor != nullptr && state->tensor->view_src == nullptr &&
+               state->residency_mode == ResidencyMode::ParamBackend &&
+               state->params_backend != nullptr && state->params_backend == state->compute_backend &&
+               state->compute_backend == compute_backend && !sd_backend_is_cpu(state->params_backend) &&
+               state->pin_count == 0 && !state->staged_to_compute_backend && state->loaded_to_params_backend &&
+               protected_states.find(state) == protected_states.end() &&
+               required_set.find(state) == required_set.end() &&
+               mapped_states.find(state) == mapped_states.end() &&
+               !state->sources.empty() && state->applied_lora_epoch == UINT64_MAX &&
+               state->split_buffer_type == nullptr;
+    };
+    for (TensorState* state : global_candidates) {
+        if (!can_demote_to_disk(state)) {
+            continue;
+        }
+        state->residency_mode = ResidencyMode::Disk;
+        demoted_states.push_back(state);
+        add_evictable_state(state);
+        if (release_eviction_states()) {
+            revert_demotions();
+            return true;
+        }
+    }
+    revert_demotions();
+    if (accept_if_fits()) {
         return true;
     }
 

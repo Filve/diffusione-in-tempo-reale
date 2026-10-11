@@ -11,6 +11,7 @@ namespace sd {
             threshold_percent_ = 0;
             states_.clear();
             unreachable_logged_.clear();
+            prefetch_exempt_.clear();
             return;
         }
         const int clamped = std::min(std::max(percent, 50), 99);
@@ -39,10 +40,15 @@ namespace sd {
         return Pressure::None;
     }
 
-    MemoryWatchdog::Pressure MemoryWatchdog::observe(ggml_backend_t backend, const Sample& sample) {
+    MemoryWatchdog::Pressure MemoryWatchdog::observe(ggml_backend_t backend, const Sample& sample, bool gates_prefetch) {
         const Pressure pressure = classify(sample);
         if (!enabled() || backend == nullptr) {
             return pressure;
+        }
+        if (gates_prefetch) {
+            prefetch_exempt_.erase(backend);
+        } else {
+            prefetch_exempt_.insert(backend);
         }
         Pressure& state = states_[backend];
         if (pressure != state) {
@@ -69,7 +75,7 @@ namespace sd {
             return false;
         }
         for (const auto& entry : states_) {
-            if (entry.second != Pressure::None) {
+            if (entry.second != Pressure::None && prefetch_exempt_.find(entry.first) == prefetch_exempt_.end()) {
                 return true;
             }
         }

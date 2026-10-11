@@ -25,10 +25,13 @@ controllato:
 | Rilevamento device | `sd_get_device_count()` / `sd_get_device_info()` elencano CPU, GPU e acceleratori con tipo e memoria, prima di caricare un modello | sempre disponibile |
 | Fallback CPU | se il backend richiesto non esiste o non si inizializza, il contesto passa alla CPU con un avviso invece di fallire | **attivo** |
 | Memory guard | sopra una soglia di memoria libera pressione (evict dei pesi, prefetch sospeso) prima che l'allocazione fallisca | **disattivo** |
+| Profili di risorse | `--profile lite\|balanced\|max\|auto` imposta in un colpo guardiano di memoria, encoder di testo su CPU, VAE a tasselli e CFG non raggruppato; `auto` sceglie dalla dimensione del modello e dalla memoria libera | **disattivo** (come `max`) |
+| Errori classificati e memoria di sistema | dopo un fallimento `sd_get_last_error()` dà un codice (memoria esaurita, file del modello, backend, ...) e il motivo; `sd_get_system_memory()` riporta RAM totale, disponibile e del processo | sempre disponibile |
 | Server senza modello | `sd-server` parte anche senza `-m`: device e upscale funzionano, la generazione risponde con un errore chiaro | **attivo** |
+| Server che resta in piedi | una richiesta che esaurisce la memoria non ferma `sd-server`: il modello viene ricaricato con un profilo più leggero (`max > balanced > lite > lite-disk > lite-cpu`) e la richiesta ripetuta; se nemmeno il più leggero basta, risposta `503` con `Retry-After`; dopo una pausa il server risale. `GET /sdcpp/v1/health` e `/resources` | **attivo** (`--disable-degradation` lo spegne) |
 | Autenticazione server | `--api-key` (Bearer o `X-API-Key`) e allowlist CORS `--cors-origins` | **disattivi** |
 | Pacchetto portabile | backend ggml come librerie dinamiche caricate a runtime: un solo pacchetto, ogni macchina usa ciò che ha | opzionale in build |
-| Release automatiche | workflow `release-portable.yml`: zip per Linux/macOS/Windows a ogni tag `portable-v*` | su tag |
+| Release automatiche | workflow `release-portable.yml`: zip con GPU (Windows CUDA 12 e Vulkan, Linux Vulkan, macOS Metal) a ogni tag `portable-v*` o avvio manuale | su tag |
 | Suite di test | `test/`: smoke di sicurezza, robustezza API, fuzzer del caricamento modelli | manuale |
 
 L'unico cambio di comportamento predefinito rispetto a upstream è il fallback
@@ -319,13 +322,15 @@ Che cosa è automatico e che cosa no:
 
 | Sintomo | Causa tipica | Che cosa fare |
 |---|---|---|
-| `--list-devices` mostra solo `CPU` | build senza backend GPU, SDK assente in build, driver mancante, o DLL dei backend non accanto all'eseguibile | ricompilare con l'SDK installato; verificare driver; controllare la cartella davvero usata dall'applicazione |
+| `--list-devices` mostra solo `CPU` | build senza backend GPU, SDK assente in build, driver mancante, o DLL dei backend non accanto all'eseguibile | leggere il log (stderr): una riga `[W] CUDA backend: ggml-cuda.dll found in ... was not usable: <motivo>` dice perché il modulo GPU presente non si è caricato (su Windows elenca anche le DLL mancanti, per esempio `cublas64_12.dll`); `[I] no GPU backend module ... found in: <cartelle>` significa che nessun modulo GPU è accanto all'eseguibile (pacchetto o build senza GPU). Poi: driver aggiornato, pacchetto giusto (`cuda12` per NVIDIA), cartella davvero usata dall'applicazione |
 | `auto-fit: no GPU devices` nei log | come sopra: il motore non vede acceleratori | stessa verifica; un'etichetta "GPU" nei log dell'applicazione non prova nulla |
 | HTTP **502** da un proxy durante una generazione lunga | il proxy ha un timeout (es. la `fetch` di Node abbandona dopo ~5 minuti senza risposta) mentre il motore sta ancora calcolando | non reinviare alla cieca; usare API a job asincroni con polling; controllare i log del servizio |
-| Il motore si chiude durante il caricamento pesi con `read tensor data failed` | pressione di memoria estrema durante letture grandi, oppure file del modello incompleto | liberare RAM o usare `--params-backend disk`; verificare l'integrità del file (dimensione attesa vs reale) |
+| Il motore si chiude durante il caricamento pesi con `read tensor data failed` | pressione di memoria estrema durante letture grandi, oppure file del modello incompleto | liberare RAM o usare `--params-backend disk`; verificare l'integrità del file (dimensione attesa vs reale). Prima di arrendersi il motore riapre il file e ripete la lettura una volta: se compare anche solo `read from '...' failed; reopening the file and trying again` il problema è stato assorbito, se subito dopo c'è `read tensor data failed` no |
+| `open '...' failed (attempt N/5): errno=..., doserrno=...` | il sistema ha rifiutato l'apertura del file del modello (su Windows: blocco temporaneo di un antivirus o di un altro programma, risorse di sistema scarse) | il motore riprova da solo fino a 5 volte; se tutti i tentativi falliscono, inviare le righe `errno`/`doserrno`: indicano la causa reale |
 | Windows impedisce l'avvio dell'eseguibile (EACCES/EPERM) | policy di sicurezza, es. Smart App Control, o binario bloccato | controllare Sicurezza di Windows e i registri CodeIntegrity; usare binari attendibili; **non** disattivare le protezioni |
 | Generazione lentissima (minuti per passo) | esecuzione sulla CPU, risoluzione alta, o modello troppo grande per la memoria | verificare i device; ridurre risoluzione/passi; modello quantizzato; build GPU |
-| Avviso "memory guard: pressure" nei log | la memoria del device ha superato la soglia `--memory-guard` | è un avviso con riduzione automatica della residenza: evitare nuove richieste finché non segnala il recupero |
+| Avviso "memory guard: pressure" nei log | la memoria del device (su CPU: la RAM di sistema) ha superato la soglia `--memory-guard` | è un avviso con riduzione automatica della residenza: evitare nuove richieste finché non segnala il recupero |
+| `auto-fit: CPU only; ...` nei log | senza GPU il motore ha confrontato la RAM disponibile con le dimensioni dei componenti | `the weights fit in RAM`: nessuna azione. `some weights do not fit in RAM; enabling the memory guard at 90%`: i componenti che non ci stanno restano su disco e il grafo gira a segmenti; è più lento ma serve proprio a non esaurire la RAM |
 
 ### 2.9 Pacchetto portabile (consigliato per la distribuzione)
 ```shell
@@ -371,11 +376,38 @@ con il generatore Visual Studio finiscono invece in `build/bin/Release` e lo
 script non li trova. Il pacchetto è rilocabile all'interno della stessa
 piattaforma e architettura: si scompatta e si usa, senza installazione.
 Il workflow GitHub Actions `release-portable.yml` produce automaticamente gli
-zip per Linux x86-64, macOS arm64 e Windows x86-64 (con varianti CPU
-SSE/AVX/AVX2/AVX-512 su x86 per le macchine più vecchie) a ogni tag
-`portable-v*` o avvio manuale. I pacchetti di release non sono un singolo
-binario multipiattaforma: scegliere quello corrispondente al sistema operativo
-e all'architettura del computer di destinazione.
+zip (con varianti CPU SSE/AVX/AVX2/AVX-512 su x86 per le macchine più vecchie)
+a ogni tag `portable-v*` o avvio manuale. I pacchetti di release non sono un
+singolo binario multipiattaforma: scegliere quello corrispondente al sistema
+operativo e all'architettura del computer di destinazione.
+
+#### Pacchetti con GPU già pronti
+
+| Pacchetto | Backend GPU | Quando sceglierlo |
+|---|---|---|
+| `windows-x86_64-cuda12` | CUDA 12 | Windows con scheda **NVIDIA**: è il più veloce su NVIDIA. Le DLL di CUDA (`cudart`, `cublas`, `cublasLt`) sono già nello zip: serve solo un driver NVIDIA aggiornato |
+| `windows-x86_64` | Vulkan | Windows con GPU AMD, Intel o NVIDIA; Vulkan arriva con il driver grafico. Senza driver Vulkan il programma usa la CPU |
+| `linux-x86_64` | Vulkan | Linux con driver grafico che fornisce `libvulkan.so.1` |
+| `darwin-arm64` | Metal | Mac con Apple Silicon |
+
+Ogni pacchetto contiene anche il backend CPU: se il modulo GPU non si carica
+(driver assente o troppo vecchio) il programma parte comunque sulla CPU, e il
+log spiega perché il modulo GPU è stato scartato. Non servono SDK o compilatori
+sulla macchina di destinazione. Su Windows serve il Microsoft Visual C++
+Redistributable 2015-2022 (x64), di solito già presente.
+
+Per ottenerli senza tag: scheda **Actions** del repository, workflow
+"Release portable package", **Run workflow**, scegliendo il ramo. Gli ingressi
+sono `targets` (`all` oppure l'elenco dei nomi sopra, separati da virgola) e
+`cuda_architectures` (predefinito: tutte le generazioni NVIDIA da Pascal a
+Blackwell; per una scheda sola, per esempio `86` per le GeForce RTX serie 30,
+la compilazione CUDA è molto più breve). Gli zip compaiono tra gli artefatti
+dell'esecuzione (`portable-<nome>`) e, con un tag, nella release. Lo script di
+packaging rifiuta di creare lo zip se il modulo GPU (o le DLL di CUDA) mancano,
+così un pacchetto "con GPU" non può in silenzio funzionare solo sulla CPU.
+
+Verifica dopo lo scompattamento: `sd-cli --list-devices` deve elencare, oltre
+alla CPU, una riga di tipo `gpu` (o `igpu`).
 
 ## 3. Come collegarlo a un progetto
 
@@ -418,7 +450,8 @@ Il ciclo di vita completo, nell'ordine tecnico corretto:
    default; poi valorizzare solo i campi necessari (tabella sotto).
 4. **Creazione del contesto**: `new_sd_ctx(&cp)` — carica il modello, sceglie
    e inizializza i backend (auto-fit + fallback CPU); è l'operazione costosa
-   (secondi–minuti). Restituisce `NULL` in caso di errore (motivo nei log).
+   (secondi–minuti). Restituisce `NULL` in caso di errore (motivo con
+   `sd_get_last_error()` e nei log).
 5. **Avanzamento** (facoltativo): `sd_set_progress_callback(cb, data)` riceve
    `(step, steps, time, data)` a ogni passo di campionamento — è ciò che serve
    per una progress bar.
@@ -448,7 +481,7 @@ default):
 | `backend` | assegnazione backend, es. `"cpu"`, `"vulkan0"`, `"diffusion=cuda0,te=cpu"`; vuoto = migliore disponibile | auto |
 | `params_backend` | dove risiedono i pesi: `"cpu"` (RAM), `"disk"`, per modulo | auto-fit |
 | `max_vram` | budget per device in GiB, es. `"6"` o `"cuda0=6,vulkan0=4"`; `-1` = riserva 1 GiB | memoria libera |
-| `memory_guard` | soglia % del guardiano di memoria (50–99); `0` = spento | `0` |
+| `memory_guard` | soglia % del guardiano di memoria (50–99): memoria del device, su CPU la RAM di sistema; `0` = spento | `0` |
 | `disable_backend_fallback` | `true` = fallire invece di ripiegare sulla CPU | `false` |
 | `enable_mmap` | mappa i pesi dal file invece di copiarli in RAM | `false` |
 | `wtype` | forza il tipo dei pesi (quantizzazione a caricamento) | tipo del file |
@@ -478,6 +511,9 @@ int main(int argc, char** argv) {
 
     sd_ctx_t* ctx = new_sd_ctx(&cp);
     if (ctx == NULL) {                // modello non valido o backend non disponibile
+        char reason[512];
+        enum sd_error_code_t code = sd_get_last_error(reason, sizeof(reason));
+        fprintf(stderr, "new_sd_ctx: %s: %s\n", sd_error_code_name(code), reason);
         return 1;
     }
 
@@ -507,6 +543,18 @@ Regole importanti per chi integra:
 - Chiamare sempre `sd_ctx_params_init()` e `sd_img_gen_params_init()` prima di
   valorizzare i campi: senza init i campi contengono valori casuali.
 - Controllare sempre il valore di ritorno di `new_sd_ctx()` e `generate_image()`.
+- **Errori**: dopo un fallimento `sd_get_last_error(buffer, dimensione)`
+  restituisce il codice (`SD_ERROR_OUT_OF_MEMORY`, `SD_ERROR_MODEL_FILE`,
+  `SD_ERROR_BACKEND`, `SD_ERROR_INVALID_ARGUMENT`, `SD_ERROR_BUSY`,
+  `SD_ERROR_CANCELLED`, `SD_ERROR_UNKNOWN`) e, se il buffer non è nullo, il
+  testo del primo errore registrato; `sd_error_code_name()` ne dà il nome. Vale per il thread che ha
+  fatto la chiamata, si azzera all'inizio di ogni chiamata e al successo. Con
+  `SD_ERROR_OUT_OF_MEMORY` ha senso ritentare con meno memoria (profilo più
+  leggero, pesi su disco) o più tardi; il contesto resta utilizzabile dopo il
+  fallimento. Le eccezioni C++ non escono mai dall'API.
+- **Memoria di sistema**: `sd_get_system_memory(&m)` riporta RAM totale,
+  disponibile e occupata dal processo, utile per decidere prima di caricare un
+  modello o per un indicatore nell'interfaccia.
 - **Threading**: un contesto non è thread-safe; serializzare gli accessi (come
   fa `sd-server` con un mutex) oppure usare un contesto per thread.
   `sd_cancel_generation()` è pensata per essere chiamata da un altro thread.
@@ -573,6 +621,41 @@ Il server **parte anche senza modello** (niente loop né uscita silenziosa):
   scrive in console il percorso del modello e il motivo del fallimento
   (exit code 1).
 
+Il server **non cade quando la memoria finisce**:
+
+- una richiesta che esaurisce la memoria (o fa fallire un device) libera il
+  modello, lo ricarica con il profilo più leggero successivo
+  (`max > balanced > lite > lite-disk > lite-cpu`; i passi che darebbero la
+  stessa configurazione vengono saltati) e ripete **la stessa richiesta**. Da
+  `lite` in poi il VAE decodifica a tasselli qualunque cosa chieda la richiesta.
+  Con `--eager-load` il passo `lite-disk` non rilegge tutti i pesi all'avvio;
+- se nemmeno il profilo più leggero basta, la risposta è `503` con
+  l'intestazione `Retry-After` e un corpo
+  `{"error": "...", "code": "out_of_memory", "retry_after_seconds": 30}`; il
+  server resta attivo e serve le richieste più piccole. Nei job asincroni lo
+  stesso `code` compare in `error.code`. Una richiesta non valida è `400`
+  (`invalid_argument`); un file del modello illeggibile o un device guasto sono
+  `500` (`model_file`, `backend`);
+- dopo `--degradation-cooldown` secondi (predefinito 300) il server risale di un
+  profilo, all'inizio della richiesta successiva, che paga il ricaricamento del
+  modello; una risalita che non funziona viene annullata e l'attesa raddoppia
+  (fino a un'ora). `--degradation-cooldown 0` lo lascia sul profilo leggero fino
+  al riavvio; `--disable-degradation` spegne tutto e la richiesta fallisce subito;
+- se il modello non si riesce a ricaricare, le richieste ricevono `503`
+  (`unavailable`) e il server riprova a partire dalla richiesta successiva, non
+  più spesso di ogni 15 secondi;
+- se il modello non ci sta nemmeno all'avvio, il server parte con il primo
+  profilo che lo carica (il log dice quale). Se non riesce ad aprire la porta, o
+  a creare i thread del server HTTP, esce con codice 1 e un messaggio
+  invece di terminare in silenzio;
+- `GET /sdcpp/v1/health` riporta stato (`ok`, `degraded`, `recovering`,
+  `unavailable`, `no_model`), profilo in uso, contatori (richieste, discese,
+  risalite, ricaricamenti), ultimo errore e coda dei job, e risponde subito
+  anche durante una generazione; `GET /sdcpp/v1/resources` riporta RAM del
+  sistema e memoria dei device. Entrambi richiedono la chiave API se impostata.
+
+Dettagli e formato delle risposte: [examples/server/api.md](../examples/server/api.md).
+
 ## 4. Retrocompatibilità e risorse
 
 La compatibilità va considerata su più livelli: sistema operativo, architettura
@@ -583,9 +666,9 @@ per cui è stato creato, non universale.
 
 | Piattaforma del pacchetto di release | Architettura prevista | Note |
 |---|---|---|
-| Linux | x86-64 | La release include varianti CPU x86 selezionabili. Non abilita CUDA o Vulkan. La compatibilità con distribuzioni Linux meno recenti dipende anche dalla versione di glibc e dalle librerie di sistema: verificare sul sistema minimo di destinazione. |
+| Linux | x86-64 | La release include varianti CPU x86 selezionabili e il backend Vulkan (serve `libvulkan.so.1` sulla macchina); CUDA non è incluso. La compatibilità con distribuzioni Linux meno recenti dipende anche dalla versione di glibc e dalle librerie di sistema: verificare sul sistema minimo di destinazione. |
 | macOS | arm64 (Apple Silicon) | La release automatica corrente è per macOS arm64; non è un binario Intel/x86-64. Include Metal, che richiede hardware e sistema Apple compatibili. |
-| Windows | x86-64 | La release include varianti CPU x86 selezionabili, ma non abilita CUDA o Vulkan. Verificare la presenza dei runtime richiesti dal compilatore; driver GPU e backend GPU vanno predisposti separatamente nelle build personalizzate. |
+| Windows | x86-64 | Due pacchetti: `windows-x86_64` (CPU + Vulkan, per GPU NVIDIA, AMD e Intel) e `windows-x86_64-cuda12` (CPU + CUDA 12 per NVIDIA, con le DLL di CUDA incluse). Entrambi richiedono il driver grafico aggiornato e il Visual C++ Redistributable 2015-2022 (x64). |
 
 Questa tabella descrive gli artefatti generati dall'attuale workflow di release,
 non una garanzia di compatibilità con tutte le versioni storiche dei sistemi
@@ -625,12 +708,51 @@ dei pacchetti portabili automatici descritti sopra.
   a soglia +5 punti la pressione è "critica". È best effort: non fa fallire
   un grafo che ci sta comunque e non è un limite fisico assoluto, perché le
   allocazioni dei driver fuori dalla gestione del motore non sono visibili.
-  Non si applica ai backend CPU: non è un guardiano della RAM di sistema.
+  Sui backend CPU misura la RAM di sistema (memoria totale meno quella
+  disponibile senza swap, più l'allocazione che il grafo sta per fare, rispetto
+  alla RAM fisica totale): sotto pressione rilascia i pesi che si possono
+  rileggere dal file (`--params-backend disk`); i pesi presenti solo in RAM non
+  si possono rilasciare, quindi viene registrato un avviso e l'esecuzione
+  continua. La percentuale riguarda l'intera macchina, non solo questo
+  processo, e sulle piattaforme che non riportano la memoria disponibile il
+  guardiano su CPU non fa nulla.
+  I pesi che vengono letti dal disco contano prima di essere caricati: se il
+  totale supererebbe la soglia, il grafo su CPU viene eseguito a segmenti
+  (come su GPU) e il picco di memoria resta ben sotto il modello intero. Succede
+  solo se esistono pesi rilasciabili (`--params-backend disk`); con tutti i
+  pesi in RAM il grafo resta intero, perché spezzarlo non abbasserebbe il
+  picco. Senza GPU, `--auto-fit` pianifica la RAM contro la CPU e, se mette un
+  componente su disco, imposta la soglia a 90 (salvo `--memory-guard`
+  esplicito). Su Linux la memoria disponibile viene da `/proc/meminfo`, che
+  non rispecchia il limite di memoria di un container: lì conviene passare a
+  mano `--memory-guard` e `--params-backend disk`.
   Gli avvisi di pressione alta/critica e di recupero sono accessibili tramite
   il callback di log; l'applicazione ospite può mostrarli senza interrompere
-  la generazione. Un monitor RAM nell'applicazione resta un controllo separato.
+  la generazione. Un eventuale monitor RAM nell'applicazione resta un controllo
+  separato: il guardiano riduce la residenza dei pesi ma non interrompe la
+  richiesta.
+- **Profili di risorse** (`--profile <max|balanced|lite|auto>`, in `sd-cli` e
+  `sd-server`): `max` non cambia nulla; `balanced` imposta `--memory-guard 90`;
+  `lite` imposta anche `--memory-guard 85`, l'encoder di testo su CPU
+  (`--backend te=cpu`), `--vae-tiling` e `--batched-cfg off`. Le opzioni scritte
+  esplicitamente sulla riga di comando vincono sempre sul profilo
+  (`--profile lite --memory-guard 70` usa 70; `--memory-guard 0` lo lascia
+  spento). Un profilo non imposta `--params-backend` né `--backend`: la
+  collocazione dei pesi resta a `--auto-fit`. Non cambia dimensione, passi o
+  campionatore dell'immagine, solo dove va la memoria e quindi la velocità.
+  `auto` somma la dimensione dei file del modello e una riserva di lavoro
+  (1 GiB più un quinto dei pesi) e la confronta con la memoria dove avviene il
+  calcolo (la memoria libera della GPU dedicata più capiente, oppure la RAM
+  disponibile senza GPU): `max` se ci sta con un quarto di margine, `balanced`
+  se ci sta, `lite` altrimenti. La scelta e le cifre vengono scritte nel log
+  (`profile auto -> lite (model 6.9 GiB + 2.4 GiB working memory, ...)`). La
+  stima usa solo le dimensioni dei file (non legge i modelli) e non tiene conto
+  di `--type`; le soglie sono euristiche da tarare su modelli e macchine reali.
 - **Elenco dispositivi** per scegliere la strategia nell'app: tipo `cpu`,
-  `gpu`, `igpu`, `accel`; memoria 0 = non riportata dal backend.
+  `gpu`, `igpu`, `accel`; memoria 0 = non riportata dal backend. Per il device
+  CPU la memoria libera è la RAM disponibile del sistema (ggml riporta il
+  totale su Linux e macOS). Su Linux la RAM disponibile viene da
+  `/proc/meminfo` e non conosce il limite di memoria di un container.
 - **Altri motori** (MNN, ncnn, ONNX Runtime): non sono integrati in questo
   repository, perché tutto il motore è basato su ggml. Vanno trattati come
   implementazioni alternative in un livello di astrazione dell'applicazione.
@@ -784,6 +906,8 @@ sincronizzazioni future.
    (`src/core/memory_watchdog.{h,cpp}`) innestato nel `ModelManager`: sopra la
    soglia riduce la residenza dei pesi (eviction), sospende il prefetch e
    forza l'esecuzione segmentata; best effort, mai fallimenti artificiali.
+   Sui backend CPU misura la RAM di sistema e può rilasciare solo i pesi
+   rileggibili dal file (`--params-backend disk`).
    API: campo `memory_guard` in `sd_ctx_params_t`; CLI: `--memory-guard`.
    Documentato in [performance.md](./performance.md).
 2. **API di rilevamento device** — `sd_get_device_count()`,
@@ -819,8 +943,155 @@ sincronizzazioni future.
     con binari, moduli backend, licenze, LEGGIMI) e workflow
     `.github/workflows/release-portable.yml` per Linux/macOS/Windows su tag
     `portable-v*`.
+11. **Pacchetti portabili con GPU** — il workflow produce ora anche
+    `windows-x86_64-cuda12` (CUDA 12 con le DLL runtime incluse) e include
+    Vulkan in `windows-x86_64` e `linux-x86_64`; opzioni, flag di
+    compilazione e SDK allineati alla CI principale; avvio manuale con scelta
+    dei pacchetti e delle architetture CUDA; release creata da un job unico;
+    lo script di packaging verifica che il modulo GPU sia nello zip.
+12. **Diagnostica dei moduli GPU** — `src/core/backend_diag.{h,cpp}`: dopo il
+    caricamento dei backend dinamici, per ogni modulo GPU presente accanto
+    all'eseguibile (o nella cartella corrente) che non fornisce un device, il
+    log riporta il motivo reale (`dlerror`, oppure codice e DLL mancanti su
+    Windows, letti dalla tabella di importazione del file con
+    `src/core/pe_imports.{h,cpp}`) e un suggerimento. ggml li carica in
+    silenzio nelle build Release e su Windows non riporta mai l'errore del
+    sistema. Test del lettore: `test/pe_imports_test.cpp`.
+13. **File del modello aperti una volta sola** — `src/model_io/file_handle_pool.{h,cpp}`:
+    `ModelLoader` tiene aperti i flussi di lettura dei file modello e li
+    riusa tra i caricamenti dei componenti (testo, UNet, VAE), tra i segmenti
+    e tra le richieste, invece di riaprire il file a ogni lotto di pesi e per
+    ogni thread (con i pesi su disco accadeva centinaia di volte, proprio
+    quando la RAM è piena). Un flusso viene scartato se il file cambia
+    (dimensione o data) o se una lettura fallisce; in quel caso il motore
+    riapre il file e ripete la lettura una volta (`read from '...' failed;
+    reopening the file and trying again`). Anche l'apertura dei `.ckpt` ha
+    ora i tentativi ripetuti. Misure con un modello sintetico (CPU, 2 thread):
+    5 aperture del file per 3 richieste del server, invece di 9 per ciascuna;
+    un errore di lettura iniettato (EIO) viene assorbito e l'immagine resta
+    identica; errori persistenti terminano con un errore pulito. I file
+    restano aperti finché il modello è caricato: su Windows non si può
+    sostituire o cancellare il file del modello mentre il motore lo usa
+    (come già accadeva con `--mmap`). Test: `test/file_handle_pool_test.cpp`
+    (ASan/UBSan e ThreadSanitizer).
+14. **CPU senza GPU: auto-fit e grafi a segmenti** — senza GPU, `--auto-fit`
+    confronta la RAM disponibile con i componenti (pesi e riserva di
+    calcolo) e lascia su disco quelli che non ci stanno; in quel caso attiva da
+    solo la memory guard al 90% (salvo `--memory-guard` esplicito). Sui backend
+    CPU la guardia conta i pesi ancora da leggere dal disco prima di caricarli
+    e, se il totale supererebbe la soglia, il grafo gira a segmenti (come su
+    GPU) invece che intero; avviene solo se esistono pesi rilasciabili
+    (`--params-backend disk`), perché con tutti i pesi in RAM spezzare il grafo
+    non abbasserebbe il picco (`ModelManager::segmenting_can_save_memory`,
+    `src/core/backend_fit.cpp`). Misure con un modello SD 1.5 sintetico
+    (128×128, 3 passi, 2 thread, Linux, 3,3 GiB occupati da un altro processo,
+    soglia 60%): UNet in 22 segmenti, picco 732 MiB invece di 1722 MiB, 23 s
+    invece di 12 s, immagine identica pixel per pixel; con pesi residenti in
+    RAM e la stessa pressione nessuna segmentazione (come prima); senza
+    pressione il comportamento non cambia. Non ancora provato su Windows né
+    con modelli reali.
+
+15. **Errori classificati e memoria di sistema** — `src/core/last_error.{h,cpp}`
+    e `src/core/system_memory.{h,cpp}`. Dopo un fallimento di `new_sd_ctx()`,
+    `generate_image()` o `generate_video()`, `sd_get_last_error()` restituisce
+    un codice (`SD_ERROR_OUT_OF_MEMORY`, `SD_ERROR_MODEL_FILE`,
+    `SD_ERROR_BACKEND`, `SD_ERROR_INVALID_ARGUMENT`, `SD_ERROR_BUSY`,
+    `SD_ERROR_CANCELLED` per l'annullamento richiesto con
+    `sd_cancel_generation()`, `SD_ERROR_UNKNOWN`) e il testo del primo errore
+    registrato, così
+    l'applicazione distingue "riprova con meno memoria" da "file danneggiato"
+    (anche i thread del caricatore riportano i loro errori al chiamante). Le
+    eccezioni C++, `std::bad_alloc` compresa, non escono più dall'API. Un test
+    a memoria limitata (`ulimit -v`) ha mostrato un'uscita brusca del processo:
+    quando non si riusciva a creare un thread del caricatore, un `std::thread`
+    ancora attivo faceva terminare tutto con `std::terminate`; ora il
+    caricamento usa meno thread, o il thread chiamante se non ne parte nessuno.
+    `sd_get_system_memory()` riporta RAM totale, disponibile e del processo; la
+    memoria libera del device CPU in `sd_get_device_info()` è la RAM
+    disponibile. Misure con il modello sintetico da 2,1 GB (128×128, 3 passi,
+    2 thread, Linux): con 2300 MiB di spazio di indirizzi la configurazione
+    standard fallisce con `out_of_memory` (`model manager alloc params backend
+    buffer failed`), lo stesso contesto genera correttamente appena il limite
+    viene tolto e, con i pesi su disco (`--params-backend disk`), la stessa
+    richiesta riesce. Il ramo Windows di `system_memory.cpp` è stato solo
+    controllato nella sintassi con intestazioni sostitutive; macOS non è stato
+    né compilato né provato.
+
+16. **Profili di risorse** — `examples/common/profile.{h,cpp}`, opzione
+    `--profile max|balanced|lite|auto` in `sd-cli` e `sd-server`
+    (`examples/common/common.cpp` registra anche quali opzioni sono state date
+    sulla riga di comando, `option_was_given()`, perché una scelta esplicita
+    vinca sempre sul profilo). I livelli oltre `lite` (`lite-disk`: pesi in
+    streaming dal disco; `lite-cpu`: tutto sulla CPU) non sono scelte della
+    riga di comando: servono a un server che deve scendere di livello quando una
+    richiesta esaurisce la memoria. Test: `test/profile_test.cpp` (nomi, ordine
+    dei livelli, scelta automatica su una tabella di casi, precedenza delle
+    opzioni esplicite). Con il modello sintetico (CPU, 128×128, 3 passi) i tre
+    profili producono la stessa immagine; con 3,3 GiB occupati da un altro
+    processo `--profile auto` sceglie `balanced`; l'auto-fit, vedendo meno RAM,
+    mette i componenti su disco (picco 1719 MiB contro 2127 MiB a memoria
+    libera). Le soglie di `auto` non sono ancora state tarate su un modello
+    reale né su una GPU.
+
+17. **Server che non cade per la memoria** — `examples/server/recovery.{h,cpp}`:
+    `ContextKeeper` possiede il contesto del server (prima era una variabile di
+    `main`) e tutte le generazioni dei tre gruppi di endpoint passano da
+    `ContextKeeper::run()`. Su `out_of_memory` o `backend` (codici di
+    `sd_get_last_error()`) libera il modello, lo ricarica con il profilo più
+    leggero successivo e ripete la stessa richiesta (da `lite` in poi forza il
+    VAE a tasselli); un guasto di device salta direttamente a `lite-cpu`. Il
+    livello di partenza è quello di `--profile`. Risalita di un passo dopo
+    `--degradation-cooldown` (300 s; 0 = mai) con prova: se il profilo più
+    pesante fallisce al primo uso, si torna indietro e l'attesa raddoppia (tetto
+    un'ora). Ricarica con attesa minima di 15 s se il modello non si riesce a
+    caricare. Risposte: `503` con `Retry-After` per memoria o contesto non
+    disponibile, `400` per richieste non valide, `500` per il resto, con corpo
+    `{"error", "code", "retry_after_seconds"}`; i job asincroni riportano lo
+    stesso `code` in `error.code`; `429` con `Retry-After`; `std::bad_alloc` nei
+    gestori diventa `503`. Nuovi endpoint `GET /sdcpp/v1/health` (stato,
+    profilo, contatori, ultimo errore, coda; non aspetta mai il blocco della
+    generazione) e `GET /sdcpp/v1/resources`. Opzioni `--disable-degradation` e
+    `--degradation-cooldown`. `main.cpp`: se il server HTTP non riesce a creare i
+    suoi thread (memoria al limite) o la porta non è libera, esce con codice 1 e
+    un messaggio; prima il primo caso terminava con `std::terminate` e il secondo
+    usciva con codice 0. Con `--eager-load` il profilo `lite-disk` non legge più
+    tutti i pesi all'avvio (altrimenti non risparmiava nulla).
+    Test: `test/server_recovery_test.cpp` (114 controlli con libreria e orologio
+    simulati, anche da più thread) con 9 mutazioni del codice, tutte rilevate.
+    Prove dal vivo con il modello sintetico da 2,1 GB (CPU, `ulimit -v` con
+    `MALLOC_ARENA_MAX=1` per un limite riproducibile): con 2400 MiB e
+    un'immagine 384×384 `max`, `balanced` e `lite` falliscono per memoria e
+    `lite-disk` riesce (200, la richiesta successiva non ricarica), con 2600 MiB
+    `max` basta, sotto 2200 MiB la risposta è `503` con `Retry-After` e il
+    server resta attivo; risalita dopo il tempo di attesa, risalita fallita con
+    attesa raddoppiata, `--disable-degradation` (503 subito), `error.code` dei
+    job, chiave API sui nuovi endpoint, avvio con `--eager-load` a 2100 MiB sul
+    profilo `lite-disk`, `health` sempre sotto 12 ms durante una generazione
+    (347 chiamate), 9 richieste parallele di tipo diverso (OpenAI, sdapi,
+    sdcpp) tutte servite con contatori coerenti, anche con 2400 MiB: una
+    richiesta 384×384 ha portato il server fino a `lite-disk` (3 discese, 3
+    ricaricamenti) e le altre sono state servite sul profilo raggiunto.
+    Sanitizer: il test del custode passa anche con AddressSanitizer,
+    UBSan e ThreadSanitizer; server e motore compilati per intero con
+    ASan/UBSan, con allocazioni che falliscono oltre una soglia, hanno
+    percorso tutta la scala dei profili fino al `503`, gli scenari CPU con RAM
+    occupata (guardia, pesi su disco, segmenti, auto-fit) sono terminati senza
+    segnalazioni e sei errori di lettura iniettati sul file del modello sono
+    stati assorbiti dalla riapertura con la stessa immagine; server con chiave
+    API, senza modello, con modello mancante e con richieste parallele senza
+    errori di memoria. UBSan ha segnalato tre punti preesistenti: un campo
+    `resolved_hires_upscaler` non inizializzato (corretto in un commit a
+    parte), e due scorrimenti a sinistra di valori negativi in
+    `base64_encode` e nello scrittore JPEG di stb (codice di upstream,
+    innocui nella pratica, lasciati invariati). Non provato: Windows, GPU,
+    modelli reali. Un errore che
+    termina il processo dentro il driver (per esempio CUDA) non si può intercettare
+    da qui. Ogni risalita costa un ricaricamento del modello: con modelli grandi
+    conviene un `--profile` più leggero fisso, oppure `--degradation-cooldown 0`.
 
 Passaggi previsti e non ancora svolti: collaudo del workflow di release sui
-runner GitHub, generazione con un modello reale (inclusa la memory guard sotto
-pressione vera), test su CUDA/Vulkan, e il livello di astrazione
+runner GitHub, generazione con un modello reale (inclusa la memory guard e la
+discesa di profilo del server sotto pressione vera), test su CUDA/Vulkan e su
+Windows (il ramo Windows della memoria di sistema è stato solo controllato nella
+sintassi), taratura delle soglie di `--profile auto`, e il livello di astrazione
 `ImageRuntime` nell'applicazione ospite (fuori da questo repository).

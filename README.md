@@ -17,9 +17,12 @@ progetto originale. Modifiche del fork di **Francesco Simeoni**
 
 - **Rilevamento hardware**: API C `sd_get_device_count()` / `sd_get_device_info()` e `--list-devices` con tipo e memoria di ogni device
 - **Fallback CPU automatico**: se il backend richiesto manca o non si inizializza, il contesto degrada alla CPU invece di fallire
-- **Memory guard** (`--memory-guard 90`): sopra la soglia riduce la pressione di memoria (eviction dei pesi, prefetch sospeso) prima dell'out-of-memory
+- **Memory guard** (`--memory-guard 90`): sopra la soglia riduce la pressione di memoria (eviction dei pesi, prefetch sospeso) prima dell'out-of-memory; sulla CPU misura la RAM di sistema
+- **Profili di risorse** (`--profile lite|balanced|max|auto`): un'unica opzione imposta guardiano di memoria, encoder di testo su CPU e VAE a tasselli per le macchine piccole; `auto` sceglie in base al modello e alla memoria libera
+- **Errori leggibili dalle app**: `sd_get_last_error()` distingue memoria esaurita, file del modello e backend; `sd_get_system_memory()` riporta la RAM di sistema
 - **Server robusto**: parte anche senza modello, autenticazione opzionale (`--api-key`) e allowlist CORS (`--cors-origins`)
-- **Pacchetto portabile**: backend ggml come librerie dinamiche caricate a runtime — un solo zip per macchine vecchie e nuove (`scripts/package_portable.sh`)
+- **Server che non cade per la memoria**: una richiesta che esaurisce la RAM/VRAM non ferma `sd-server`; il modello viene ricaricato con un profilo più leggero e la richiesta ripetuta, altrimenti risposta `503` con `Retry-After`; `GET /sdcpp/v1/health` e `/resources` mostrano lo stato (`--disable-degradation` per spegnerlo)
+- **Pacchetto portabile**: backend ggml come librerie dinamiche caricate a runtime — un solo zip per macchine vecchie e nuove (`scripts/package_portable.sh`); pacchetti con GPU pronti: Windows CUDA 12 (NVIDIA, DLL incluse), Windows/Linux Vulkan, macOS Metal
 - **Suite di test di sicurezza** in [test/](./test/): file modello ostili, fuzzing, sanitizer
 
 Tutti i dettagli, passo per passo: **[guida completa in italiano](./docs/integrazione_progetti.md)**
@@ -117,6 +120,7 @@ API and command-line option may change frequently.***
     - [LLaDA-Image](./docs/llada_image.md)
     - [Ming-Image Design](./docs/ming_image.md)
     - [PixArt](./docs/pixart.md)
+    - [Iris-3B](./docs/iris.md)
   - [Image Edit Models](./docs/edit.md)
     - [FLUX.1-Kontext-dev](./docs/kontext.md)
     - [Qwen Image Edit series](./docs/qwen_image_edit.md)
@@ -232,7 +236,6 @@ These projects wrap `stable-diffusion.cpp` for easier use in other languages/fra
 These projects use `stable-diffusion.cpp` as a backend for their image generation.
 
 - [GIMP Plugins](https://github.com/themanyone/gimp-plugins)
-- [Jellybox](https://jellybox.com)
 - [Stable Diffusion GUI](https://github.com/fszontagh/sd.cpp.gui.wx)
 - [Stable Diffusion CLI-GUI](https://github.com/piallai/stable-diffusion.cpp)
 - [Local Diffusion](https://github.com/rmatif/Local-Diffusion)

@@ -9,7 +9,7 @@
 #include <unordered_map>
 #include <vector>
 
-
+#include "recovery.h"
 #include "runtime.h"
 
 enum class AsyncJobKind {
@@ -72,12 +72,12 @@ json make_async_job_json(const AsyncJobManager& manager, const AsyncGenerationJo
 bool execute_img_gen_job(ServerRuntime& runtime,
                          AsyncGenerationJob& job,
                          std::vector<std::string>& output_images,
-                         std::string& error_message);
+                         GenerationFailure& failure);
 bool execute_vid_gen_job(ServerRuntime& runtime,
                          AsyncGenerationJob& job,
                          std::string& output_media_b64,
                          std::string& output_media_mime_type,
                          int& output_frame_count,
                          int& output_fps,
-                         std::string& error_message);
+                         GenerationFailure& failure);
 void async_job_worker(ServerRuntime& runtime);

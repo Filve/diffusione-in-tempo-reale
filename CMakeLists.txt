@@ -338,9 +338,10 @@ target_link_libraries(${SD_LIB} PRIVATE Threads::Threads)
 target_link_libraries(${SD_LIB} PRIVATE onig sd-utf8proc)
 if (SD_CUDA)
     find_package(CUDAToolkit REQUIRED)
-    # Keep the driver stub on downstream link lines when no driver is installed.
-    target_link_libraries(${SD_LIB} PUBLIC CUDA::cuda_driver)
-    set_property(SOURCE src/core/ggml_extend_backend.cpp APPEND PROPERTY COMPILE_DEFINITIONS SD_USE_CUDA)
+    # Headers only: the driver is loaded at run time (src/core/cuda_driver.cpp), so that the library
+    # also starts on a machine without an NVIDIA driver.
+    target_link_libraries(${SD_LIB} PRIVATE CUDA::toolkit)
+    set_property(SOURCE src/core/ggml_extend_backend.cpp src/core/cuda_driver.cpp APPEND PROPERTY COMPILE_DEFINITIONS SD_USE_CUDA)
 endif()
 target_include_directories(${SD_LIB} PUBLIC . src include)
 target_include_directories(${SD_LIB} PRIVATE src/core)

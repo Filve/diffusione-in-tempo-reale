@@ -32,10 +32,6 @@ if(NOT TARGET stable-diffusion)
             INTERFACE_COMPILE_FEATURES "c_std_11;cxx_std_17"
             POSITION_INDEPENDENT_CODE ON)
 
-    if(@SD_CUDA@)
-        set_property(TARGET stable-diffusion APPEND PROPERTY INTERFACE_LINK_LIBRARIES CUDA::cuda_driver)
-    endif()
-
     if(SD_SHARED_LIB)
         target_compile_definitions(stable-diffusion
             INTERFACE SD_BUILD_SHARED_LIB)

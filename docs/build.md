@@ -102,7 +102,28 @@ at runtime, which keeps the same package working on very old CPUs.
 
 `scripts/package_portable.sh <build_dir>` collects the executables, backend
 modules, and license files from a portable build into a relocatable zip under
-`dist/`.
+`dist/`. Two environment variables describe a GPU package:
+`PORTABLE_VARIANT=cuda12|vulkan|metal` (zip name suffix and README wording) and
+`PORTABLE_REQUIRE_BACKENDS=cuda|vulkan|metal`, which makes the script fail when
+that backend module is not in the build (on Windows, also when the CUDA runtime
+DLLs `cudart64_*`, `cublas64_*` and `cublasLt64_*` are missing) instead of
+shipping a package that silently runs on the CPU.
+
+The GitHub Actions workflow `.github/workflows/release-portable.yml` builds
+these packages, each with the CPU backend plus one GPU module:
+
+| Package | GPU backend | Notes |
+|---|---|---|
+| `linux-x86_64` | Vulkan | needs the Vulkan loader (`libvulkan.so.1`) at runtime |
+| `darwin-arm64` | Metal | Apple Silicon |
+| `windows-x86_64` | Vulkan | NVIDIA, AMD and Intel GPUs; `vulkan-1.dll` comes with the GPU driver |
+| `windows-x86_64-cuda12` | CUDA 12 | NVIDIA only; the CUDA runtime DLLs are bundled, only the NVIDIA driver is needed (without it the package still starts, on the CPU) |
+
+Start it from the Actions tab ("Run workflow", any branch) or push a tag
+`portable-v*`, which also attaches the zips to a release. The manual run takes
+two inputs: `targets` (`all` or a comma-separated list of the package names
+above) and `cuda_architectures` (default `61;70;75;80;86;89;90;100;120`; a single
+architecture, e.g. `86` for GeForce RTX 30 series, shortens the CUDA build a lot).
 
 ## Build with OpenBLAS
 
