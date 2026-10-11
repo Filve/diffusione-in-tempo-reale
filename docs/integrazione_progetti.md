@@ -319,7 +319,7 @@ Che cosa è automatico e che cosa no:
 
 | Sintomo | Causa tipica | Che cosa fare |
 |---|---|---|
-| `--list-devices` mostra solo `CPU` | build senza backend GPU, SDK assente in build, driver mancante, o DLL dei backend non accanto all'eseguibile | ricompilare con l'SDK installato; verificare driver; controllare la cartella davvero usata dall'applicazione |
+| `--list-devices` mostra solo `CPU` | build senza backend GPU, SDK assente in build, driver mancante, o DLL dei backend non accanto all'eseguibile | leggere il log (stderr): una riga `[W] CUDA backend: ggml-cuda.dll found in ... was not usable: <motivo>` dice perché il modulo GPU presente non si è caricato (su Windows elenca anche le DLL mancanti, per esempio `cublas64_12.dll`); `[I] no GPU backend module ... found in: <cartelle>` significa che nessun modulo GPU è accanto all'eseguibile (pacchetto o build senza GPU). Poi: driver aggiornato, pacchetto giusto (`cuda12` per NVIDIA), cartella davvero usata dall'applicazione |
 | `auto-fit: no GPU devices` nei log | come sopra: il motore non vede acceleratori | stessa verifica; un'etichetta "GPU" nei log dell'applicazione non prova nulla |
 | HTTP **502** da un proxy durante una generazione lunga | il proxy ha un timeout (es. la `fetch` di Node abbandona dopo ~5 minuti senza risposta) mentre il motore sta ancora calcolando | non reinviare alla cieca; usare API a job asincroni con polling; controllare i log del servizio |
 | Il motore si chiude durante il caricamento pesi con `read tensor data failed` | pressione di memoria estrema durante letture grandi, oppure file del modello incompleto | liberare RAM o usare `--params-backend disk`; verificare l'integrità del file (dimensione attesa vs reale) |
@@ -863,6 +863,14 @@ sincronizzazioni future.
     compilazione e SDK allineati alla CI principale; avvio manuale con scelta
     dei pacchetti e delle architetture CUDA; release creata da un job unico;
     lo script di packaging verifica che il modulo GPU sia nello zip.
+12. **Diagnostica dei moduli GPU** — `src/core/backend_diag.{h,cpp}`: dopo il
+    caricamento dei backend dinamici, per ogni modulo GPU presente accanto
+    all'eseguibile (o nella cartella corrente) che non fornisce un device, il
+    log riporta il motivo reale (`dlerror`, oppure codice e DLL mancanti su
+    Windows, letti dalla tabella di importazione del file con
+    `src/core/pe_imports.{h,cpp}`) e un suggerimento. ggml li carica in
+    silenzio nelle build Release e su Windows non riporta mai l'errore del
+    sistema. Test del lettore: `test/pe_imports_test.cpp`.
 
 Passaggi previsti e non ancora svolti: collaudo del workflow di release sui
 runner GitHub, generazione con un modello reale (inclusa la memory guard sotto

@@ -95,6 +95,17 @@ free/total memory when the backend reports it. Host applications can query the
 same information through `sd_get_device_count()` / `sd_get_device_info()` in
 the C API.
 
+## Diagnosing a GPU that does not show up
+
+With dynamic backends (`GGML_BACKEND_DL`), ggml loads the GPU modules silently in
+Release builds, and on Windows it never reports the operating system error. After
+the first load, this fork logs on stderr, for each GPU module found next to the
+executable or in the working directory that provides no device, why it could not be
+used (the `dlopen` error on Linux/macOS; on Windows the error code plus the DLLs the
+module imports that cannot be found, such as `cublas64_12.dll`), with a hint. When no
+GPU module is present at all it says where it looked. These are warnings and notes,
+not errors: the CPU backend keeps working.
+
 ## CPU fallback
 
 If a requested backend is unavailable at context creation (for example a

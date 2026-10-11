@@ -15,6 +15,7 @@
 #include <thread>
 #include <unordered_set>
 #include <vector>
+#include "core/ggml_extend_backend.h"
 #include "core/ggml_tensor_utils.h"
 #include "runtime/preprocessing.hpp"
 
@@ -1143,10 +1144,8 @@ std::vector<std::pair<std::string, float>> split_quotation_attention(
 }
 
 size_t sd_list_devices(char* buffer, size_t buffer_size) {
-    if (ggml_backend_dev_count() == 0) {
-        // dynamic-backend builds discover their backend modules at runtime
-        ggml_backend_load_all();
-    }
+    // dynamic-backend builds discover their backend modules at runtime
+    sd_backend_ensure_loaded();
 
     std::ostringstream oss;
     for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
@@ -1166,10 +1165,8 @@ size_t sd_list_devices(char* buffer, size_t buffer_size) {
 }
 
 size_t sd_get_device_count(void) {
-    if (ggml_backend_dev_count() == 0) {
-        // dynamic-backend builds discover their backend modules at runtime
-        ggml_backend_load_all();
-    }
+    // dynamic-backend builds discover their backend modules at runtime
+    sd_backend_ensure_loaded();
     return ggml_backend_dev_count();
 }
 

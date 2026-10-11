@@ -6,6 +6,7 @@ test/*
 !test/README.md
 !test/security_smoke.sh
 !test/api_robustness.cpp
+!test/pe_imports_test.cpp
 !test/fuzz_model_loader.py
 tests/
 .vscode/

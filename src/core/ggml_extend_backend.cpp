@@ -12,6 +12,7 @@
 #include <cuda.h>
 #endif
 
+#include "core/backend_diag.h"
 #include "core/util.h"
 #include "ggml-backend-impl.h"
 #include "ggml-impl.h"
@@ -325,7 +326,12 @@ static void ggml_backend_load_all_once() {
             return;
         }
         ggml_backend_load_all();
+        sd::backend_diag::report_backend_modules();
     });
+}
+
+void sd_backend_ensure_loaded() {
+    ggml_backend_load_all_once();
 }
 
 bool sd_backend_is(ggml_backend_t backend, const std::string& name) {

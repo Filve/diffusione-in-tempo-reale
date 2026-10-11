@@ -85,6 +85,9 @@ private:
     ggml_backend_t init_cached_backend(const std::string& name);
 };
 
+// Loads the dynamic ggml backend modules once (no-op for static builds) and logs why a
+// GPU module that is on disk could not be used.
+void sd_backend_ensure_loaded();
 bool sd_backend_is(ggml_backend_t backend, const std::string& name);
 bool sd_backend_is_cpu(ggml_backend_t backend);
 bool sd_backend_supports_cuda_mma(ggml_backend_t backend);
