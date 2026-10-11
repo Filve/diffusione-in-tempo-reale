@@ -216,7 +216,22 @@ jobs:
         run: |
           exe=build/bin/sd-cli
           [ -x "$exe" ] || exe="$exe.exe"
-          "$exe" --list-devices
+          status=0
+          "$exe" --list-devices || status=$?
+          if [ "$status" -ne 0 ] && [ "$RUNNER_OS" = Windows ]; then
+            # Git Bash reports a program that cannot start because a DLL is missing as status 127, without a message.
+            echo "::error::$exe --list-devices exited with status $status"
+            system32="$(cygpath -u "${SYSTEMROOT:-${SystemRoot:-/c/Windows}}")/System32"
+            for file in "$exe" build/bin/stable-diffusion.dll build/bin/ggml.dll build/bin/ggml-base.dll; do
+              echo "::group::DLLs imported by $file"
+              dumpbin -dependents "$file" | tr -d '\r' | grep -i -E '^ +[^ ]+\.dll$' | while read -r dll; do
+                case "$dll" in api-ms-win-* | ext-ms-win-*) continue ;; esac
+                if [ -e "build/bin/$dll" ] || [ -e "$system32/$dll" ]; then echo "  $dll"; else echo "  $dll   <-- NOT FOUND"; fi
+              done || true
+              echo "::endgroup::"
+            done
+          fi
+          exit "$status"
 
       - name: Security smoke test
         if: runner.os != 'Windows'

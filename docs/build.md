@@ -117,7 +117,7 @@ these packages, each with the CPU backend plus one GPU module:
 | `linux-x86_64` | Vulkan | needs the Vulkan loader (`libvulkan.so.1`) at runtime |
 | `darwin-arm64` | Metal | Apple Silicon |
 | `windows-x86_64` | Vulkan | NVIDIA, AMD and Intel GPUs; `vulkan-1.dll` comes with the GPU driver |
-| `windows-x86_64-cuda12` | CUDA 12 | NVIDIA only; the CUDA runtime DLLs are bundled, only the NVIDIA driver is needed |
+| `windows-x86_64-cuda12` | CUDA 12 | NVIDIA only; the CUDA runtime DLLs are bundled, only the NVIDIA driver is needed (without it the package still starts, on the CPU) |
 
 Start it from the Actions tab ("Run workflow", any branch) or push a tag
 `portable-v*`, which also attaches the zips to a release. The manual run takes

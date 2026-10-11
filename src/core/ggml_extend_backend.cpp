@@ -8,11 +8,8 @@
 #include <stdexcept>
 #include <vector>
 
-#ifdef SD_USE_CUDA
-#include <cuda.h>
-#endif
-
 #include "core/backend_diag.h"
+#include "core/cuda_driver.h"
 #include "core/util.h"
 #include "ggml-backend-impl.h"
 #include "ggml-impl.h"
@@ -477,12 +474,8 @@ bool sd_backend_supports_cuda_mma(ggml_backend_t backend) {
     const bool supported = [&]() {
         ggml_backend_dev_props props{};
         ggml_backend_dev_get_props(dev, &props);
-        CUdevice device;
         int major = 0, minor = 0;
-        if (props.device_id == nullptr || cuInit(0) != CUDA_SUCCESS ||
-            cuDeviceGetByPCIBusId(&device, props.device_id) != CUDA_SUCCESS ||
-            cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device) != CUDA_SUCCESS ||
-            cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device) != CUDA_SUCCESS) {
+        if (!sd::cuda_driver::compute_capability(props.device_id, major, minor)) {
             return false;
         }
         auto reg          = ggml_backend_dev_backend_reg(dev);
