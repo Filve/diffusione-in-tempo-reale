@@ -1,3 +1,7 @@
+// httplib.h must come before any header that reaches <windows.h> (common/log.h does): windows.h pulls in winsock.h,
+// which clashes with the winsock2.h included by httplib.h.
+#include "httplib.h"
+
 #include "recovery.h"
 
 #include <algorithm>
@@ -6,8 +10,6 @@
 #include <initializer_list>
 #include <new>
 #include <utility>
-
-#include "httplib.h"
 
 #include "common/log.h"
 
