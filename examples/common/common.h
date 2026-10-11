@@ -287,7 +287,7 @@ struct SDGenerationParams {
     // Derived and normalized fields.
     std::string prompt_with_lora;  // for metadata record only
     std::vector<sd_lora_t> lora_vec;
-    sd_hires_upscaler_t resolved_hires_upscaler;
+    sd_hires_upscaler_t resolved_hires_upscaler = SD_HIRES_UPSCALER_NONE;
 
     // Owned execution payload.
     SDImageOwner init_image;
