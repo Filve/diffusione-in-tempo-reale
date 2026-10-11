@@ -419,7 +419,8 @@ namespace sd::backend_fit {
                               ggml_type override_wtype,
                               sd::ggml_graph_cut::MaxVramAssignment& budgets,
                               std::string& runtime_spec,
-                              std::string& params_spec) {
+                              std::string& params_spec,
+                              int& memory_guard_percent) {
         std::string error;
         if (!budgets.canonicalize_backend_keys(&error)) {
             LOG_ERROR("%s", error.c_str());
@@ -435,8 +436,25 @@ namespace sd::backend_fit {
             LOG_ERROR("%s", error.c_str());
             return false;
         }
-        const int64_t free_ram   = available_ram_bytes();
-        const int64_t ram_budget = std::max<int64_t>(free_ram - std::max<int64_t>(2048 * MiB, free_ram / 10), 0);
+        const int64_t free_ram = available_ram_bytes();
+        // Without a GPU everything runs on the CPU and the compute buffers come out of RAM too.
+        const bool cpu_only = devices.empty() && std::all_of(runtimes.begin(), runtimes.end(), [](const Runtime& runtime) {
+                                  return runtime.devices.empty();
+                              });
+        if (cpu_only && runtimes.empty()) {
+            if (free_ram < 0) {
+                LOG_WARN("auto-fit: no GPU devices and available RAM is unknown; using the default backend");
+                return true;
+            }
+            runtimes.assign(components.size(), Runtime{"CPU", {}});
+        }
+        int64_t compute_reserve = 0;
+        if (cpu_only) {
+            for (const Component& comp : components) {
+                compute_reserve = std::max(compute_reserve, comp.reserve_bytes);
+            }
+        }
+        const int64_t ram_budget = std::max<int64_t>(free_ram - std::max<int64_t>(2048 * MiB, free_ram / 10) - compute_reserve, 0);
         const auto plan          = compute_plan(components, devices, ram_budget, runtimes);
         params_spec.clear();
         if (!plan.valid) {
@@ -450,6 +468,19 @@ namespace sd::backend_fit {
         }
 
         print_plan(plan, components, devices, free_ram, ram_budget);
+        if (cpu_only) {
+            const bool streams_from_disk = std::any_of(plan.decisions.begin(), plan.decisions.end(), [](const Decision& decision) {
+                return decision.params_location == ParamsLocation::DISK;
+            });
+            if (!streams_from_disk) {
+                LOG_INFO("auto-fit: CPU only; the weights fit in RAM");
+                return true;
+            }
+            if (memory_guard_percent <= 0) {
+                memory_guard_percent = 90;
+                LOG_INFO("auto-fit: CPU only and some weights do not fit in RAM; enabling the memory guard at %d%% so the model runs in segments", memory_guard_percent);
+            }
+        }
         for (size_t ci = 0; ci < components.size(); ++ci) {
             if (components[ci].params_bytes == 0) {
                 continue;

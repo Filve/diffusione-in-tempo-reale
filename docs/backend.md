@@ -210,6 +210,17 @@ weight to be copied again at every step.
 RAM and GPU budgets are shared across components. Each component uses a single
 parameter backend; several other GPUs' capacities are not combined to store
 one component. If available RAM cannot be queried, RAM residency is skipped.
+
+Without a GPU (a CPU-only machine, or every GPU backend unavailable) the same
+planning runs against the CPU: the diffusion model, text encoder and VAE are
+considered in the usual order, and each one stays in RAM if its weights fit in
+what is left of the available RAM after the 2 GiB / 10% margin and the largest
+compute reserve (computation also needs RAM). A component that does not fit
+reads its weights from disk, and auto-fit then turns the memory guard on at 90%
+(unless `--memory-guard` is set) so that the graph runs in segments and weights
+are released between them. When everything fits, the plan changes nothing and
+the log says `auto-fit: CPU only; the weights fit in RAM`. If available RAM
+cannot be queried, the default backend and placement are used.
 Weights stored on another GPU are copied to the component's compute devices for
 execution. CPU modules use RAM or disk. Compute reserves and cache priority are
 accounted for separately on each device, so a CPU module does not reserve GPU

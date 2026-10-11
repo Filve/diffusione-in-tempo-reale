@@ -186,6 +186,22 @@ continues. RAM is shared with other programs, so the percentage covers the whole
 machine, not only this process. The guard never fails a graph on the CPU, and it
 does nothing on platforms that cannot report available memory.
 
+Weights that stream from disk are counted before they are loaded, so on the CPU
+the guard sees what a graph is about to need and not only what is resident. When
+that total would pass the threshold, a graph that has graph cuts runs in segments,
+as it does on a GPU: each segment reads its weights, computes, and lets them go
+before the next one starts, which keeps the peak well below the whole model. This
+only applies when some weights can be released (`--params-backend disk`); if
+every weight is resident in RAM, splitting the graph would not lower the peak and
+the graph runs in one piece. `--disable-segmented-compute` turns segmentation off.
+
+On a machine without a GPU, `--auto-fit` plans RAM against the CPU backend (see
+[backend.md](./backend.md#automatic-placement---auto-fit-onoff)) and, when it
+puts a component on disk, sets the guard to 90 unless `--memory-guard` is given.
+On Linux, available memory comes from `/proc/meminfo`, which does not reflect the
+limit of a container's memory cgroup; inside a container with such a limit, pass
+`--memory-guard` and `--params-backend disk` explicitly and leave headroom.
+
 ## Use quantization to reduce memory usage.
 
 [quantization](./quantization_and_gguf.md)

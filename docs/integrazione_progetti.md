@@ -327,6 +327,7 @@ Che cosa è automatico e che cosa no:
 | Windows impedisce l'avvio dell'eseguibile (EACCES/EPERM) | policy di sicurezza, es. Smart App Control, o binario bloccato | controllare Sicurezza di Windows e i registri CodeIntegrity; usare binari attendibili; **non** disattivare le protezioni |
 | Generazione lentissima (minuti per passo) | esecuzione sulla CPU, risoluzione alta, o modello troppo grande per la memoria | verificare i device; ridurre risoluzione/passi; modello quantizzato; build GPU |
 | Avviso "memory guard: pressure" nei log | la memoria del device (su CPU: la RAM di sistema) ha superato la soglia `--memory-guard` | è un avviso con riduzione automatica della residenza: evitare nuove richieste finché non segnala il recupero |
+| `auto-fit: CPU only; ...` nei log | senza GPU il motore ha confrontato la RAM disponibile con le dimensioni dei componenti | `the weights fit in RAM`: nessuna azione. `some weights do not fit in RAM; enabling the memory guard at 90%`: i componenti che non ci stanno restano su disco e il grafo gira a segmenti; è più lento ma serve proprio a non esaurire la RAM |
 
 ### 2.9 Pacchetto portabile (consigliato per la distribuzione)
 ```shell
@@ -661,6 +662,16 @@ dei pacchetti portabili automatici descritti sopra.
   continua. La percentuale riguarda l'intera macchina, non solo questo
   processo, e sulle piattaforme che non riportano la memoria disponibile il
   guardiano su CPU non fa nulla.
+  I pesi che vengono letti dal disco contano prima di essere caricati: se il
+  totale supererebbe la soglia, il grafo su CPU viene eseguito a segmenti
+  (come su GPU) e il picco di memoria resta ben sotto il modello intero. Succede
+  solo se esistono pesi rilasciabili (`--params-backend disk`); con tutti i
+  pesi in RAM il grafo resta intero, perché spezzarlo non abbasserebbe il
+  picco. Senza GPU, `--auto-fit` pianifica la RAM contro la CPU e, se mette un
+  componente su disco, imposta la soglia a 90 (salvo `--memory-guard`
+  esplicito). Su Linux la memoria disponibile viene da `/proc/meminfo`, che
+  non rispecchia il limite di memoria di un container: lì conviene passare a
+  mano `--memory-guard` e `--params-backend disk`.
   Gli avvisi di pressione alta/critica e di recupero sono accessibili tramite
   il callback di log; l'applicazione ospite può mostrarli senza interrompere
   la generazione. Un eventuale monitor RAM nell'applicazione resta un controllo
@@ -889,6 +900,22 @@ sincronizzazioni future.
     sostituire o cancellare il file del modello mentre il motore lo usa
     (come già accadeva con `--mmap`). Test: `test/file_handle_pool_test.cpp`
     (ASan/UBSan e ThreadSanitizer).
+14. **CPU senza GPU: auto-fit e grafi a segmenti** — senza GPU, `--auto-fit`
+    confronta la RAM disponibile con i componenti (pesi e riserva di
+    calcolo) e lascia su disco quelli che non ci stanno; in quel caso attiva da
+    solo la memory guard al 90% (salvo `--memory-guard` esplicito). Sui backend
+    CPU la guardia conta i pesi ancora da leggere dal disco prima di caricarli
+    e, se il totale supererebbe la soglia, il grafo gira a segmenti (come su
+    GPU) invece che intero; avviene solo se esistono pesi rilasciabili
+    (`--params-backend disk`), perché con tutti i pesi in RAM spezzare il grafo
+    non abbasserebbe il picco (`ModelManager::segmenting_can_save_memory`,
+    `src/core/backend_fit.cpp`). Misure con un modello SD 1.5 sintetico
+    (128×128, 3 passi, 2 thread, Linux, 3,3 GiB occupati da un altro processo,
+    soglia 60%): UNet in 22 segmenti, picco 732 MiB invece di 1722 MiB, 23 s
+    invece di 12 s, immagine identica pixel per pixel; con pesi residenti in
+    RAM e la stessa pressione nessuna segmentazione (come prima); senza
+    pressione il comportamento non cambia. Non ancora provato su Windows né
+    con modelli reali.
 
 Passaggi previsti e non ancora svolti: collaudo del workflow di release sui
 runner GitHub, generazione con un modello reale (inclusa la memory guard sotto

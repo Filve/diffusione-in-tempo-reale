@@ -595,7 +595,9 @@ ArgOptions SDContextParams::get_options() {
          &conditioning_cache_size},
         {"",
          "--memory-guard",
-         "memory usage percent (device memory, or system RAM on CPU backends) that triggers pressure reduction (weight eviction, prefetch pause) before allocations fail, e.g. 90 (default: 0, disabled)",
+         "memory usage percent (device memory, or system RAM on CPU backends) that triggers pressure reduction (weight eviction, prefetch pause) before allocations fail, e.g. 90 (default: 0, disabled). "
+         "On CPU backends, weights still to be read from disk count before they are loaded, and the graph runs in segments when they would not fit. "
+         "With no GPU, --auto-fit enables it at 90 when some weights do not fit in RAM",
          &memory_guard},
     };
 
@@ -749,6 +751,7 @@ ArgOptions SDContextParams::get_options() {
          "--auto-fit",
          "on|off (default: on). Preserve --backend (otherwise select one GPU) and place weights on the compute GPU, "
          "RAM, another GPU, or disk in that order, according to available memory (--max-vram limits GPU budgets). "
+         "With no GPU, each component stays in RAM if it fits in the available RAM and is read from disk otherwise. "
          "Disabled by explicit --params-backend; uses automatic graph segmentation when needed",
          [this](int argc, const char** argv, int index) {
              return parse_on_off_arg(argc, argv, index, "--auto-fit", auto_fit);

@@ -1863,12 +1863,52 @@ bool ModelManager::memory_guard_ok(const DeviceMemoryRequest& request) const {
            sd::MemoryWatchdog::Pressure::None;
 }
 
+// Weights read from disk into host memory become resident in system RAM, but the guard only
+// sees RAM that is already in use. Counting the weights this graph still has to load lets it
+// tell before loading whether the whole graph fits or has to run in segments.
+DeviceMemoryRequest ModelManager::with_streamed_weights(DeviceMemoryRequest request,
+                                                        const std::vector<TensorState*>& states) const {
+    std::vector<TensorState*> streamed;
+    for (TensorState* state : states) {
+        if (state != nullptr && state->residency_mode == ResidencyMode::Disk) {
+            streamed.push_back(state);
+        }
+    }
+    const size_t missing             = compute_backend_alloc_size(streamed, true);
+    request.pending_allocation_bytes = missing > SIZE_MAX - request.pending_allocation_bytes
+                                           ? SIZE_MAX
+                                           : request.pending_allocation_bytes + missing;
+    return request;
+}
+
+bool ModelManager::segmenting_can_save_memory(const std::vector<ggml_tensor*>& params,
+                                              ggml_backend_t compute_backend) const {
+    if (compute_backend == nullptr || !sd_backend_is_cpu(compute_backend)) {
+        return true;
+    }
+    if (!memory_watchdog_.enabled()) {
+        return false;
+    }
+    std::vector<TensorState*> states;
+    if (!resolve_required_tensor_states(params, states, compute_backend)) {
+        return false;
+    }
+    return std::any_of(states.begin(), states.end(), [](const TensorState* state) {
+        return state != nullptr && state->residency_mode == ResidencyMode::Disk;
+    });
+}
+
 bool ModelManager::fits_compute_backend_capacity(
     const DeviceMemoryRequest& request,
     const std::vector<ggml_tensor*>& required_params) const {
     std::vector<TensorState*> states;
-    return resolve_required_tensor_states(required_params, states, request.compute_backend) &&
-           check_capacity(request, states).fits() && memory_guard_ok(request);
+    if (!resolve_required_tensor_states(required_params, states, request.compute_backend)) {
+        return false;
+    }
+    if (request.compute_backend != nullptr && sd_backend_is_cpu(request.compute_backend)) {
+        return memory_guard_ok(with_streamed_weights(request, states));
+    }
+    return check_capacity(request, states).fits() && memory_guard_ok(request);
 }
 
 bool ModelManager::ensure_compute_backend_capacity(
@@ -1891,10 +1931,11 @@ bool ModelManager::ensure_compute_backend_capacity(
         return true;
     }
 
-    memory_watchdog_.observe(compute_backend, memory_guard_sample(request), !host_backend);
+    const DeviceMemoryRequest guard_request = host_backend ? with_streamed_weights(request, required_states) : request;
+    memory_watchdog_.observe(compute_backend, memory_guard_sample(guard_request), !host_backend);
     // System RAM has no managed capacity on the CPU: only the memory guard applies there.
     auto fits      = [&]() { return host_backend || check_capacity(request, required_states).fits(); };
-    auto satisfied = [&]() { return fits() && memory_guard_ok(request); };
+    auto satisfied = [&]() { return fits() && memory_guard_ok(guard_request); };
     if (satisfied()) {
         return true;
     }
@@ -1977,7 +2018,7 @@ bool ModelManager::ensure_compute_backend_capacity(
         if (!fits()) {
             return false;
         }
-        memory_watchdog_.observe(compute_backend, memory_guard_sample(request), !host_backend);
+        memory_watchdog_.observe(compute_backend, memory_guard_sample(guard_request), !host_backend);
         if (memory_watchdog_.should_log_unreachable(compute_backend)) {
             LOG_WARN("memory guard: cannot reduce %s below %d%% usage, continuing under pressure",
                      ggml_backend_name(compute_backend), memory_watchdog_.threshold_percent());

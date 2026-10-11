@@ -1017,12 +1017,17 @@ bool StableDiffusionGGML::init(const sd_ctx_params_t* sd_ctx_params) {
     }
 
     if (auto_fit_enabled) {
+        int memory_guard_percent = sd_ctx_params->memory_guard;
         if (!sd::backend_fit::derive_backend_specs(model_loader,
                                                    sd_type_to_ggml_type(sd_ctx_params->wtype),
                                                    max_vram_assignment,
                                                    backend_spec,
-                                                   params_backend_spec)) {
+                                                   params_backend_spec,
+                                                   memory_guard_percent)) {
             return false;
+        }
+        if (memory_guard_percent != sd_ctx_params->memory_guard) {
+            model_manager->set_memory_guard_percent(memory_guard_percent);
         }
     }
 

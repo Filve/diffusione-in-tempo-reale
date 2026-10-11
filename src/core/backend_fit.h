@@ -10,11 +10,14 @@
 
 namespace sd::backend_fit {
 
+    // memory_guard_percent is raised from 0 when the plan runs a component on the CPU with its
+    // weights read from disk: without the guard nothing would release them between segments.
     bool derive_backend_specs(ModelLoader& loader,
                               ggml_type override_wtype,
                               sd::ggml_graph_cut::MaxVramAssignment& budgets,
                               std::string& runtime_spec,
-                              std::string& params_spec);
+                              std::string& params_spec,
+                              int& memory_guard_percent);
 
     bool prepare_vae_decode_retry_tiling(sd_tiling_params_t& tiling_params,
                                          bool prefer_temporal_tiling,

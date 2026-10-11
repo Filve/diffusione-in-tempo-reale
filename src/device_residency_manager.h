@@ -46,6 +46,10 @@ struct DeviceResidencyManager {
     // Capacity requests select their backend's weights; protection spans all backends.
     virtual bool fits_compute_backend_capacity(const DeviceMemoryRequest& request,
                                                const std::vector<ggml_tensor*>& required_params) const = 0;
+    // False when splitting a graph into segments cannot lower peak memory on a host backend:
+    // no memory guard is set, or every weight stays resident once loaded.
+    virtual bool segmenting_can_save_memory(const std::vector<ggml_tensor*>& params,
+                                            ggml_backend_t compute_backend) const { return true; }
     virtual bool assign_compute_backend(const std::vector<ggml_tensor*>& tensors,
                                         ggml_backend_t compute_backend)                                = 0;
     virtual ggml_tensor* resolve_param_tensor(ggml_tensor* tensor) const { return nullptr; }
