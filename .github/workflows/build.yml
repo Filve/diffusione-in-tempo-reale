@@ -755,6 +755,9 @@ jobs:
 
     runs-on: ubuntu-latest
 
+    permissions:
+      contents: write
+
     needs:
       - ubuntu-latest-cmake
       - ubuntu-latest-cmake-vulkan
