@@ -23,6 +23,11 @@ if [[ ! -x "$build_dir/bin/sd-cli" && ! -x "$build_dir/bin/sd-cli.exe" ]]; then
     exit 1
 fi
 
+# The zip is created from another directory, so the paths must not be relative.
+mkdir -p "$output_dir"
+build_dir="$(cd "$build_dir" && pwd)"
+output_dir="$(cd "$output_dir" && pwd)"
+
 cd "$repo_root"
 version="$(git describe --tags --always 2>/dev/null || echo unknown)"
 case "$(uname -s)" in
