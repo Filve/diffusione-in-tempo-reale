@@ -117,6 +117,7 @@ API and command-line option may change frequently.***
     - [LLaDA-Image](./docs/llada_image.md)
     - [Ming-Image Design](./docs/ming_image.md)
     - [PixArt](./docs/pixart.md)
+    - [Iris-3B](./docs/iris.md)
   - [Image Edit Models](./docs/edit.md)
     - [FLUX.1-Kontext-dev](./docs/kontext.md)
     - [Qwen Image Edit series](./docs/qwen_image_edit.md)
@@ -232,7 +233,6 @@ These projects wrap `stable-diffusion.cpp` for easier use in other languages/fra
 These projects use `stable-diffusion.cpp` as a backend for their image generation.
 
 - [GIMP Plugins](https://github.com/themanyone/gimp-plugins)
-- [Jellybox](https://jellybox.com)
 - [Stable Diffusion GUI](https://github.com/fszontagh/sd.cpp.gui.wx)
 - [Stable Diffusion CLI-GUI](https://github.com/piallai/stable-diffusion.cpp)
 - [Local Diffusion](https://github.com/rmatif/Local-Diffusion)
