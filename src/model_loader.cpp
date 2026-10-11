@@ -167,6 +167,7 @@ void convert_tensor(void* src,
 
 ModelLoader::ModelLoader()
     : n_threads_(sd_get_num_physical_cores()) {
+    file_pool_.set_max_idle(static_cast<size_t>(std::max(n_threads_, 1)));
 }
 
 size_t ModelLoader::add_file_path(const std::string& file_path) {
@@ -188,6 +189,7 @@ void ModelLoader::add_tensor_storage(const TensorStorage& tensor_storage) {
 
 void ModelLoader::set_n_threads(int n_threads) {
     n_threads_ = n_threads > 0 ? n_threads : sd_get_num_physical_cores();
+    file_pool_.set_max_idle(static_cast<size_t>(std::max(n_threads_, 1)));
     LOG_VERBOSE("using %d threads for model loading", n_threads_);
 }
 
@@ -1137,45 +1139,21 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
 
         for (int i = 0; i < n_threads; ++i) {
             workers.emplace_back([&, file_path, is_zip]() {
-                std::ifstream file;
+                sd::FileHandlePool::Lease file;
                 zip_t* zip = nullptr;
                 if (is_zip) {
-                    zip = zip_open(file_path.c_str(), 0, 'r');
+                    sd::open_with_retry(file_path, [&]() {
+                        zip = zip_open(file_path.c_str(), 0, 'r');
+                        return zip != nullptr;
+                    });
                     if (zip == nullptr) {
                         LOG_ERROR("failed to open zip '%s'", file_path.c_str());
                         failed = true;
                         return;
                     }
                 } else if (!mmapped) {
-                    // Opening can fail transiently on Windows (e.g. sharing violations under
-                    // load); retry and log the OS error so the cause is visible.
-                    constexpr int kOpenAttempts = 5;
-                    for (int attempt = 1; attempt <= kOpenAttempts; ++attempt) {
-                        file.clear();
-                        errno = 0;
-                        file.open(file_path, std::ios::binary);
-                        if (file.is_open()) {
-                            break;
-                        }
-                        int saved_errno = errno;
-#ifdef _WIN32
-                        unsigned long win_err = 0;
-                        _get_doserrno(&win_err);
-                        LOG_WARN("open '%s' failed (attempt %d/%d): errno=%d (%s), doserrno=%lu",
-                                 file_path.c_str(), attempt, kOpenAttempts,
-                                 saved_errno, strerror(saved_errno), win_err);
-#else
-                        LOG_WARN("open '%s' failed (attempt %d/%d): errno=%d (%s)",
-                                 file_path.c_str(), attempt, kOpenAttempts,
-                                 saved_errno, strerror(saved_errno));
-#endif
-                        if (saved_errno == ENOENT || attempt == kOpenAttempts) {
-                            break;
-                        }
-                        std::this_thread::sleep_for(std::chrono::milliseconds(200 * attempt));
-                    }
-                    if (!file.is_open()) {
-                        LOG_ERROR("failed to open '%s'", file_path.c_str());
+                    file = file_pool_.acquire(file_path);
+                    if (!file) {
                         failed = true;
                         return;
                     }
@@ -1273,11 +1251,21 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
                                 return false;
                             }
                         } else {
-                            file.seekg(tensor_storage.offset);
-                            file.read(buf, n);
-                            if (!file) {
-                                LOG_ERROR("read tensor data failed: '%s'", file_path.c_str());
-                                return false;
+                            auto read_from_file = [&]() {
+                                file.stream().seekg(tensor_storage.offset);
+                                file.stream().read(buf, n);
+                                return static_cast<bool>(file.stream());
+                            };
+                            if (!read_from_file()) {
+                                // A stream kept open for a long time can go bad (removable or
+                                // network storage); try once more on a newly opened one.
+                                LOG_WARN("read from '%s' failed; reopening the file and trying again", file_path.c_str());
+                                file.discard();
+                                file = file_pool_.acquire(file_path, true);
+                                if (!file || !read_from_file()) {
+                                    LOG_ERROR("read tensor data failed: '%s'", file_path.c_str());
+                                    return false;
+                                }
                             }
                         }
                         return true;

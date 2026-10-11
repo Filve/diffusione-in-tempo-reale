@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "model.h"
+#include "model_io/file_handle_pool.h"
 
 TensorTypeRules parse_tensor_type_rules(const std::string& tensor_type_rules);
 
@@ -70,6 +71,8 @@ private:
     std::string tensor_type_rules_;
     std::vector<FileStamp> parsed_dependencies_;
     std::map<std::string, std::set<std::string>> parsed_tensor_names_;
+    // Keeps model files open between tensor loads. Copies of a loader share it.
+    sd::FileHandlePool file_pool_;
 
     static bool read_file_stamp(const std::string& path, FileStamp& stamp);
     static bool file_unchanged(const FileStamp& stamp);

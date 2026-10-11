@@ -322,7 +322,8 @@ Che cosa è automatico e che cosa no:
 | `--list-devices` mostra solo `CPU` | build senza backend GPU, SDK assente in build, driver mancante, o DLL dei backend non accanto all'eseguibile | leggere il log (stderr): una riga `[W] CUDA backend: ggml-cuda.dll found in ... was not usable: <motivo>` dice perché il modulo GPU presente non si è caricato (su Windows elenca anche le DLL mancanti, per esempio `cublas64_12.dll`); `[I] no GPU backend module ... found in: <cartelle>` significa che nessun modulo GPU è accanto all'eseguibile (pacchetto o build senza GPU). Poi: driver aggiornato, pacchetto giusto (`cuda12` per NVIDIA), cartella davvero usata dall'applicazione |
 | `auto-fit: no GPU devices` nei log | come sopra: il motore non vede acceleratori | stessa verifica; un'etichetta "GPU" nei log dell'applicazione non prova nulla |
 | HTTP **502** da un proxy durante una generazione lunga | il proxy ha un timeout (es. la `fetch` di Node abbandona dopo ~5 minuti senza risposta) mentre il motore sta ancora calcolando | non reinviare alla cieca; usare API a job asincroni con polling; controllare i log del servizio |
-| Il motore si chiude durante il caricamento pesi con `read tensor data failed` | pressione di memoria estrema durante letture grandi, oppure file del modello incompleto | liberare RAM o usare `--params-backend disk`; verificare l'integrità del file (dimensione attesa vs reale) |
+| Il motore si chiude durante il caricamento pesi con `read tensor data failed` | pressione di memoria estrema durante letture grandi, oppure file del modello incompleto | liberare RAM o usare `--params-backend disk`; verificare l'integrità del file (dimensione attesa vs reale). Prima di arrendersi il motore riapre il file e ripete la lettura una volta: se compare anche solo `read from '...' failed; reopening the file and trying again` il problema è stato assorbito, se subito dopo c'è `read tensor data failed` no |
+| `open '...' failed (attempt N/5): errno=..., doserrno=...` | il sistema ha rifiutato l'apertura del file del modello (su Windows: blocco temporaneo di un antivirus o di un altro programma, risorse di sistema scarse) | il motore riprova da solo fino a 5 volte; se tutti i tentativi falliscono, inviare le righe `errno`/`doserrno`: indicano la causa reale |
 | Windows impedisce l'avvio dell'eseguibile (EACCES/EPERM) | policy di sicurezza, es. Smart App Control, o binario bloccato | controllare Sicurezza di Windows e i registri CodeIntegrity; usare binari attendibili; **non** disattivare le protezioni |
 | Generazione lentissima (minuti per passo) | esecuzione sulla CPU, risoluzione alta, o modello troppo grande per la memoria | verificare i device; ridurre risoluzione/passi; modello quantizzato; build GPU |
 | Avviso "memory guard: pressure" nei log | la memoria del device (su CPU: la RAM di sistema) ha superato la soglia `--memory-guard` | è un avviso con riduzione automatica della residenza: evitare nuove richieste finché non segnala il recupero |
@@ -871,6 +872,23 @@ sincronizzazioni future.
     `src/core/pe_imports.{h,cpp}`) e un suggerimento. ggml li carica in
     silenzio nelle build Release e su Windows non riporta mai l'errore del
     sistema. Test del lettore: `test/pe_imports_test.cpp`.
+13. **File del modello aperti una volta sola** — `src/model_io/file_handle_pool.{h,cpp}`:
+    `ModelLoader` tiene aperti i flussi di lettura dei file modello e li
+    riusa tra i caricamenti dei componenti (testo, UNet, VAE), tra i segmenti
+    e tra le richieste, invece di riaprire il file a ogni lotto di pesi e per
+    ogni thread (con i pesi su disco accadeva centinaia di volte, proprio
+    quando la RAM è piena). Un flusso viene scartato se il file cambia
+    (dimensione o data) o se una lettura fallisce; in quel caso il motore
+    riapre il file e ripete la lettura una volta (`read from '...' failed;
+    reopening the file and trying again`). Anche l'apertura dei `.ckpt` ha
+    ora i tentativi ripetuti. Misure con un modello sintetico (CPU, 2 thread):
+    5 aperture del file per 3 richieste del server, invece di 9 per ciascuna;
+    un errore di lettura iniettato (EIO) viene assorbito e l'immagine resta
+    identica; errori persistenti terminano con un errore pulito. I file
+    restano aperti finché il modello è caricato: su Windows non si può
+    sostituire o cancellare il file del modello mentre il motore lo usa
+    (come già accadeva con `--mmap`). Test: `test/file_handle_pool_test.cpp`
+    (ASan/UBSan e ThreadSanitizer).
 
 Passaggi previsti e non ancora svolti: collaudo del workflow di release sui
 runner GitHub, generazione con un modello reale (inclusa la memory guard sotto
