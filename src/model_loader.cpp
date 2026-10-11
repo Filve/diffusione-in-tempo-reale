@@ -1,9 +1,11 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cerrno>
 #include <cinttypes>
 #include <cstdarg>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <functional>
 #include <mutex>
@@ -1141,7 +1143,33 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
                         return;
                     }
                 } else if (!mmapped) {
-                    file.open(file_path, std::ios::binary);
+                    // Opening can fail transiently on Windows (e.g. sharing violations under
+                    // load); retry and log the OS error so the cause is visible.
+                    constexpr int kOpenAttempts = 5;
+                    for (int attempt = 1; attempt <= kOpenAttempts; ++attempt) {
+                        file.clear();
+                        errno = 0;
+                        file.open(file_path, std::ios::binary);
+                        if (file.is_open()) {
+                            break;
+                        }
+                        int saved_errno = errno;
+#ifdef _WIN32
+                        unsigned long win_err = 0;
+                        _get_doserrno(&win_err);
+                        LOG_WARN("open '%s' failed (attempt %d/%d): errno=%d (%s), doserrno=%lu",
+                                 file_path.c_str(), attempt, kOpenAttempts,
+                                 saved_errno, strerror(saved_errno), win_err);
+#else
+                        LOG_WARN("open '%s' failed (attempt %d/%d): errno=%d (%s)",
+                                 file_path.c_str(), attempt, kOpenAttempts,
+                                 saved_errno, strerror(saved_errno));
+#endif
+                        if (saved_errno == ENOENT || attempt == kOpenAttempts) {
+                            break;
+                        }
+                        std::this_thread::sleep_for(std::chrono::milliseconds(200 * attempt));
+                    }
                     if (!file.is_open()) {
                         LOG_ERROR("failed to open '%s'", file_path.c_str());
                         failed = true;
