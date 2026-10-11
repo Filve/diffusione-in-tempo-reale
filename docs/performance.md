@@ -237,6 +237,23 @@ The estimate comes from the file sizes (it does not read the models) and does no
 account for `--type` conversions at load time. When the sizes or the memory are
 unknown, `auto` leaves the defaults alone. The thresholds are heuristics.
 
+### Two more levels for the server
+
+`sd-server` can go beyond `lite` on its own. When a request runs out of memory, it
+loads the model again with the next lighter profile and runs the request again:
+
+| Level | What it sets |
+|---|---|
+| `lite-disk` | `--params-backend disk` (weights are streamed from the file instead of kept in memory); `--eager-load` is switched off |
+| `lite-cpu` | everything on the CPU (`--backend cpu`); only when the machine has another device |
+
+These two are not values of `--profile`. The server climbs back one level at a time
+after `--degradation-cooldown` seconds; every climb loads the model once, which takes
+long on a large model. If that cost is not worth it, start the server on the lighter
+profile with `--profile lite` and `--degradation-cooldown 0`, or use
+`--disable-degradation` to get the error at once. See [Failures and
+recovery](../examples/server/api.md#failures-and-recovery).
+
 ## Use quantization to reduce memory usage.
 
 [quantization](./quantization_and_gguf.md)

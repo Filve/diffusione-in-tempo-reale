@@ -21,6 +21,7 @@ progetto originale. Modifiche del fork di **Francesco Simeoni**
 - **Profili di risorse** (`--profile lite|balanced|max|auto`): un'unica opzione imposta guardiano di memoria, encoder di testo su CPU e VAE a tasselli per le macchine piccole; `auto` sceglie in base al modello e alla memoria libera
 - **Errori leggibili dalle app**: `sd_get_last_error()` distingue memoria esaurita, file del modello e backend; `sd_get_system_memory()` riporta la RAM di sistema
 - **Server robusto**: parte anche senza modello, autenticazione opzionale (`--api-key`) e allowlist CORS (`--cors-origins`)
+- **Server che non cade per la memoria**: una richiesta che esaurisce la RAM/VRAM non ferma `sd-server`; il modello viene ricaricato con un profilo più leggero e la richiesta ripetuta, altrimenti risposta `503` con `Retry-After`; `GET /sdcpp/v1/health` e `/resources` mostrano lo stato (`--disable-degradation` per spegnerlo)
 - **Pacchetto portabile**: backend ggml come librerie dinamiche caricate a runtime — un solo zip per macchine vecchie e nuove (`scripts/package_portable.sh`); pacchetti con GPU pronti: Windows CUDA 12 (NVIDIA, DLL incluse), Windows/Linux Vulkan, macOS Metal
 - **Suite di test di sicurezza** in [test/](./test/): file modello ostili, fuzzing, sanitizer
 

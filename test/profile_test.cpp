@@ -138,11 +138,13 @@ int main() {
         CHECK(!p.ctx.clip_on_cpu, "an explicit text encoder placement is not overridden by lite");
     }
     {
-        Parsed p({"--params-backend", "cpu", "--offload-to-cpu"});
+        Parsed p({"--params-backend", "cpu", "--offload-to-cpu", "--eager-load"});
         sd_profile::apply(Level::LITE_DISK, p.ctx, p.gen, true);
-        CHECK(p.ctx.params_backend == "cpu" && p.ctx.offload_params_to_cpu, "an explicit --params-backend is kept at startup");
+        CHECK(p.ctx.params_backend == "cpu" && p.ctx.offload_params_to_cpu && p.ctx.eager_load,
+              "an explicit --params-backend is kept at startup");
         sd_profile::apply(Level::LITE_DISK, p.ctx, p.gen, false);
         CHECK(p.ctx.params_backend == "disk" && !p.ctx.offload_params_to_cpu, "lite-disk streams the weights from disk in a recovery");
+        CHECK(!p.ctx.eager_load, "and does not read all of them into memory first");
     }
     {
         Parsed p({"--backend", "cuda0"});

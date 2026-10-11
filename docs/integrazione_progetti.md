@@ -28,6 +28,7 @@ controllato:
 | Profili di risorse | `--profile lite\|balanced\|max\|auto` imposta in un colpo guardiano di memoria, encoder di testo su CPU, VAE a tasselli e CFG non raggruppato; `auto` sceglie dalla dimensione del modello e dalla memoria libera | **disattivo** (come `max`) |
 | Errori classificati e memoria di sistema | dopo un fallimento `sd_get_last_error()` dà un codice (memoria esaurita, file del modello, backend, ...) e il motivo; `sd_get_system_memory()` riporta RAM totale, disponibile e del processo | sempre disponibile |
 | Server senza modello | `sd-server` parte anche senza `-m`: device e upscale funzionano, la generazione risponde con un errore chiaro | **attivo** |
+| Server che resta in piedi | una richiesta che esaurisce la memoria non ferma `sd-server`: il modello viene ricaricato con un profilo più leggero (`max > balanced > lite > lite-disk > lite-cpu`) e la richiesta ripetuta; se nemmeno il più leggero basta, risposta `503` con `Retry-After`; dopo una pausa il server risale. `GET /sdcpp/v1/health` e `/resources` | **attivo** (`--disable-degradation` lo spegne) |
 | Autenticazione server | `--api-key` (Bearer o `X-API-Key`) e allowlist CORS `--cors-origins` | **disattivi** |
 | Pacchetto portabile | backend ggml come librerie dinamiche caricate a runtime: un solo pacchetto, ogni macchina usa ciò che ha | opzionale in build |
 | Release automatiche | workflow `release-portable.yml`: zip con GPU (Windows CUDA 12 e Vulkan, Linux Vulkan, macOS Metal) a ogni tag `portable-v*` o avvio manuale | su tag |
@@ -620,6 +621,41 @@ Il server **parte anche senza modello** (niente loop né uscita silenziosa):
   scrive in console il percorso del modello e il motivo del fallimento
   (exit code 1).
 
+Il server **non cade quando la memoria finisce**:
+
+- una richiesta che esaurisce la memoria (o fa fallire un device) libera il
+  modello, lo ricarica con il profilo più leggero successivo
+  (`max > balanced > lite > lite-disk > lite-cpu`; i passi che darebbero la
+  stessa configurazione vengono saltati) e ripete **la stessa richiesta**. Da
+  `lite` in poi il VAE decodifica a tasselli qualunque cosa chieda la richiesta.
+  Con `--eager-load` il passo `lite-disk` non rilegge tutti i pesi all'avvio;
+- se nemmeno il profilo più leggero basta, la risposta è `503` con
+  l'intestazione `Retry-After` e un corpo
+  `{"error": "...", "code": "out_of_memory", "retry_after_seconds": 30}`; il
+  server resta attivo e serve le richieste più piccole. Nei job asincroni lo
+  stesso `code` compare in `error.code`. Una richiesta non valida è `400`
+  (`invalid_argument`); un file del modello illeggibile o un device guasto sono
+  `500` (`model_file`, `backend`);
+- dopo `--degradation-cooldown` secondi (predefinito 300) il server risale di un
+  profilo, all'inizio della richiesta successiva, che paga il ricaricamento del
+  modello; una risalita che non funziona viene annullata e l'attesa raddoppia
+  (fino a un'ora). `--degradation-cooldown 0` lo lascia sul profilo leggero fino
+  al riavvio; `--disable-degradation` spegne tutto e la richiesta fallisce subito;
+- se il modello non si riesce a ricaricare, le richieste ricevono `503`
+  (`unavailable`) e il server riprova a partire dalla richiesta successiva, non
+  più spesso di ogni 15 secondi;
+- se il modello non ci sta nemmeno all'avvio, il server parte con il primo
+  profilo che lo carica (il log dice quale). Se non riesce ad aprire la porta, o
+  a creare i thread del server HTTP, esce con codice 1 e un messaggio
+  invece di terminare in silenzio;
+- `GET /sdcpp/v1/health` riporta stato (`ok`, `degraded`, `recovering`,
+  `unavailable`, `no_model`), profilo in uso, contatori (richieste, discese,
+  risalite, ricaricamenti), ultimo errore e coda dei job, e risponde subito
+  anche durante una generazione; `GET /sdcpp/v1/resources` riporta RAM del
+  sistema e memoria dei device. Entrambi richiedono la chiave API se impostata.
+
+Dettagli e formato delle risposte: [examples/server/api.md](../examples/server/api.md).
+
 ## 4. Retrocompatibilità e risorse
 
 La compatibilità va considerata su più livelli: sistema operativo, architettura
@@ -997,7 +1033,65 @@ sincronizzazioni future.
     libera). Le soglie di `auto` non sono ancora state tarate su un modello
     reale né su una GPU.
 
+17. **Server che non cade per la memoria** — `examples/server/recovery.{h,cpp}`:
+    `ContextKeeper` possiede il contesto del server (prima era una variabile di
+    `main`) e tutte le generazioni dei tre gruppi di endpoint passano da
+    `ContextKeeper::run()`. Su `out_of_memory` o `backend` (codici di
+    `sd_get_last_error()`) libera il modello, lo ricarica con il profilo più
+    leggero successivo e ripete la stessa richiesta (da `lite` in poi forza il
+    VAE a tasselli); un guasto di device salta direttamente a `lite-cpu`. Il
+    livello di partenza è quello di `--profile`. Risalita di un passo dopo
+    `--degradation-cooldown` (300 s; 0 = mai) con prova: se il profilo più
+    pesante fallisce al primo uso, si torna indietro e l'attesa raddoppia (tetto
+    un'ora). Ricarica con attesa minima di 15 s se il modello non si riesce a
+    caricare. Risposte: `503` con `Retry-After` per memoria o contesto non
+    disponibile, `400` per richieste non valide, `500` per il resto, con corpo
+    `{"error", "code", "retry_after_seconds"}`; i job asincroni riportano lo
+    stesso `code` in `error.code`; `429` con `Retry-After`; `std::bad_alloc` nei
+    gestori diventa `503`. Nuovi endpoint `GET /sdcpp/v1/health` (stato,
+    profilo, contatori, ultimo errore, coda; non aspetta mai il blocco della
+    generazione) e `GET /sdcpp/v1/resources`. Opzioni `--disable-degradation` e
+    `--degradation-cooldown`. `main.cpp`: se il server HTTP non riesce a creare i
+    suoi thread (memoria al limite) o la porta non è libera, esce con codice 1 e
+    un messaggio; prima il primo caso terminava con `std::terminate` e il secondo
+    usciva con codice 0. Con `--eager-load` il profilo `lite-disk` non legge più
+    tutti i pesi all'avvio (altrimenti non risparmiava nulla).
+    Test: `test/server_recovery_test.cpp` (114 controlli con libreria e orologio
+    simulati, anche da più thread) con 9 mutazioni del codice, tutte rilevate.
+    Prove dal vivo con il modello sintetico da 2,1 GB (CPU, `ulimit -v` con
+    `MALLOC_ARENA_MAX=1` per un limite riproducibile): con 2400 MiB e
+    un'immagine 384×384 `max`, `balanced` e `lite` falliscono per memoria e
+    `lite-disk` riesce (200, la richiesta successiva non ricarica), con 2600 MiB
+    `max` basta, sotto 2200 MiB la risposta è `503` con `Retry-After` e il
+    server resta attivo; risalita dopo il tempo di attesa, risalita fallita con
+    attesa raddoppiata, `--disable-degradation` (503 subito), `error.code` dei
+    job, chiave API sui nuovi endpoint, avvio con `--eager-load` a 2100 MiB sul
+    profilo `lite-disk`, `health` sempre sotto 12 ms durante una generazione
+    (347 chiamate), 9 richieste parallele di tipo diverso (OpenAI, sdapi,
+    sdcpp) tutte servite con contatori coerenti, anche con 2400 MiB: una
+    richiesta 384×384 ha portato il server fino a `lite-disk` (3 discese, 3
+    ricaricamenti) e le altre sono state servite sul profilo raggiunto.
+    Sanitizer: il test del custode passa anche con AddressSanitizer,
+    UBSan e ThreadSanitizer; server e motore compilati per intero con
+    ASan/UBSan, con allocazioni che falliscono oltre una soglia, hanno
+    percorso tutta la scala dei profili fino al `503`, gli scenari CPU con RAM
+    occupata (guardia, pesi su disco, segmenti, auto-fit) sono terminati senza
+    segnalazioni e sei errori di lettura iniettati sul file del modello sono
+    stati assorbiti dalla riapertura con la stessa immagine; server con chiave
+    API, senza modello, con modello mancante e con richieste parallele senza
+    errori di memoria. UBSan ha segnalato tre punti preesistenti: un campo
+    `resolved_hires_upscaler` non inizializzato (corretto in un commit a
+    parte), e due scorrimenti a sinistra di valori negativi in
+    `base64_encode` e nello scrittore JPEG di stb (codice di upstream,
+    innocui nella pratica, lasciati invariati). Non provato: Windows, GPU,
+    modelli reali. Un errore che
+    termina il processo dentro il driver (per esempio CUDA) non si può intercettare
+    da qui. Ogni risalita costa un ricaricamento del modello: con modelli grandi
+    conviene un `--profile` più leggero fisso, oppure `--degradation-cooldown 0`.
+
 Passaggi previsti e non ancora svolti: collaudo del workflow di release sui
-runner GitHub, generazione con un modello reale (inclusa la memory guard sotto
-pressione vera), test su CUDA/Vulkan, e il livello di astrazione
+runner GitHub, generazione con un modello reale (inclusa la memory guard e la
+discesa di profilo del server sotto pressione vera), test su CUDA/Vulkan e su
+Windows (il ramo Windows della memoria di sistema è stato solo controllato nella
+sintassi), taratura delle soglie di `--profile auto`, e il livello di astrazione
 `ImageRuntime` nell'applicazione ospite (fuori da questo repository).

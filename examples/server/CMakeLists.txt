@@ -69,6 +69,7 @@ add_executable(${TARGET}
     ../common/profile.cpp
     main.cpp
     runtime.cpp
+    recovery.cpp
     async_jobs.cpp
     routes_index.cpp
     routes_openai.cpp

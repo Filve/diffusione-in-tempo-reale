@@ -225,31 +225,45 @@ json make_async_job_json(const AsyncJobManager& manager, const AsyncGenerationJo
     return result;
 }
 
+static bool fail_with(GenerationFailure& failure, const char* message) {
+    failure         = GenerationFailure();
+    failure.code    = SD_ERROR_UNKNOWN;
+    failure.message = message;
+    return false;
+}
+
 bool execute_img_gen_job(ServerRuntime& runtime,
                          AsyncGenerationJob& job,
                          std::vector<std::string>& output_images,
-                         std::string& error_message) {
-    sd_img_gen_params_t params = job.img_gen.to_sd_img_gen_params_t();
+                         GenerationFailure& failure) {
+    const sd_img_gen_params_t params = job.img_gen.to_sd_img_gen_params_t();
 
     SDImageVec results;
-
-    {
-        std::lock_guard<std::mutex> lock(*runtime.sd_ctx_mutex);
-        set_preview_callback(job);
-        sd_image_t* raw_results = nullptr;
-        int num_results         = 0;
-        if (!generate_image(runtime.sd_ctx, &params, &raw_results, &num_results)) {
-            raw_results = nullptr;
-            num_results = 0;
-        }
-        clear_preview_callback();
-        results.adopt(raw_results, num_results);
+    const bool generated = runtime.keeper->run(
+        [&](const ContextKeeper::ContextView& view) {
+            sd_img_gen_params_t attempt_params = params;
+            if (view.force_vae_tiling) {
+                attempt_params.vae_tiling_params.enabled = true;
+            }
+            set_preview_callback(job);
+            sd_image_t* raw_results = nullptr;
+            int num_results         = 0;
+            const bool ok           = generate_image(view.ctx, &attempt_params, &raw_results, &num_results);
+            clear_preview_callback();
+            if (!ok) {
+                return false;
+            }
+            results.adopt(raw_results, num_results);
+            return true;
+        },
+        failure);
+    if (!generated) {
+        return false;
     }
 
     const int num_results = results.count();
     if (num_results <= 0) {
-        error_message = "generate_image returned no results";
-        return false;
+        return fail_with(failure, "generate_image returned no results");
     }
 
     EncodedImageFormat encoded_format = EncodedImageFormat::PNG;
@@ -285,8 +299,7 @@ bool execute_img_gen_job(ServerRuntime& runtime,
     }
 
     if (output_images.empty()) {
-        error_message = "generate_image returned empty encoded outputs";
-        return false;
+        return fail_with(failure, "generate_image returned empty encoded outputs");
     }
 
     return true;
@@ -298,32 +311,46 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
                          std::string& output_media_mime_type,
                          int& output_frame_count,
                          int& output_fps,
-                         std::string& error_message) {
-    sd_vid_gen_params_t params = job.vid_gen.to_sd_vid_gen_params_t();
-    std::string str_params     = job.vid_gen.gen_params.embed_image_metadata
-                                     ? get_image_params(*runtime.ctx_params, job.vid_gen.gen_params, job.vid_gen.gen_params.seed, VID_GEN)
-                                     : "";
+                         GenerationFailure& failure) {
+    const sd_vid_gen_params_t params = job.vid_gen.to_sd_vid_gen_params_t();
+    std::string str_params           = job.vid_gen.gen_params.embed_image_metadata
+                                           ? get_image_params(*runtime.ctx_params, job.vid_gen.gen_params, job.vid_gen.gen_params.seed, VID_GEN)
+                                           : "";
 
     SDImageVec results;
     int num_results             = 0;
     sd_audio_t* generated_audio = nullptr;
 
-    {
-        std::lock_guard<std::mutex> lock(*runtime.sd_ctx_mutex);
-        set_preview_callback(job);
-        sd_image_t* raw_results = nullptr;
-        if (!generate_video(runtime.sd_ctx, &params, &raw_results, &num_results, &generated_audio, &output_fps)) {
-            raw_results = nullptr;
-        }
-        clear_preview_callback();
-        results.adopt(raw_results, num_results);
+    const bool generated = runtime.keeper->run(
+        [&](const ContextKeeper::ContextView& view) {
+            sd_vid_gen_params_t attempt_params = params;
+            if (view.force_vae_tiling) {
+                attempt_params.vae_tiling_params.enabled = true;
+            }
+            set_preview_callback(job);
+            sd_image_t* raw_results = nullptr;
+            int frame_count         = 0;
+            sd_audio_t* audio       = nullptr;
+            int fps                 = 0;
+            const bool ok           = generate_video(view.ctx, &attempt_params, &raw_results, &frame_count, &audio, &fps);
+            clear_preview_callback();
+            if (!ok) {
+                return false;
+            }
+            results.adopt(raw_results, frame_count);
+            generated_audio = audio;
+            output_fps      = fps;
+            return true;
+        },
+        failure);
+    if (!generated) {
+        return false;
     }
 
     num_results = results.count();
     if (num_results <= 0) {
         free_sd_audio(generated_audio);
-        error_message = "generate_video returned no results";
-        return false;
+        return fail_with(failure, "generate_video returned no results");
     }
 
     std::vector<uint8_t> video_bytes = create_video_from_sd_images_to_vector(job.vid_gen.output_format,
@@ -335,8 +362,7 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
                                                                              str_params);
     free_sd_audio(generated_audio);
     if (video_bytes.empty()) {
-        error_message = "failed to encode generated video container";
-        return false;
+        return fail_with(failure, "failed to encode generated video container");
     }
 
     output_media_b64       = base64_encode(video_bytes);
@@ -381,21 +407,31 @@ void async_job_worker(ServerRuntime& runtime) {
         std::string output_media_mime_type;
         int output_frame_count = 0;
         int output_fps         = 0;
-        std::string error_message;
+        GenerationFailure failure;
         bool ok = false;
 
-        if (job->kind == AsyncJobKind::ImgGen) {
-            ok = execute_img_gen_job(runtime, *job, output_images, error_message);
-        } else if (job->kind == AsyncJobKind::VidGen) {
-            ok = execute_vid_gen_job(runtime,
-                                     *job,
-                                     output_media_b64,
-                                     output_media_mime_type,
-                                     output_frame_count,
-                                     output_fps,
-                                     error_message);
-        } else {
-            error_message = "unsupported job kind";
+        try {
+            if (job->kind == AsyncJobKind::ImgGen) {
+                ok = execute_img_gen_job(runtime, *job, output_images, failure);
+            } else if (job->kind == AsyncJobKind::VidGen) {
+                ok = execute_vid_gen_job(runtime,
+                                         *job,
+                                         output_media_b64,
+                                         output_media_mime_type,
+                                         output_frame_count,
+                                         output_fps,
+                                         failure);
+            } else {
+                fail_with(failure, "unsupported job kind");
+            }
+        } catch (const std::exception& error) {
+            // An exception must not end the only thread that serves the queue.
+            ok      = false;
+            failure = failure_from_exception(error);
+            LOG_ERROR("job %s stopped by an exception: %s", job->id.c_str(), error.what());
+        } catch (...) {
+            ok = false;
+            fail_with(failure, "unexpected error while generating");
         }
 
         {
@@ -417,8 +453,8 @@ void async_job_worker(ServerRuntime& runtime) {
                 job->error_message.clear();
             } else {
                 job->status        = AsyncJobStatus::Failed;
-                job->error_code    = "generation_failed";
-                job->error_message = error_message.empty() ? "unknown generation error" : error_message;
+                job->error_code    = failure_code_name(failure);
+                job->error_message = failure.message.empty() ? "unknown generation error" : failure.message;
                 job->result_images_b64.clear();
                 job->result_media_b64.clear();
                 job->result_media_mime_type.clear();

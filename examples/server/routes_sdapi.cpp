@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <new>
 #include <regex>
 #include <string_view>
 #include <unordered_map>
@@ -400,24 +401,38 @@ void register_sdapi_endpoints(httplib::Server& svr, ServerRuntime& rt) {
 
             LOG_VERBOSE("%s\n", request.gen_params.to_string().c_str());
 
-            sd_img_gen_params_t img_gen_params = request.to_sd_img_gen_params_t();
+            const sd_img_gen_params_t img_gen_params = request.to_sd_img_gen_params_t();
             SDImageVec results;
             int num_results = 0;
 
-            {
-                std::lock_guard<std::mutex> lock(*runtime->sd_ctx_mutex);
-                SDAPIPreviewGuard preview_guard(id_task, img_gen_params, img2img ? "img2img" : "txt2img");
-                sd_image_t* raw_results = nullptr;
-                if (!generate_image(runtime->sd_ctx, &img_gen_params, &raw_results, &num_results)) {
-                    raw_results = nullptr;
-                    num_results = 0;
-                }
-                results.adopt(raw_results, num_results);
+            GenerationFailure failure;
+            const bool generated = runtime->keeper->run(
+                [&](const ContextKeeper::ContextView& view) {
+                    sd_img_gen_params_t params = img_gen_params;
+                    if (view.force_vae_tiling) {
+                        params.vae_tiling_params.enabled = true;
+                    }
+                    SDAPIPreviewGuard preview_guard(id_task, params, img2img ? "img2img" : "txt2img");
+                    sd_image_t* raw_results = nullptr;
+                    int count               = 0;
+                    if (!generate_image(view.ctx, &params, &raw_results, &count)) {
+                        return false;
+                    }
+                    results.adopt(raw_results, count);
+                    num_results = count;
+                    return true;
+                },
+                failure);
+            if (!generated) {
+                send_generation_failure(res, failure);
+                return;
             }
 
             if (results.empty()) {
-                res.status = 500;
-                res.set_content(R"({"error":"generate_image returned no results"})", "application/json");
+                failure         = GenerationFailure();
+                failure.code    = SD_ERROR_UNKNOWN;
+                failure.message = "generate_image returned no results";
+                send_generation_failure(res, failure);
                 return;
             }
 
@@ -464,12 +479,14 @@ void register_sdapi_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             res.set_content(out.dump(), "application/json");
             res.status = 200;
 
+        } catch (const std::bad_alloc&) {
+            send_generation_failure(res, out_of_memory_failure());
         } catch (const std::exception& e) {
             res.status = 500;
             json err;
             err["error"]   = "server_error";
             err["message"] = e.what();
-            res.set_content(err.dump(), "application/json");
+            res.set_content(safe_json_dump(err), "application/json");
         }
     };
 

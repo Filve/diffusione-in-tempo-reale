@@ -169,6 +169,7 @@ namespace sd_profile {
         if (level >= Level::LITE_DISK && free_to_set("--params-backend")) {
             ctx.params_backend        = "disk";
             ctx.offload_params_to_cpu = false;
+            ctx.eager_load            = false;
         }
         if (level >= Level::LITE_CPU && free_to_set("--backend")) {
             ctx.backend         = "cpu";

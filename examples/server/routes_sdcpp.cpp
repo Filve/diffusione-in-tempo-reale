@@ -4,6 +4,7 @@
 #include <cmath>
 #include <filesystem>
 #include <limits>
+#include <new>
 
 #include "async_jobs.h"
 #include "common/common.h"
@@ -476,6 +477,53 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
         res.set_content(make_capabilities_json(*runtime).dump(), "application/json");
     });
 
+    svr.Get("/sdcpp/v1/health", [runtime](const httplib::Request&, httplib::Response& res) {
+        json body = runtime->keeper->health_json();
+        {
+            AsyncJobManager& manager = *runtime->async_job_manager;
+            std::lock_guard<std::mutex> lock(manager.mutex);
+            body["queue"] = {
+                {"pending", count_pending_jobs(manager)},
+                {"waiting", manager.queue.size()},
+                {"max", manager.max_pending_jobs},
+            };
+        }
+        res.status = body.value("status", std::string()) == "unavailable" ? 503 : 200;
+        res.set_content(safe_json_dump(body), "application/json");
+    });
+
+    svr.Get("/sdcpp/v1/resources", [runtime](const httplib::Request&, httplib::Response& res) {
+        json body;
+        sd_system_memory_t memory;
+        if (sd_get_system_memory(&memory)) {
+            body["system_memory"] = {
+                {"total_bytes", memory.total_bytes},
+                {"available_bytes", memory.available_bytes},
+                {"process_bytes", memory.process_bytes},
+            };
+        } else {
+            body["system_memory"] = nullptr;
+        }
+
+        json devices = json::array();
+        for (size_t i = 0; i < sd_get_device_count(); ++i) {
+            sd_device_info_t info;
+            if (!sd_get_device_info(i, &info)) {
+                continue;
+            }
+            devices.push_back({
+                {"name", info.name},
+                {"description", info.description},
+                {"type", sd_device_type_name(info.type)},
+                {"free_memory_bytes", info.free_memory_bytes},
+                {"total_memory_bytes", info.total_memory_bytes},
+            });
+        }
+        body["devices"] = std::move(devices);
+        res.status      = 200;
+        res.set_content(safe_json_dump(body), "application/json");
+    });
+
     svr.Post("/sdcpp/v1/upscale", [runtime](const httplib::Request& req, httplib::Response& res) {
         try {
             if (req.body.empty()) {
@@ -564,14 +612,16 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 return;
             }
 
-            // One GPU: an upscale must not run while a generation is using it.
-            std::lock_guard<std::mutex> ctx_lock(*runtime->sd_ctx_mutex);
+            // One GPU: an upscale must not run while a generation is using it. The upscaler follows the
+            // settings the server is running with, which are lighter after it stepped down.
+            std::lock_guard<std::mutex> ctx_lock(runtime->keeper->mutex());
+            const ContextKeeper::BackendChoice choice = runtime->keeper->backend_choice();
             UpscalerCtxPtr upscaler_ctx(new_upscaler_ctx(model_path.c_str(),
-                                                         runtime->ctx_params->diffusion_conv_direct,
-                                                         runtime->ctx_params->n_threads,
+                                                         choice.diffusion_conv_direct,
+                                                         choice.n_threads,
                                                          tile_size,
-                                                         runtime->ctx_params->backend.c_str(),
-                                                         runtime->ctx_params->params_backend.c_str()));
+                                                         choice.backend.c_str(),
+                                                         choice.params_backend.c_str()));
             if (upscaler_ctx == nullptr) {
                 res.status = 500;
                 res.set_content(R"({"error":"the upscaler model could not be loaded"})", "application/json");
@@ -635,9 +685,11 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
         } catch (const json::exception& e) {
             res.status = 400;
             res.set_content(json({{"error", "invalid request"}, {"message", e.what()}}).dump(), "application/json");
+        } catch (const std::bad_alloc&) {
+            send_generation_failure(res, out_of_memory_failure());
         } catch (const std::exception& e) {
             res.status = 500;
-            res.set_content(json({{"error", std::string("server_error: ") + e.what()}}).dump(), "application/json");
+            res.set_content(safe_json_dump(json({{"error", std::string("server_error: ") + e.what()}})), "application/json");
         }
     });
 
@@ -675,6 +727,7 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 purge_expired_jobs(manager);
                 if (count_pending_jobs(manager) >= manager.max_pending_jobs) {
                     res.status = 429;
+                    res.set_header("Retry-After", "10");
                     res.set_content(R"({"error":"job queue is full"})", "application/json");
                     return;
                 }
@@ -737,6 +790,7 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 purge_expired_jobs(manager);
                 if (count_pending_jobs(manager) >= manager.max_pending_jobs) {
                     res.status = 429;
+                    res.set_header("Retry-After", "10");
                     res.set_content(R"({"error":"job queue is full"})", "application/json");
                     return;
                 }
