@@ -7,6 +7,7 @@
 #include <tuple>
 #include <unordered_set>
 
+#include "core/backend_fit.h"
 #include "core/ggml_extend_backend.h"
 #include "core/util.h"
 #include "model/adapter/lora.hpp"
@@ -1799,11 +1800,31 @@ ModelManager::CapacityCheck ModelManager::check_capacity(
     return result;
 }
 
+// On the CPU backend system RAM stands in for device memory. ggml reports no usable
+// free figure for the CPU device outside Windows, so availability comes from the OS probe.
+static sd::MemoryWatchdog::Sample system_ram_sample(ggml_backend_t backend, size_t pending_allocation_bytes) {
+    sd::MemoryWatchdog::Sample sample;
+    size_t free_bytes = 0, total_bytes = 0;
+    if (auto device = ggml_backend_get_device(backend)) {
+        ggml_backend_dev_memory(device, &free_bytes, &total_bytes);
+    }
+    const int64_t available = sd::backend_fit::available_ram_bytes();
+    if (total_bytes == 0 || available < 0) {
+        return sample;
+    }
+    const size_t used  = total_bytes - std::min(static_cast<size_t>(available), total_bytes);
+    sample.limit_bytes = total_bytes;
+    sample.used_bytes  = pending_allocation_bytes > SIZE_MAX - used ? SIZE_MAX : used + pending_allocation_bytes;
+    return sample;
+}
+
 sd::MemoryWatchdog::Sample ModelManager::memory_guard_sample(const DeviceMemoryRequest& request) const {
     sd::MemoryWatchdog::Sample sample;
-    if (!memory_watchdog_.enabled() || request.compute_backend == nullptr ||
-        sd_backend_is_cpu(request.compute_backend)) {
+    if (!memory_watchdog_.enabled() || request.compute_backend == nullptr) {
         return sample;
+    }
+    if (sd_backend_is_cpu(request.compute_backend)) {
+        return system_ram_sample(request.compute_backend, request.pending_allocation_bytes);
     }
     auto add             = [](size_t a, size_t b) { return b > SIZE_MAX - a ? SIZE_MAX : a + b; };
     const size_t tracked = add(compute_backend_resident_bytes(request.compute_backend),
@@ -1865,12 +1886,14 @@ bool ModelManager::ensure_compute_backend_capacity(
         LOG_ERROR("model manager cannot reclaim memory for a null compute backend");
         return false;
     }
-    if (sd_backend_is_cpu(compute_backend)) {
+    const bool host_backend = sd_backend_is_cpu(compute_backend);
+    if (host_backend && !memory_watchdog_.enabled()) {
         return true;
     }
 
-    memory_watchdog_.observe(compute_backend, memory_guard_sample(request));
-    auto fits      = [&]() { return check_capacity(request, required_states).fits(); };
+    memory_watchdog_.observe(compute_backend, memory_guard_sample(request), !host_backend);
+    // System RAM has no managed capacity on the CPU: only the memory guard applies there.
+    auto fits      = [&]() { return host_backend || check_capacity(request, required_states).fits(); };
     auto satisfied = [&]() { return fits() && memory_guard_ok(request); };
     if (satisfied()) {
         return true;
@@ -1954,7 +1977,7 @@ bool ModelManager::ensure_compute_backend_capacity(
         if (!fits()) {
             return false;
         }
-        memory_watchdog_.observe(compute_backend, memory_guard_sample(request));
+        memory_watchdog_.observe(compute_backend, memory_guard_sample(request), !host_backend);
         if (memory_watchdog_.should_log_unreachable(compute_backend)) {
             LOG_WARN("memory guard: cannot reduce %s below %d%% usage, continuing under pressure",
                      ggml_backend_name(compute_backend), memory_watchdog_.threshold_percent());

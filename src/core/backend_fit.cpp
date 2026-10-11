@@ -161,7 +161,7 @@ namespace sd::backend_fit {
         return out;
     }
 
-    static int64_t available_ram_bytes() {
+    int64_t available_ram_bytes() {
 #if defined(_WIN32)
         MEMORYSTATUSEX status{};
         status.dwLength = sizeof(status);

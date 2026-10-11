@@ -1,6 +1,7 @@
 #ifndef __SD_BACKEND_FIT_H__
 #define __SD_BACKEND_FIT_H__
 
+#include <cstdint>
 #include <string>
 
 #include "core/ggml_graph_cut.h"
@@ -21,6 +22,9 @@ namespace sd::backend_fit {
                                          int latent_tile_size_w,
                                          int latent_tile_size_h,
                                          int scale_factor);
+
+    // Physical memory available without swapping, or -1 when the platform cannot report it.
+    int64_t available_ram_bytes();
 
 }  // namespace sd::backend_fit
 

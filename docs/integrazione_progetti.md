@@ -325,7 +325,7 @@ Che cosa è automatico e che cosa no:
 | Il motore si chiude durante il caricamento pesi con `read tensor data failed` | pressione di memoria estrema durante letture grandi, oppure file del modello incompleto | liberare RAM o usare `--params-backend disk`; verificare l'integrità del file (dimensione attesa vs reale) |
 | Windows impedisce l'avvio dell'eseguibile (EACCES/EPERM) | policy di sicurezza, es. Smart App Control, o binario bloccato | controllare Sicurezza di Windows e i registri CodeIntegrity; usare binari attendibili; **non** disattivare le protezioni |
 | Generazione lentissima (minuti per passo) | esecuzione sulla CPU, risoluzione alta, o modello troppo grande per la memoria | verificare i device; ridurre risoluzione/passi; modello quantizzato; build GPU |
-| Avviso "memory guard: pressure" nei log | la memoria del device ha superato la soglia `--memory-guard` | è un avviso con riduzione automatica della residenza: evitare nuove richieste finché non segnala il recupero |
+| Avviso "memory guard: pressure" nei log | la memoria del device (su CPU: la RAM di sistema) ha superato la soglia `--memory-guard` | è un avviso con riduzione automatica della residenza: evitare nuove richieste finché non segnala il recupero |
 
 ### 2.9 Pacchetto portabile (consigliato per la distribuzione)
 ```shell
@@ -448,7 +448,7 @@ default):
 | `backend` | assegnazione backend, es. `"cpu"`, `"vulkan0"`, `"diffusion=cuda0,te=cpu"`; vuoto = migliore disponibile | auto |
 | `params_backend` | dove risiedono i pesi: `"cpu"` (RAM), `"disk"`, per modulo | auto-fit |
 | `max_vram` | budget per device in GiB, es. `"6"` o `"cuda0=6,vulkan0=4"`; `-1` = riserva 1 GiB | memoria libera |
-| `memory_guard` | soglia % del guardiano di memoria (50–99); `0` = spento | `0` |
+| `memory_guard` | soglia % del guardiano di memoria (50–99): memoria del device, su CPU la RAM di sistema; `0` = spento | `0` |
 | `disable_backend_fallback` | `true` = fallire invece di ripiegare sulla CPU | `false` |
 | `enable_mmap` | mappa i pesi dal file invece di copiarli in RAM | `false` |
 | `wtype` | forza il tipo dei pesi (quantizzazione a caricamento) | tipo del file |
@@ -625,10 +625,19 @@ dei pacchetti portabili automatici descritti sopra.
   a soglia +5 punti la pressione è "critica". È best effort: non fa fallire
   un grafo che ci sta comunque e non è un limite fisico assoluto, perché le
   allocazioni dei driver fuori dalla gestione del motore non sono visibili.
-  Non si applica ai backend CPU: non è un guardiano della RAM di sistema.
+  Sui backend CPU misura la RAM di sistema (memoria totale meno quella
+  disponibile senza swap, più l'allocazione che il grafo sta per fare, rispetto
+  alla RAM fisica totale): sotto pressione rilascia i pesi che si possono
+  rileggere dal file (`--params-backend disk`); i pesi presenti solo in RAM non
+  si possono rilasciare, quindi viene registrato un avviso e l'esecuzione
+  continua. La percentuale riguarda l'intera macchina, non solo questo
+  processo, e sulle piattaforme che non riportano la memoria disponibile il
+  guardiano su CPU non fa nulla.
   Gli avvisi di pressione alta/critica e di recupero sono accessibili tramite
   il callback di log; l'applicazione ospite può mostrarli senza interrompere
-  la generazione. Un monitor RAM nell'applicazione resta un controllo separato.
+  la generazione. Un eventuale monitor RAM nell'applicazione resta un controllo
+  separato: il guardiano riduce la residenza dei pesi ma non interrompe la
+  richiesta.
 - **Elenco dispositivi** per scegliere la strategia nell'app: tipo `cpu`,
   `gpu`, `igpu`, `accel`; memoria 0 = non riportata dal backend.
 - **Altri motori** (MNN, ncnn, ONNX Runtime): non sono integrati in questo
@@ -784,6 +793,8 @@ sincronizzazioni future.
    (`src/core/memory_watchdog.{h,cpp}`) innestato nel `ModelManager`: sopra la
    soglia riduce la residenza dei pesi (eviction), sospende il prefetch e
    forza l'esecuzione segmentata; best effort, mai fallimenti artificiali.
+   Sui backend CPU misura la RAM di sistema e può rilasciare solo i pesi
+   rileggibili dal file (`--params-backend disk`).
    API: campo `memory_guard` in `sd_ctx_params_t`; CLI: `--memory-guard`.
    Documentato in [performance.md](./performance.md).
 2. **API di rilevamento device** — `sd_get_device_count()`,

@@ -174,8 +174,17 @@ more pressed:
 The guard covers memory managed by the runners (weights, compute workspaces,
 caches). Driver contexts and allocations made outside the managed runners stay
 invisible to it, so it is not a hard physical cap. On backends that do not
-report device memory the guard only tracks the managed `--max-vram` budget,
-and it does not apply to CPU backends. `0` (the default) disables the guard.
+report device memory the guard only tracks the managed `--max-vram` budget.
+`0` (the default) disables the guard.
+
+On CPU backends the guard measures system RAM instead: used memory (total minus
+the memory available without swapping, plus the allocation a graph is about to
+make) against total physical memory. Under pressure it releases unpinned weights
+that can be re-read from disk (`--params-backend disk`); weights that live only
+in RAM cannot be released, so the guard logs a warning once and the run
+continues. RAM is shared with other programs, so the percentage covers the whole
+machine, not only this process. The guard never fails a graph on the CPU, and it
+does nothing on platforms that cannot report available memory.
 
 ## Use quantization to reduce memory usage.
 

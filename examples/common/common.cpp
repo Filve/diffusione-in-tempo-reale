@@ -595,7 +595,7 @@ ArgOptions SDContextParams::get_options() {
          &conditioning_cache_size},
         {"",
          "--memory-guard",
-         "device memory usage percent that triggers pressure reduction (weight eviction, prefetch pause) before allocations fail, e.g. 90 (default: 0, disabled)",
+         "memory usage percent (device memory, or system RAM on CPU backends) that triggers pressure reduction (weight eviction, prefetch pause) before allocations fail, e.g. 90 (default: 0, disabled)",
          &memory_guard},
     };
 
