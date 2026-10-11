@@ -19,7 +19,7 @@ progetto originale. Modifiche del fork di **Francesco Simeoni**
 - **Fallback CPU automatico**: se il backend richiesto manca o non si inizializza, il contesto degrada alla CPU invece di fallire
 - **Memory guard** (`--memory-guard 90`): sopra la soglia riduce la pressione di memoria (eviction dei pesi, prefetch sospeso) prima dell'out-of-memory; sulla CPU misura la RAM di sistema
 - **Server robusto**: parte anche senza modello, autenticazione opzionale (`--api-key`) e allowlist CORS (`--cors-origins`)
-- **Pacchetto portabile**: backend ggml come librerie dinamiche caricate a runtime — un solo zip per macchine vecchie e nuove (`scripts/package_portable.sh`)
+- **Pacchetto portabile**: backend ggml come librerie dinamiche caricate a runtime — un solo zip per macchine vecchie e nuove (`scripts/package_portable.sh`); pacchetti con GPU pronti: Windows CUDA 12 (NVIDIA, DLL incluse), Windows/Linux Vulkan, macOS Metal
 - **Suite di test di sicurezza** in [test/](./test/): file modello ostili, fuzzing, sanitizer
 
 Tutti i dettagli, passo per passo: **[guida completa in italiano](./docs/integrazione_progetti.md)**

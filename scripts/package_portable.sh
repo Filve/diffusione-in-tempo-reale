@@ -2,6 +2,14 @@
 # Create a relocatable distribution package from a portable build
 # (see docs/build.md, "Build a portable package").
 # Usage: scripts/package_portable.sh [build_dir] [output_dir]
+#
+# Environment:
+#   PORTABLE_VARIANT           suffix of the zip name and wording of LEGGIMI.txt:
+#                              cuda12, vulkan or metal (empty: CPU only)
+#   PORTABLE_REQUIRE_BACKENDS  space/comma separated ggml backends (cuda, vulkan,
+#                              metal) whose module must be in the build; the
+#                              script fails instead of shipping a package that
+#                              would silently fall back to the CPU
 
 set -euo pipefail
 
@@ -24,13 +32,61 @@ case "$(uname -s)" in
     *) os="$(uname -s | tr '[:upper:]' '[:lower:]')" ;;
 esac
 arch="$(uname -m)"
-name="diffusione-in-tempo-reale-${version}-${os}-${arch}"
+variant="${PORTABLE_VARIANT:-}"
+name="diffusione-in-tempo-reale-${version}-${os}-${arch}${variant:+-$variant}"
 stage="$(mktemp -d)/$name"
 mkdir -p "$stage/licenses" "$output_dir"
 trap 'rm -rf "$(dirname "$stage")"' EXIT
 
 # Binaries plus every shared library/backend module next to them.
 cp -R "$build_dir/bin/." "$stage/"
+
+missing=()
+required="${PORTABLE_REQUIRE_BACKENDS:-}"
+for backend in ${required//,/ }; do
+    compgen -G "$stage/*ggml-$backend.*" >/dev/null || missing+=("ggml-$backend module")
+    if [[ "$backend" == cuda && "$os" == windows ]]; then
+        # ggml-cuda.dll cannot load on a machine without the CUDA toolkit
+        # unless its runtime libraries sit next to it.
+        for lib in cudart64_ cublas64_ cublasLt64_; do
+            compgen -G "$stage/${lib}*.dll" >/dev/null || missing+=("${lib}*.dll")
+        done
+    fi
+done
+if ((${#missing[@]})); then
+    echo "error: the package could not use its GPU backend; missing: ${missing[*]}" >&2
+    exit 1
+fi
+
+case "$variant" in
+    cuda*) gpu_note="GPU: questo pacchetto usa CUDA 12 (schede NVIDIA). Serve solo il driver
+NVIDIA aggiornato: le DLL di CUDA (cudart, cublas) sono incluse e devono
+restare nella stessa cartella di sd-cli e sd-server." ;;
+    vulkan) gpu_note="GPU: questo pacchetto usa Vulkan (schede NVIDIA, AMD, Intel). Serve il
+driver grafico aggiornato del produttore, che installa Vulkan insieme a se'." ;;
+    metal) gpu_note="GPU: questo pacchetto usa Metal (Apple Silicon)." ;;
+    *) gpu_note="GPU: questo pacchetto usa solo la CPU." ;;
+esac
+
+help_note=""
+if [[ -n "$variant" ]]; then
+    keep_files="i file ggml-*"
+    if [[ "$variant" == cuda* ]]; then
+        keep_files+=" e le DLL di CUDA"
+    fi
+    help_note="
+Se --list-devices mostra solo la CPU: aggiorna il driver della scheda video e
+non spostare ${keep_files} fuori dalla cartella degli
+eseguibili. Il programma scrive nel log perche' un modulo GPU non e' stato
+caricato.
+"
+fi
+if [[ "$os" == windows ]]; then
+    help_note+="
+Su Windows serve anche Microsoft Visual C++ Redistributable 2015-2022 (x64),
+di solito gia' presente.
+"
+fi
 
 cp LICENSE "$stage/"
 cp ggml/LICENSE "$stage/licenses/ggml.LICENSE"
@@ -40,16 +96,18 @@ cp thirdparty/oniguruma/COPYING "$stage/licenses/oniguruma.COPYING" 2>/dev/null 
 cp thirdparty/utf8proc/LICENSE.md "$stage/licenses/utf8proc.LICENSE.md" 2>/dev/null || true
 
 cat > "$stage/LEGGIMI.txt" <<EOF
-diffusione-in-tempo-reale ${version} (${os}/${arch})
-Pacchetto portabile: i backend (libggml-*) sono caricati a runtime, solo se
+diffusione-in-tempo-reale ${version} (${os}/${arch}${variant:+, $variant})
+Pacchetto portabile: i backend (ggml-*) sono caricati a runtime, solo se
 la macchina li supporta. Nessuna installazione richiesta.
 
-Comandi principali:
-  ./sd-cli --list-devices        elenca i dispositivi disponibili
-  ./sd-cli -m modello.safetensors -p "un gatto"   genera un'immagine
-  ./sd-server                    avvia il server HTTP su 127.0.0.1:1234
-                                 (parte anche senza modello)
+${gpu_note}
 
+Comandi principali:
+  sd-cli --list-devices          elenca i dispositivi: deve comparire la GPU
+  sd-cli -m modello.safetensors -p "un gatto"   genera un'immagine
+  sd-server                      avvia il server HTTP su 127.0.0.1:1234
+                                 (parte anche senza modello)
+${help_note}
 Opzioni utili: --memory-guard 90 (protezione memoria), --max-vram,
 --params-backend disk (modelli piu' grandi della RAM/VRAM).
 

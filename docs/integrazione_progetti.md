@@ -28,7 +28,7 @@ controllato:
 | Server senza modello | `sd-server` parte anche senza `-m`: device e upscale funzionano, la generazione risponde con un errore chiaro | **attivo** |
 | Autenticazione server | `--api-key` (Bearer o `X-API-Key`) e allowlist CORS `--cors-origins` | **disattivi** |
 | Pacchetto portabile | backend ggml come librerie dinamiche caricate a runtime: un solo pacchetto, ogni macchina usa ciò che ha | opzionale in build |
-| Release automatiche | workflow `release-portable.yml`: zip per Linux/macOS/Windows a ogni tag `portable-v*` | su tag |
+| Release automatiche | workflow `release-portable.yml`: zip con GPU (Windows CUDA 12 e Vulkan, Linux Vulkan, macOS Metal) a ogni tag `portable-v*` o avvio manuale | su tag |
 | Suite di test | `test/`: smoke di sicurezza, robustezza API, fuzzer del caricamento modelli | manuale |
 
 L'unico cambio di comportamento predefinito rispetto a upstream è il fallback
@@ -371,11 +371,38 @@ con il generatore Visual Studio finiscono invece in `build/bin/Release` e lo
 script non li trova. Il pacchetto è rilocabile all'interno della stessa
 piattaforma e architettura: si scompatta e si usa, senza installazione.
 Il workflow GitHub Actions `release-portable.yml` produce automaticamente gli
-zip per Linux x86-64, macOS arm64 e Windows x86-64 (con varianti CPU
-SSE/AVX/AVX2/AVX-512 su x86 per le macchine più vecchie) a ogni tag
-`portable-v*` o avvio manuale. I pacchetti di release non sono un singolo
-binario multipiattaforma: scegliere quello corrispondente al sistema operativo
-e all'architettura del computer di destinazione.
+zip (con varianti CPU SSE/AVX/AVX2/AVX-512 su x86 per le macchine più vecchie)
+a ogni tag `portable-v*` o avvio manuale. I pacchetti di release non sono un
+singolo binario multipiattaforma: scegliere quello corrispondente al sistema
+operativo e all'architettura del computer di destinazione.
+
+#### Pacchetti con GPU già pronti
+
+| Pacchetto | Backend GPU | Quando sceglierlo |
+|---|---|---|
+| `windows-x86_64-cuda12` | CUDA 12 | Windows con scheda **NVIDIA**: è il più veloce su NVIDIA. Le DLL di CUDA (`cudart`, `cublas`, `cublasLt`) sono già nello zip: serve solo un driver NVIDIA aggiornato |
+| `windows-x86_64` | Vulkan | Windows con GPU AMD, Intel o NVIDIA; Vulkan arriva con il driver grafico. Senza driver Vulkan il programma usa la CPU |
+| `linux-x86_64` | Vulkan | Linux con driver grafico che fornisce `libvulkan.so.1` |
+| `darwin-arm64` | Metal | Mac con Apple Silicon |
+
+Ogni pacchetto contiene anche il backend CPU: se il modulo GPU non si carica
+(driver assente o troppo vecchio) il programma parte comunque sulla CPU, e il
+log spiega perché il modulo GPU è stato scartato. Non servono SDK o compilatori
+sulla macchina di destinazione. Su Windows serve il Microsoft Visual C++
+Redistributable 2015-2022 (x64), di solito già presente.
+
+Per ottenerli senza tag: scheda **Actions** del repository, workflow
+"Release portable package", **Run workflow**, scegliendo il ramo. Gli ingressi
+sono `targets` (`all` oppure l'elenco dei nomi sopra, separati da virgola) e
+`cuda_architectures` (predefinito: tutte le generazioni NVIDIA da Pascal a
+Blackwell; per una scheda sola, per esempio `86` per le GeForce RTX serie 30,
+la compilazione CUDA è molto più breve). Gli zip compaiono tra gli artefatti
+dell'esecuzione (`portable-<nome>`) e, con un tag, nella release. Lo script di
+packaging rifiuta di creare lo zip se il modulo GPU (o le DLL di CUDA) mancano,
+così un pacchetto "con GPU" non può in silenzio funzionare solo sulla CPU.
+
+Verifica dopo lo scompattamento: `sd-cli --list-devices` deve elencare, oltre
+alla CPU, una riga di tipo `gpu` (o `igpu`).
 
 ## 3. Come collegarlo a un progetto
 
@@ -583,9 +610,9 @@ per cui è stato creato, non universale.
 
 | Piattaforma del pacchetto di release | Architettura prevista | Note |
 |---|---|---|
-| Linux | x86-64 | La release include varianti CPU x86 selezionabili. Non abilita CUDA o Vulkan. La compatibilità con distribuzioni Linux meno recenti dipende anche dalla versione di glibc e dalle librerie di sistema: verificare sul sistema minimo di destinazione. |
+| Linux | x86-64 | La release include varianti CPU x86 selezionabili e il backend Vulkan (serve `libvulkan.so.1` sulla macchina); CUDA non è incluso. La compatibilità con distribuzioni Linux meno recenti dipende anche dalla versione di glibc e dalle librerie di sistema: verificare sul sistema minimo di destinazione. |
 | macOS | arm64 (Apple Silicon) | La release automatica corrente è per macOS arm64; non è un binario Intel/x86-64. Include Metal, che richiede hardware e sistema Apple compatibili. |
-| Windows | x86-64 | La release include varianti CPU x86 selezionabili, ma non abilita CUDA o Vulkan. Verificare la presenza dei runtime richiesti dal compilatore; driver GPU e backend GPU vanno predisposti separatamente nelle build personalizzate. |
+| Windows | x86-64 | Due pacchetti: `windows-x86_64` (CPU + Vulkan, per GPU NVIDIA, AMD e Intel) e `windows-x86_64-cuda12` (CPU + CUDA 12 per NVIDIA, con le DLL di CUDA incluse). Entrambi richiedono il driver grafico aggiornato e il Visual C++ Redistributable 2015-2022 (x64). |
 
 Questa tabella descrive gli artefatti generati dall'attuale workflow di release,
 non una garanzia di compatibilità con tutte le versioni storiche dei sistemi
@@ -830,6 +857,12 @@ sincronizzazioni future.
     con binari, moduli backend, licenze, LEGGIMI) e workflow
     `.github/workflows/release-portable.yml` per Linux/macOS/Windows su tag
     `portable-v*`.
+11. **Pacchetti portabili con GPU** — il workflow produce ora anche
+    `windows-x86_64-cuda12` (CUDA 12 con le DLL runtime incluse) e include
+    Vulkan in `windows-x86_64` e `linux-x86_64`; opzioni, flag di
+    compilazione e SDK allineati alla CI principale; avvio manuale con scelta
+    dei pacchetti e delle architetture CUDA; release creata da un job unico;
+    lo script di packaging verifica che il modulo GPU sia nello zip.
 
 Passaggi previsti e non ancora svolti: collaudo del workflow di release sui
 runner GitHub, generazione con un modello reale (inclusa la memory guard sotto
