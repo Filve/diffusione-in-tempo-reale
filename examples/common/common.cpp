@@ -2997,6 +2997,15 @@ std::string version_string() {
     return std::string("stable-diffusion.cpp version ") + sd_version() + ", commit " + sd_commit();
 }
 
+std::string last_error_text() {
+    char message[512];
+    const sd_error_code_t code = sd_get_last_error(message, sizeof(message));
+    if (code == SD_ERROR_NONE) {
+        return "";
+    }
+    return std::string(sd_error_code_name(code)) + ": " + message;
+}
+
 static std::string safe_json_string(const char* value) {
     return value ? value : "";
 }

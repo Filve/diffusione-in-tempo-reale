@@ -893,7 +893,8 @@ int main(int argc, const char* argv[]) {
         SDCtxPtr sd_ctx(new_sd_ctx(&sd_ctx_params));
 
         if (sd_ctx == nullptr) {
-            LOG_INFO("new_sd_ctx_t failed");
+            const std::string reason = last_error_text();
+            LOG_INFO("new_sd_ctx_t failed%s%s", reason.empty() ? "" : " (", reason.empty() ? "" : (reason + ")").c_str());
             return 1;
         }
 
@@ -936,7 +937,8 @@ int main(int argc, const char* argv[]) {
         }
 
         if (!results) {
-            LOG_ERROR("generate failed");
+            const std::string reason = last_error_text();
+            LOG_ERROR("generate failed%s%s", reason.empty() ? "" : " (", reason.empty() ? "" : (reason + ")").c_str());
             return 1;
         }
 

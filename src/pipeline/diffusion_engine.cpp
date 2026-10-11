@@ -17,6 +17,7 @@
 #include "core/ggml_graph_cut.h"
 #include "core/ggml_runner.h"
 #include "core/ggml_tensor_utils.h"
+#include "core/last_error.h"
 #include "core/layer_split_partition.h"
 #include "model.h"
 
@@ -315,7 +316,7 @@ bool StableDiffusionGGML::apply_model_update(ModelLoader candidate,
 ggml_backend_t StableDiffusionGGML::backend_for(SDBackendModule module) {
     ggml_backend_t module_backend = backend_manager.runtime_backend(module);
     if (module_backend == nullptr) {
-        LOG_ERROR("failed to initialize %s backend", sd_backend_module_name(module));
+        LOG_ERROR_CODE(SD_ERROR_BACKEND, "failed to initialize %s backend", sd_backend_module_name(module));
     }
     return module_backend;
 }
@@ -323,7 +324,7 @@ ggml_backend_t StableDiffusionGGML::backend_for(SDBackendModule module) {
 ggml_backend_t StableDiffusionGGML::params_backend_for(SDBackendModule module) {
     ggml_backend_t module_backend = backend_manager.params_backend(module);
     if (module_backend == nullptr) {
-        LOG_ERROR("failed to initialize %s params backend", sd_backend_module_name(module));
+        LOG_ERROR_CODE(SD_ERROR_BACKEND, "failed to initialize %s params backend", sd_backend_module_name(module));
     }
     return module_backend;
 }
@@ -645,7 +646,7 @@ bool StableDiffusionGGML::init_backend() {
     }
     const bool already_cpu = backend_spec == "cpu" && params_backend_spec.empty();
     if (backend_fallback_disabled || already_cpu) {
-        LOG_ERROR("backend config failed: %s", error.c_str());
+        LOG_ERROR_CODE(SD_ERROR_BACKEND, "backend config failed: %s", error.c_str());
         return false;
     }
     LOG_WARN("backend config failed (%s); falling back to the cpu backend "
@@ -655,7 +656,7 @@ bool StableDiffusionGGML::init_backend() {
     params_backend_spec.clear();
     split_mode_spec.clear();
     if (!backend_manager.init("cpu", "", "", &error)) {
-        LOG_ERROR("cpu fallback failed: %s", error.c_str());
+        LOG_ERROR_CODE(SD_ERROR_BACKEND, "cpu fallback failed: %s", error.c_str());
         return false;
     }
     return ensure_backend_pair(SDBackendModule::DIFFUSION);
@@ -743,7 +744,7 @@ bool StableDiffusionGGML::init_model_loader(ModelLoader& model_loader, ModelConf
     if (strlen(SAFE_STR(sd_ctx_params->model_path)) > 0) {
         LOG_INFO("loading model from '%s'", sd_ctx_params->model_path);
         if (!model_loader.init_from_file(sd_ctx_params->model_path)) {
-            LOG_ERROR("init model loader from file failed: '%s'", sd_ctx_params->model_path);
+            LOG_ERROR_CODE(SD_ERROR_MODEL_FILE, "init model loader from file failed: '%s'", sd_ctx_params->model_path);
         }
     }
 
@@ -1010,7 +1011,7 @@ bool StableDiffusionGGML::init(const sd_ctx_params_t* sd_ctx_params) {
 
     version = model_loader.get_sd_version();
     if (version == VERSION_COUNT) {
-        LOG_ERROR("get sd version from file failed: '%s'", SAFE_STR(sd_ctx_params->model_path));
+        LOG_ERROR_CODE(SD_ERROR_MODEL_FILE, "get sd version from file failed: '%s'", SAFE_STR(sd_ctx_params->model_path));
         return false;
     } else {
         LOG_INFO("Version: %s ", model_version_to_str[version]);
@@ -1293,7 +1294,7 @@ bool StableDiffusionGGML::validate_and_load_runners() {
 
     model_manager->set_common_ignore_tensors(ignore_tensors);
     if (!model_manager->validate_registered_tensors()) {
-        LOG_ERROR("model metadata validation failed");
+        LOG_ERROR_CODE(SD_ERROR_MODEL_FILE, "model metadata validation failed");
         return false;
     }
 

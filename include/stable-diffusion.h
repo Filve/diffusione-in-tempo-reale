@@ -650,7 +650,7 @@ typedef struct {
     char name[64];  // device name accepted by the --backend / --params-backend assignment specs
     char description[128];
     enum sd_device_type_t type;
-    uint64_t free_memory_bytes;   // 0 when the backend does not report memory
+    uint64_t free_memory_bytes;   // 0 when the backend does not report memory; for the CPU, the RAM available without swapping
     uint64_t total_memory_bytes;  // 0 when the backend does not report memory
 } sd_device_info_t;
 
@@ -658,6 +658,34 @@ typedef struct {
 SD_API size_t sd_get_device_count(void);
 SD_API bool sd_get_device_info(size_t index, sd_device_info_t* info);
 SD_API const char* sd_device_type_name(enum sd_device_type_t type);
+
+typedef struct {
+    uint64_t total_bytes;      // physical RAM; 0 when unknown
+    uint64_t available_bytes;  // RAM that can be used without swapping; 0 when unknown
+    uint64_t process_bytes;    // RAM held by this process (resident set); 0 when unknown
+} sd_system_memory_t;
+
+// Current system RAM figures, for hosts that decide when to start work or how to configure a context.
+// Returns false when none of them can be determined on this platform.
+SD_API bool sd_get_system_memory(sd_system_memory_t* info);
+
+// Why a call failed. new_sd_ctx, generate_image and generate_video record the reason on the calling
+// thread when they fail; a call that succeeds resets it to SD_ERROR_NONE.
+enum sd_error_code_t {
+    SD_ERROR_NONE,
+    SD_ERROR_UNKNOWN,           // failed without a more specific cause; the message tells more
+    SD_ERROR_INVALID_ARGUMENT,  // a null pointer or an unsupported parameter
+    SD_ERROR_MODEL_FILE,        // a model file is missing, unreadable, incomplete or not recognized
+    SD_ERROR_OUT_OF_MEMORY,     // system RAM or device memory ran out; a lighter configuration may succeed
+    SD_ERROR_BACKEND,           // a compute backend could not be initialized or failed while computing
+    SD_ERROR_BUSY,              // the context is already running another operation
+    SD_ERROR_CANCELLED,         // stopped on request through sd_cancel_generation(); not a failure of the system
+};
+
+// Returns the reason of the latest failed call made by this thread. When message is not null it receives
+// the text of the error (at most message_size - 1 bytes, always terminated).
+SD_API enum sd_error_code_t sd_get_last_error(char* message, size_t message_size);
+SD_API const char* sd_error_code_name(enum sd_error_code_t code);
 
 // for C API, caller needs to call free_sd_images to free the memory after use
 // This helps avoid CRT problems on Windows when memory is allocated in the library but freed in the caller, which may use a different CRT.

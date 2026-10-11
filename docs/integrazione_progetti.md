@@ -25,6 +25,7 @@ controllato:
 | Rilevamento device | `sd_get_device_count()` / `sd_get_device_info()` elencano CPU, GPU e acceleratori con tipo e memoria, prima di caricare un modello | sempre disponibile |
 | Fallback CPU | se il backend richiesto non esiste o non si inizializza, il contesto passa alla CPU con un avviso invece di fallire | **attivo** |
 | Memory guard | sopra una soglia di memoria libera pressione (evict dei pesi, prefetch sospeso) prima che l'allocazione fallisca | **disattivo** |
+| Errori classificati e memoria di sistema | dopo un fallimento `sd_get_last_error()` dà un codice (memoria esaurita, file del modello, backend, ...) e il motivo; `sd_get_system_memory()` riporta RAM totale, disponibile e del processo | sempre disponibile |
 | Server senza modello | `sd-server` parte anche senza `-m`: device e upscale funzionano, la generazione risponde con un errore chiaro | **attivo** |
 | Autenticazione server | `--api-key` (Bearer o `X-API-Key`) e allowlist CORS `--cors-origins` | **disattivi** |
 | Pacchetto portabile | backend ggml come librerie dinamiche caricate a runtime: un solo pacchetto, ogni macchina usa ciò che ha | opzionale in build |
@@ -447,7 +448,8 @@ Il ciclo di vita completo, nell'ordine tecnico corretto:
    default; poi valorizzare solo i campi necessari (tabella sotto).
 4. **Creazione del contesto**: `new_sd_ctx(&cp)` — carica il modello, sceglie
    e inizializza i backend (auto-fit + fallback CPU); è l'operazione costosa
-   (secondi–minuti). Restituisce `NULL` in caso di errore (motivo nei log).
+   (secondi–minuti). Restituisce `NULL` in caso di errore (motivo con
+   `sd_get_last_error()` e nei log).
 5. **Avanzamento** (facoltativo): `sd_set_progress_callback(cb, data)` riceve
    `(step, steps, time, data)` a ogni passo di campionamento — è ciò che serve
    per una progress bar.
@@ -507,6 +509,9 @@ int main(int argc, char** argv) {
 
     sd_ctx_t* ctx = new_sd_ctx(&cp);
     if (ctx == NULL) {                // modello non valido o backend non disponibile
+        char reason[512];
+        enum sd_error_code_t code = sd_get_last_error(reason, sizeof(reason));
+        fprintf(stderr, "new_sd_ctx: %s: %s\n", sd_error_code_name(code), reason);
         return 1;
     }
 
@@ -536,6 +541,18 @@ Regole importanti per chi integra:
 - Chiamare sempre `sd_ctx_params_init()` e `sd_img_gen_params_init()` prima di
   valorizzare i campi: senza init i campi contengono valori casuali.
 - Controllare sempre il valore di ritorno di `new_sd_ctx()` e `generate_image()`.
+- **Errori**: dopo un fallimento `sd_get_last_error(buffer, dimensione)`
+  restituisce il codice (`SD_ERROR_OUT_OF_MEMORY`, `SD_ERROR_MODEL_FILE`,
+  `SD_ERROR_BACKEND`, `SD_ERROR_INVALID_ARGUMENT`, `SD_ERROR_BUSY`,
+  `SD_ERROR_CANCELLED`, `SD_ERROR_UNKNOWN`) e, se il buffer non è nullo, il
+  testo del primo errore registrato; `sd_error_code_name()` ne dà il nome. Vale per il thread che ha
+  fatto la chiamata, si azzera all'inizio di ogni chiamata e al successo. Con
+  `SD_ERROR_OUT_OF_MEMORY` ha senso ritentare con meno memoria (profilo più
+  leggero, pesi su disco) o più tardi; il contesto resta utilizzabile dopo il
+  fallimento. Le eccezioni C++ non escono mai dall'API.
+- **Memoria di sistema**: `sd_get_system_memory(&m)` riporta RAM totale,
+  disponibile e occupata dal processo, utile per decidere prima di caricare un
+  modello o per un indicatore nell'interfaccia.
 - **Threading**: un contesto non è thread-safe; serializzare gli accessi (come
   fa `sd-server` con un mutex) oppure usare un contesto per thread.
   `sd_cancel_generation()` è pensata per essere chiamata da un altro thread.
@@ -678,7 +695,10 @@ dei pacchetti portabili automatici descritti sopra.
   separato: il guardiano riduce la residenza dei pesi ma non interrompe la
   richiesta.
 - **Elenco dispositivi** per scegliere la strategia nell'app: tipo `cpu`,
-  `gpu`, `igpu`, `accel`; memoria 0 = non riportata dal backend.
+  `gpu`, `igpu`, `accel`; memoria 0 = non riportata dal backend. Per il device
+  CPU la memoria libera è la RAM disponibile del sistema (ggml riporta il
+  totale su Linux e macOS). Su Linux la RAM disponibile viene da
+  `/proc/meminfo` e non conosce il limite di memoria di un container.
 - **Altri motori** (MNN, ncnn, ONNX Runtime): non sono integrati in questo
   repository, perché tutto il motore è basato su ggml. Vanno trattati come
   implementazioni alternative in un livello di astrazione dell'applicazione.
@@ -916,6 +936,32 @@ sincronizzazioni future.
     RAM e la stessa pressione nessuna segmentazione (come prima); senza
     pressione il comportamento non cambia. Non ancora provato su Windows né
     con modelli reali.
+
+15. **Errori classificati e memoria di sistema** — `src/core/last_error.{h,cpp}`
+    e `src/core/system_memory.{h,cpp}`. Dopo un fallimento di `new_sd_ctx()`,
+    `generate_image()` o `generate_video()`, `sd_get_last_error()` restituisce
+    un codice (`SD_ERROR_OUT_OF_MEMORY`, `SD_ERROR_MODEL_FILE`,
+    `SD_ERROR_BACKEND`, `SD_ERROR_INVALID_ARGUMENT`, `SD_ERROR_BUSY`,
+    `SD_ERROR_CANCELLED` per l'annullamento richiesto con
+    `sd_cancel_generation()`, `SD_ERROR_UNKNOWN`) e il testo del primo errore
+    registrato, così
+    l'applicazione distingue "riprova con meno memoria" da "file danneggiato"
+    (anche i thread del caricatore riportano i loro errori al chiamante). Le
+    eccezioni C++, `std::bad_alloc` compresa, non escono più dall'API. Un test
+    a memoria limitata (`ulimit -v`) ha mostrato un'uscita brusca del processo:
+    quando non si riusciva a creare un thread del caricatore, un `std::thread`
+    ancora attivo faceva terminare tutto con `std::terminate`; ora il
+    caricamento usa meno thread, o il thread chiamante se non ne parte nessuno.
+    `sd_get_system_memory()` riporta RAM totale, disponibile e del processo; la
+    memoria libera del device CPU in `sd_get_device_info()` è la RAM
+    disponibile. Misure con il modello sintetico da 2,1 GB (128×128, 3 passi,
+    2 thread, Linux): con 2300 MiB di spazio di indirizzi la configurazione
+    standard fallisce con `out_of_memory` (`model manager alloc params backend
+    buffer failed`), lo stesso contesto genera correttamente appena il limite
+    viene tolto e, con i pesi su disco (`--params-backend disk`), la stessa
+    richiesta riesce. Il ramo Windows di `system_memory.cpp` è stato solo
+    controllato nella sintassi con intestazioni sostitutive; macOS non è stato
+    né compilato né provato.
 
 Passaggi previsti e non ancora svolti: collaudo del workflow di release sui
 runner GitHub, generazione con un modello reale (inclusa la memory guard sotto

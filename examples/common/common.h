@@ -333,6 +333,8 @@ struct SDGenerationParams {
 };
 
 std::string version_string();
+// "<code name>: <message>" for the latest failed library call of this thread; empty when it did not fail.
+std::string last_error_text();
 std::string build_sdcpp_image_metadata_json(const SDContextParams& ctx_params,
                                             const SDGenerationParams& gen_params,
                                             int64_t seed,

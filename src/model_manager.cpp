@@ -9,6 +9,7 @@
 
 #include "core/backend_fit.h"
 #include "core/ggml_extend_backend.h"
+#include "core/last_error.h"
 #include "core/util.h"
 #include "model/adapter/lora.hpp"
 
@@ -568,8 +569,8 @@ bool ModelManager::stage_tensors_to_compute_backend(const std::vector<TensorStat
             ggml_backend_buffer_t compute_buffer =
                 ggml_backend_alloc_ctx_tensors_from_buft(staging_ctx, staging_buft);
             if (compute_buffer == nullptr) {
-                LOG_ERROR("model manager alloc compute params backend buffer failed, num_tensors = %zu",
-                              staged_tensors.size());
+                LOG_ERROR_CODE(SD_ERROR_OUT_OF_MEMORY, "model manager alloc compute params backend buffer failed, num_tensors = %zu",
+                               staged_tensors.size());
                 ggml_free(staging_ctx);
                 return false;
             }
@@ -897,8 +898,8 @@ bool ModelManager::alloc_params_buffers(const std::vector<TensorState*>& states,
 
             ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(params_buft, chunk_size);
             if (buffer == nullptr) {
-                LOG_ERROR("model manager alloc params backend buffer failed, size = %.2fMB",
-                          chunk_size / (1024.0 * 1024.0));
+                LOG_ERROR_CODE(SD_ERROR_OUT_OF_MEMORY, "model manager alloc params backend buffer failed, size = %.2fMB",
+                               chunk_size / (1024.0 * 1024.0));
                 return false;
             }
             ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
