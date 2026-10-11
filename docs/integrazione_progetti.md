@@ -25,6 +25,7 @@ controllato:
 | Rilevamento device | `sd_get_device_count()` / `sd_get_device_info()` elencano CPU, GPU e acceleratori con tipo e memoria, prima di caricare un modello | sempre disponibile |
 | Fallback CPU | se il backend richiesto non esiste o non si inizializza, il contesto passa alla CPU con un avviso invece di fallire | **attivo** |
 | Memory guard | sopra una soglia di memoria libera pressione (evict dei pesi, prefetch sospeso) prima che l'allocazione fallisca | **disattivo** |
+| Profili di risorse | `--profile lite\|balanced\|max\|auto` imposta in un colpo guardiano di memoria, encoder di testo su CPU, VAE a tasselli e CFG non raggruppato; `auto` sceglie dalla dimensione del modello e dalla memoria libera | **disattivo** (come `max`) |
 | Errori classificati e memoria di sistema | dopo un fallimento `sd_get_last_error()` dà un codice (memoria esaurita, file del modello, backend, ...) e il motivo; `sd_get_system_memory()` riporta RAM totale, disponibile e del processo | sempre disponibile |
 | Server senza modello | `sd-server` parte anche senza `-m`: device e upscale funzionano, la generazione risponde con un errore chiaro | **attivo** |
 | Autenticazione server | `--api-key` (Bearer o `X-API-Key`) e allowlist CORS `--cors-origins` | **disattivi** |
@@ -694,6 +695,23 @@ dei pacchetti portabili automatici descritti sopra.
   la generazione. Un eventuale monitor RAM nell'applicazione resta un controllo
   separato: il guardiano riduce la residenza dei pesi ma non interrompe la
   richiesta.
+- **Profili di risorse** (`--profile <max|balanced|lite|auto>`, in `sd-cli` e
+  `sd-server`): `max` non cambia nulla; `balanced` imposta `--memory-guard 90`;
+  `lite` imposta anche `--memory-guard 85`, l'encoder di testo su CPU
+  (`--backend te=cpu`), `--vae-tiling` e `--batched-cfg off`. Le opzioni scritte
+  esplicitamente sulla riga di comando vincono sempre sul profilo
+  (`--profile lite --memory-guard 70` usa 70; `--memory-guard 0` lo lascia
+  spento). Un profilo non imposta `--params-backend` né `--backend`: la
+  collocazione dei pesi resta a `--auto-fit`. Non cambia dimensione, passi o
+  campionatore dell'immagine, solo dove va la memoria e quindi la velocità.
+  `auto` somma la dimensione dei file del modello e una riserva di lavoro
+  (1 GiB più un quinto dei pesi) e la confronta con la memoria dove avviene il
+  calcolo (la memoria libera della GPU dedicata più capiente, oppure la RAM
+  disponibile senza GPU): `max` se ci sta con un quarto di margine, `balanced`
+  se ci sta, `lite` altrimenti. La scelta e le cifre vengono scritte nel log
+  (`profile auto -> lite (model 6.9 GiB + 2.4 GiB working memory, ...)`). La
+  stima usa solo le dimensioni dei file (non legge i modelli) e non tiene conto
+  di `--type`; le soglie sono euristiche da tarare su modelli e macchine reali.
 - **Elenco dispositivi** per scegliere la strategia nell'app: tipo `cpu`,
   `gpu`, `igpu`, `accel`; memoria 0 = non riportata dal backend. Per il device
   CPU la memoria libera è la RAM disponibile del sistema (ggml riporta il
@@ -962,6 +980,22 @@ sincronizzazioni future.
     richiesta riesce. Il ramo Windows di `system_memory.cpp` è stato solo
     controllato nella sintassi con intestazioni sostitutive; macOS non è stato
     né compilato né provato.
+
+16. **Profili di risorse** — `examples/common/profile.{h,cpp}`, opzione
+    `--profile max|balanced|lite|auto` in `sd-cli` e `sd-server`
+    (`examples/common/common.cpp` registra anche quali opzioni sono state date
+    sulla riga di comando, `option_was_given()`, perché una scelta esplicita
+    vinca sempre sul profilo). I livelli oltre `lite` (`lite-disk`: pesi in
+    streaming dal disco; `lite-cpu`: tutto sulla CPU) non sono scelte della
+    riga di comando: servono a un server che deve scendere di livello quando una
+    richiesta esaurisce la memoria. Test: `test/profile_test.cpp` (nomi, ordine
+    dei livelli, scelta automatica su una tabella di casi, precedenza delle
+    opzioni esplicite). Con il modello sintetico (CPU, 128×128, 3 passi) i tre
+    profili producono la stessa immagine; con 3,3 GiB occupati da un altro
+    processo `--profile auto` sceglie `balanced`; l'auto-fit, vedendo meno RAM,
+    mette i componenti su disco (picco 1719 MiB contro 2127 MiB a memoria
+    libera). Le soglie di `auto` non sono ancora state tarate su un modello
+    reale né su una GPU.
 
 Passaggi previsti e non ancora svolti: collaudo del workflow di release sui
 runner GitHub, generazione con un modello reale (inclusa la memory guard sotto

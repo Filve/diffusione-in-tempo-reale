@@ -66,6 +66,7 @@ add_executable(${TARGET}
     ../common/common.cpp
     ../common/log.cpp
     ../common/media_io.cpp
+    ../common/profile.cpp
     main.cpp
     runtime.cpp
     async_jobs.cpp

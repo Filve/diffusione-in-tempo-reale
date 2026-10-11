@@ -109,6 +109,9 @@ struct ArgOptions {
 
 void add_log_options(ArgOptions& options, sd_log_level_t& level);
 bool parse_options(int argc, const char** argv, const std::vector<ArgOptions>& options_list);
+// Whether the last parse_options() call found the option on the command line. Pass the long name
+// (e.g. "--memory-guard"), or the short one for an option that has no long name.
+bool option_was_given(const std::string& name);
 bool decode_base64_image(const std::string& encoded_input,
                          int target_channels,
                          int expected_width,
@@ -155,6 +158,7 @@ struct SDContextParams {
     bool offload_params_to_cpu     = false;
     std::string max_vram           = "0";
     int memory_guard               = 0;
+    std::string profile;
     bool disable_backend_fallback  = false;
     bool disable_prefetch          = false;
     bool disable_segmented_compute = false;

@@ -202,6 +202,41 @@ On Linux, available memory comes from `/proc/meminfo`, which does not reflect th
 limit of a container's memory cgroup; inside a container with such a limit, pass
 `--memory-guard` and `--params-backend disk` explicitly and leave headroom.
 
+## Pick a resource profile (`--profile`).
+
+`--profile` sets, in one option, the settings that trade speed for a smaller
+memory footprint:
+
+| Profile | What it sets |
+|---|---|
+| `max` | nothing; the defaults of the engine |
+| `balanced` | `--memory-guard 90` |
+| `lite` | `--memory-guard 85`, the text encoder on the CPU (`--backend te=cpu`), `--vae-tiling`, `--batched-cfg off` |
+| `auto` | one of the three above, chosen from the machine (below) |
+
+An option given on the command line always wins over the profile: with
+`--profile lite --memory-guard 70` the guard is 70, and `--memory-guard 0` keeps
+it off. A profile does not set `--params-backend` or `--backend`, so `--auto-fit`
+still decides where the weights live. It does not change the size, the steps or
+the sampler of an image; it only changes where the memory goes, and with it the
+speed (the text encoder on the CPU and the tiled VAE are slower, unbatched CFG
+needs two forwards per step).
+
+`auto` adds up the size of the model files and a working-memory reserve (1 GiB
+plus a fifth of the weights) and compares it with the memory where the compute
+happens: the free memory of the discrete GPU with the most, or the available RAM
+without one. `max` when it fits with a quarter to spare, `balanced` when it fits,
+`lite` when it does not and the weights will have to be streamed. The decision and
+the figures are logged, for example:
+
+```
+[INFO ] profile auto -> lite (model 6.9 GiB + 2.4 GiB working memory, RAM available 5.0 GiB, GPU free 5.5 GiB: does not fit, weights will be streamed)
+```
+
+The estimate comes from the file sizes (it does not read the models) and does not
+account for `--type` conversions at load time. When the sizes or the memory are
+unknown, `auto` leaves the defaults alone. The thresholds are heuristics.
+
 ## Use quantization to reduce memory usage.
 
 [quantization](./quantization_and_gguf.md)

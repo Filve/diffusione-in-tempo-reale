@@ -69,6 +69,10 @@ check "option: --cfg-scale overflow"  "$SD_CLI" -m garbage.safetensors -p t --cf
 check "option: --max-vram text"       "$SD_CLI" -m garbage.safetensors -p t --max-vram abc
 check "option: --backend unknown"     "$SD_CLI" -m garbage.safetensors -p t --backend no_such_backend --disable-backend-fallback
 check "option: --backend long"        "$SD_CLI" -m garbage.safetensors -p t --backend "$long_arg"
+check "option: --profile unknown"     "$SD_CLI" -m garbage.safetensors -p t --profile fast
+check "option: --profile long"        "$SD_CLI" -m garbage.safetensors -p t --profile "$long_arg"
+check "option: --profile no value"    "$SD_CLI" -m garbage.safetensors -p t --profile
+check "option: --profile auto, bad model" "$SD_CLI" -m garbage.safetensors -p t --profile auto
 
 echo
 if [[ $failures -gt 0 ]]; then

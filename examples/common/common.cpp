@@ -10,6 +10,7 @@
 #include <iomanip>
 #include <iostream>
 #include <regex>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <type_traits>
@@ -259,14 +260,25 @@ void add_log_options(ArgOptions& options, sd_log_level_t& level) {
                                       }});
 }
 
+static std::set<std::string>& options_given() {
+    static std::set<std::string> given;
+    return given;
+}
+
+bool option_was_given(const std::string& name) {
+    return options_given().count(name) > 0;
+}
+
 bool parse_options(int argc, const char** argv, const std::vector<ArgOptions>& options_list) {
     bool invalid_arg = false;
     std::string arg;
+    options_given().clear();
 
     auto match_and_apply = [&](auto& opts, auto&& apply_fn) -> bool {
         for (auto& option : opts) {
             if ((option.short_name.size() > 0 && arg == option.short_name) ||
                 (option.long_name.size() > 0 && arg == option.long_name)) {
+                options_given().insert(option.long_name.empty() ? option.short_name : option.long_name);
                 apply_fn(option);
                 return true;
             }
@@ -581,6 +593,12 @@ ArgOptions SDContextParams::get_options() {
          "optional per-device budget in GiB for managed weights and runner buffers during automatic graph-cut execution. Accepts a single value or assignments by backend/device, e.g. 6 or cuda0=6,vulkan0=4. 0 uses live free VRAM without an explicit budget; a negative value reserves that much free VRAM",
          0,
          &max_vram},
+        {"",
+         "--profile",
+         "resource profile: max (engine defaults), balanced (memory guard at 90), lite (also text encoder on the CPU, tiled VAE, unbatched CFG, guard at 85) "
+         "or auto (picks one from the model size, the free RAM and the free GPU memory). Options given explicitly on the command line always win",
+         0,
+         &profile},
     };
 
     options.int_options = {
@@ -972,6 +990,7 @@ std::string SDContextParams::to_string() const {
         << "  offload_params_to_cpu: " << (offload_params_to_cpu ? "true" : "false") << ",\n"
         << "  max_vram: \"" << max_vram << "\",\n"
         << "  memory_guard: " << memory_guard << ",\n"
+        << "  profile: \"" << profile << "\",\n"
         << "  disable_backend_fallback: " << (disable_backend_fallback ? "true" : "false") << ",\n"
         << "  disable_prefetch: " << (disable_prefetch ? "true" : "false") << ",\n"
         << "  disable_segmented_compute: " << (disable_segmented_compute ? "true" : "false") << ",\n"

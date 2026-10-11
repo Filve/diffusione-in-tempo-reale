@@ -9,6 +9,7 @@
 
 #include "async_jobs.h"
 #include "common/common.h"
+#include "common/profile.h"
 #include "common/resource_owners.hpp"
 #include "routes.h"
 #include "runtime.h"
@@ -49,11 +50,13 @@ static void parse_args(int argc,
 
     const bool random_seed_requested = default_gen_params.seed < 0;
 
+    sd_profile::Level profile_level = sd_profile::Level::MAX;
     if (!svr_params.resolve_and_validate() ||
         !ctx_params.resolve_and_validate(IMG_GEN, /*require_model=*/false) ||
         !default_gen_params.resolve_and_validate(IMG_GEN,
                                                  ctx_params.lora_model_dir,
-                                                 ctx_params.hires_upscalers_dir)) {
+                                                 ctx_params.hires_upscalers_dir) ||
+        !sd_profile::apply_from_options(ctx_params, default_gen_params, profile_level)) {
         print_usage(argv[0], options_vec);
         exit(1);
     }
