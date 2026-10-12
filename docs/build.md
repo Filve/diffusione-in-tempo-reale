@@ -119,6 +119,18 @@ these packages, each with the CPU backend plus one GPU module:
 | `windows-x86_64` | Vulkan | NVIDIA, AMD and Intel GPUs; `vulkan-1.dll` comes with the GPU driver |
 | `windows-x86_64-cuda12` | CUDA 12 | NVIDIA only; the CUDA runtime DLLs are bundled, only the NVIDIA driver is needed (without it the package still starts, on the CPU) |
 
+On Windows every package also needs the Microsoft Visual C++ Redistributable
+2015-2022 (x64), **version 14.44 or newer**. The executables are built with MSVC
+14.44, and Microsoft requires an installed redistributable at least as recent as
+the build tools that produced the binaries
+([details](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist)).
+If it is missing or older, Windows cannot load the DLLs and ends the program at
+once without printing anything: the exit code is `0xC0000135` (`3221225781`,
+shown as `-1073741515` by PowerShell). Check the installed version with
+`(Get-Item C:\Windows\System32\msvcp140.dll).VersionInfo.FileVersion` and install
+the latest from <https://aka.ms/vc14/vc_redist.x64.exe>. If you rebuild with a
+newer Visual Studio, the version of that compiler applies instead.
+
 Start it from the Actions tab ("Run workflow", any branch) or push a tag
 `portable-v*`, which also attaches the zips to a release. The manual run takes
 two inputs: `targets` (`all` or a comma-separated list of the package names

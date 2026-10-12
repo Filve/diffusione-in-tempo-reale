@@ -1,5 +1,31 @@
 # Troubleshooting
 
+## Windows: the program exits immediately without printing anything
+
+On Windows, an `sd-cli.exe` or `sd-server.exe` that ends at once with no output
+(for example `--list-devices` prints nothing), or an application that reports an
+exit code such as `3221225781`, usually means that the Microsoft Visual C++
+Redistributable is missing or too old. The pre-built binaries need the
+2015-2022 (x64) redistributable **version 14.44 or newer**; Microsoft requires the
+installed version to be at least as recent as the build tools that produced the
+binaries ([details](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist)).
+
+Windows reports this only through the exit code, normally without an
+"Application Error" event. In PowerShell:
+
+```powershell
+.\sd-cli.exe --list-devices
+$LASTEXITCODE    # -1073741515 (0xC0000135, the same as 3221225781): a DLL was not found
+(Get-Item C:\Windows\System32\msvcp140.dll).VersionInfo.FileVersion    # must be 14.44 or newer
+```
+
+Install the latest redistributable from <https://aka.ms/vc14/vc_redist.x64.exe>
+and run the command again. The other start-up codes, such as `0xC0000139` (a DLL
+lacks a required function: mixed versions in one folder or an old runtime),
+`0xC000007B` (32-bit and 64-bit files mixed) and `0xC0000428` (file signature
+rejected by a security policy), are listed in the
+[Italian guide](./integrazione_progetti.md#28-problemi-comuni-e-come-leggerli).
+
 ## Video model used in image generation mode
 
 If generation reports that a model cannot be run with `generate_image()`, add
