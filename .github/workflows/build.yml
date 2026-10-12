@@ -193,6 +193,7 @@ jobs:
       artifact-metadata: write
 
     strategy:
+      fail-fast: false
       matrix:
         variant: [cpu, musa, sycl, vulkan, cuda]
         platform: [linux/amd64]

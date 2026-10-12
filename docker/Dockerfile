@@ -27,7 +27,8 @@ RUN cmake . -B ./build \
     -DGGML_CPU_ALL_VARIANTS=ON \
     -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
     -DCMAKE_INSTALL_RPATH='$ORIGIN'
-RUN cmake --build ./build --config Release --parallel
+# A bare --parallel runs make with an unlimited number of jobs, which exhausts the memory of a small builder.
+RUN cmake --build ./build --config Release -j$(nproc)
 
 FROM ubuntu:$UBUNTU_VERSION AS runtime
 
