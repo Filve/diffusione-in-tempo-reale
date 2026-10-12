@@ -194,7 +194,7 @@ jobs:
 
     strategy:
       matrix:
-        variant: [musa, sycl, vulkan, cuda]
+        variant: [cpu, musa, sycl, vulkan, cuda]
         platform: [linux/amd64]
         runner: [ubuntu-latest]
         build-args: [""]
@@ -269,7 +269,7 @@ jobs:
           context: .
           platforms: ${{ matrix.platform }}
           push: ${{ ( github.event_name == 'push' && github.ref == 'refs/heads/master' ) || github.event.inputs.create_release == 'true' }}
-          file: docker/Dockerfile.${{ matrix.variant }}
+          file: ${{ matrix.variant == 'cpu' && 'docker/Dockerfile' || format('docker/Dockerfile.{0}', matrix.variant) }}
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.BRANCH_NAME }}-${{ matrix.variant }}${{ matrix.tag-suffix }}
           labels: ${{ steps.meta.outputs.labels }}
           annotations: ${{ steps.meta.outputs.annotations }}
@@ -798,6 +798,18 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: ${{ format('{0}-{1}-{2}', env.BRANCH_NAME, steps.commit_count.outputs.count, steps.commit.outputs.short) }}
+          body: |
+            **Windows: quale file scaricare**
+
+            | File | Quando sceglierlo |
+            |---|---|
+            | `sd-<ramo>-<commit>-bin-win-cuda12-x64.zip` + `cudart-sd-bin-win-cu12-x64.zip` | schede **NVIDIA**. Scompatta **entrambi** nella stessa cartella: il secondo contiene le DLL di CUDA. Serve il driver NVIDIA aggiornato |
+            | `sd-<ramo>-<commit>-bin-win-vulkan-x64.zip` | schede NVIDIA, AMD e Intel con driver Vulkan |
+            | `sd-<ramo>-<commit>-bin-win-cpu-x64.zip` | solo CPU |
+
+            **Requisito su Windows: [Microsoft Visual C++ Redistributable](https://aka.ms/vc14/vc_redist.x64.exe) 2015-2022 (x64), versione 14.44 o successiva.** Se manca o è più vecchio, il programma si chiude subito senza scrivere nulla (codice di uscita `0xC0000135`, cioè `3221225781` oppure `-1073741515` in PowerShell). Controlla la versione con `(Get-Item C:\Windows\System32\msvcp140.dll).VersionInfo.FileVersion`.
+
+            Dopo lo scompattamento `.\sd-cli.exe --list-devices` deve elencare una riga `gpu`, non soltanto `CPU`. Guida completa: https://github.com/${{ github.repository }}/blob/master/docs/integrazione_progetti.md#28-problemi-comuni-e-come-leggerli
 
       - name: Upload release
         id: upload_release

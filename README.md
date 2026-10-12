@@ -57,6 +57,12 @@ Toolkit) vanno installati a parte, una tantum: nessuno script li scarica.
 Tutti i dettagli nella [guida in italiano](./docs/integrazione_progetti.md),
 sezioni 2.6-2.8.
 
+Pacchetti già pronti per Windows: serve il
+[Microsoft Visual C++ Redistributable](https://aka.ms/vc14/vc_redist.x64.exe)
+2015-2022 (x64), **versione 14.44 o successiva**. Se manca o è più vecchio il
+programma si chiude subito senza scrivere nulla (codice di uscita
+`0xC0000135`, cioè `3221225781`): vedi la sezione 2.8 della guida.
+
 Guide principali: [build](./docs/build.md) · [prestazioni e memoria](./docs/performance.md) · [selezione backend](./docs/backend.md) · [risoluzione problemi](./docs/troubleshooting.md)
 
 ---
@@ -182,7 +188,7 @@ API and command-line option may change frequently.***
 
 ### Get the sd executable
 
-- Download pre-built binaries from the [releases page](https://github.com/leejet/stable-diffusion.cpp/releases)
+- Download pre-built binaries from the [releases page](https://github.com/Filve/diffusione-in-tempo-reale/releases)
 - Or build from source by following the [build guide](./docs/build.md)
 
 ### Download model weights

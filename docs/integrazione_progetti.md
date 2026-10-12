@@ -322,6 +322,7 @@ Che cosa è automatico e che cosa no:
 
 | Sintomo | Causa tipica | Che cosa fare |
 |---|---|---|
+| Su Windows `sd-cli`/`sd-server` si chiude subito **senza scrivere nulla** (`--list-devices` non stampa niente), oppure l'applicazione che lo avvia riporta il codice `3221225781` | manca il Visual C++ Redistributable 2015-2022 (x64) oppure è più vecchio della **14.44** con cui sono compilati i programmi: Windows non carica le DLL e termina il processo prima che scriva qualcosa. Di norma non lascia nessun evento «Application Error» | in PowerShell `$LASTEXITCODE` dà `-1073741515` (`0xC0000135`, vedi i codici qui sotto). Controllare la versione con `(Get-Item C:\Windows\System32\msvcp140.dll).VersionInfo.FileVersion` (serve 14.44 o più), installare l'ultima da <https://aka.ms/vc14/vc_redist.x64.exe> e riprovare. Verificare anche che tutti i file dello zip stiano nella stessa cartella di `sd-cli` (per CUDA anche le DLL `cudart`/`cublas`) |
 | `--list-devices` mostra solo `CPU` | build senza backend GPU, SDK assente in build, driver mancante, o DLL dei backend non accanto all'eseguibile | leggere il log (stderr): una riga `[W] CUDA backend: ggml-cuda.dll found in ... was not usable: <motivo>` dice perché il modulo GPU presente non si è caricato (su Windows elenca anche le DLL mancanti, per esempio `cublas64_12.dll`); `[I] no GPU backend module ... found in: <cartelle>` significa che nessun modulo GPU è accanto all'eseguibile (pacchetto o build senza GPU). Poi: driver aggiornato, pacchetto giusto (`cuda12` per NVIDIA), cartella davvero usata dall'applicazione |
 | `auto-fit: no GPU devices` nei log | come sopra: il motore non vede acceleratori | stessa verifica; un'etichetta "GPU" nei log dell'applicazione non prova nulla |
 | HTTP **502** da un proxy durante una generazione lunga | il proxy ha un timeout (es. la `fetch` di Node abbandona dopo ~5 minuti senza risposta) mentre il motore sta ancora calcolando | non reinviare alla cieca; usare API a job asincroni con polling; controllare i log del servizio |
@@ -331,6 +332,18 @@ Che cosa è automatico e che cosa no:
 | Generazione lentissima (minuti per passo) | esecuzione sulla CPU, risoluzione alta, o modello troppo grande per la memoria | verificare i device; ridurre risoluzione/passi; modello quantizzato; build GPU |
 | Avviso "memory guard: pressure" nei log | la memoria del device (su CPU: la RAM di sistema) ha superato la soglia `--memory-guard` | è un avviso con riduzione automatica della residenza: evitare nuove richieste finché non segnala il recupero |
 | `auto-fit: CPU only; ...` nei log | senza GPU il motore ha confrontato la RAM disponibile con le dimensioni dei componenti | `the weights fit in RAM`: nessuna azione. `some weights do not fit in RAM; enabling the memory guard at 90%`: i componenti che non ci stanno restano su disco e il grafo gira a segmenti; è più lento ma serve proprio a non esaurire la RAM |
+
+Codici con cui Windows chiude un programma che non riesce ad avviarsi.
+PowerShell li mostra con il segno, molte applicazioni senza: è lo stesso
+numero.
+
+| Codice | Esadecimale | Significato | Che cosa fare |
+|---|---|---|---|
+| `-1073741515` / `3221225781` | `0xC0000135` | DLL non trovata | installare o aggiornare il Visual C++ Redistributable (14.44 o più); tenere tutti i file dello zip nella stessa cartella |
+| `-1073741511` / `3221225785` | `0xC0000139` | una DLL non ha una funzione richiesta | file di versioni diverse nella stessa cartella oppure runtime Visual C++ troppo vecchio: ricopiare tutti i file dallo stesso zip e aggiornare il redistributable |
+| `-1073741701` / `3221225595` | `0xC000007B` | immagine non valida (file a 32 e a 64 bit mischiati) | usare soltanto i file x64 dello stesso zip |
+| `-1073741819` / `3221225477` | `0xC0000005` | violazione di accesso: il programma è andato in crash | leggere l'evento «Application Error» più recente (indica il modulo in errore); aggiornare driver video e Visual C++; provare il pacchetto Vulkan o solo CPU |
+| `-1073740760` / `3221226536` | `0xC0000428` | Windows ha rifiutato un file perché la firma non è accettata | policy di sicurezza (es. Smart App Control): controllare i registri CodeIntegrity; **non** disattivare le protezioni |
 
 ### 2.9 Pacchetto portabile (consigliato per la distribuzione)
 ```shell
@@ -393,8 +406,27 @@ operativo e all'architettura del computer di destinazione.
 Ogni pacchetto contiene anche il backend CPU: se il modulo GPU non si carica
 (driver assente o troppo vecchio) il programma parte comunque sulla CPU, e il
 log spiega perché il modulo GPU è stato scartato. Non servono SDK o compilatori
-sulla macchina di destinazione. Su Windows serve il Microsoft Visual C++
-Redistributable 2015-2022 (x64), di solito già presente.
+sulla macchina di destinazione.
+
+**Requisito su Windows: Microsoft Visual C++ Redistributable 2015-2022 (x64),
+versione 14.44 o successiva.** I programmi dei pacchetti sono compilati con
+MSVC 14.44 e Microsoft richiede un redistributable uguale o più recente degli
+strumenti di build usati ([dettagli](https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist)).
+Se manca o è più vecchio, Windows non riesce a caricare le DLL del motore e lo
+chiude subito, **senza scrivere nulla**: `sd-cli --list-devices` non stampa
+niente e un'applicazione che avvia il motore riceve il codice di uscita
+`3221225781` (`0xC0000135`, mostrato da PowerShell come `-1073741515`). Per
+controllare la versione installata:
+
+```powershell
+(Get-Item C:\Windows\System32\msvcp140.dll).VersionInfo.FileVersion   # deve essere 14.44 o più
+```
+
+L'ultima versione si scarica da <https://aka.ms/vc14/vc_redist.x64.exe>. Dopo
+l'installazione riavviare l'applicazione che usa il motore: alcune ricordano
+l'esito del primo controllo. Se si ricompila il motore con un Visual Studio più
+recente, vale la versione di quel compilatore. Sintomi e altri codici di
+uscita: sezione 2.8.
 
 Per ottenerli senza tag: scheda **Actions** del repository, workflow
 "Release portable package", **Run workflow**, scegliendo il ramo. Gli ingressi
@@ -668,7 +700,7 @@ per cui è stato creato, non universale.
 |---|---|---|
 | Linux | x86-64 | La release include varianti CPU x86 selezionabili e il backend Vulkan (serve `libvulkan.so.1` sulla macchina); CUDA non è incluso. La compatibilità con distribuzioni Linux meno recenti dipende anche dalla versione di glibc e dalle librerie di sistema: verificare sul sistema minimo di destinazione. |
 | macOS | arm64 (Apple Silicon) | La release automatica corrente è per macOS arm64; non è un binario Intel/x86-64. Include Metal, che richiede hardware e sistema Apple compatibili. |
-| Windows | x86-64 | Due pacchetti: `windows-x86_64` (CPU + Vulkan, per GPU NVIDIA, AMD e Intel) e `windows-x86_64-cuda12` (CPU + CUDA 12 per NVIDIA, con le DLL di CUDA incluse). Entrambi richiedono il driver grafico aggiornato e il Visual C++ Redistributable 2015-2022 (x64). |
+| Windows | x86-64 | Due pacchetti: `windows-x86_64` (CPU + Vulkan, per GPU NVIDIA, AMD e Intel) e `windows-x86_64-cuda12` (CPU + CUDA 12 per NVIDIA, con le DLL di CUDA incluse). Entrambi richiedono il driver grafico aggiornato e il Visual C++ Redistributable 2015-2022 (x64) **versione 14.44 o successiva** (sezioni 2.8 e 2.9). |
 
 Questa tabella descrive gli artefatti generati dall'attuale workflow di release,
 non una garanzia di compatibilità con tutte le versioni storiche dei sistemi

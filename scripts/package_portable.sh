@@ -88,8 +88,13 @@ caricato.
 fi
 if [[ "$os" == windows ]]; then
     help_note+="
-Su Windows serve anche Microsoft Visual C++ Redistributable 2015-2022 (x64),
-di solito gia' presente.
+Su Windows serve Microsoft Visual C++ Redistributable 2015-2022 (x64),
+versione 14.44 o successiva (i programmi sono compilati con MSVC 14.44).
+Se manca o e' piu' vecchio, Windows chiude il programma subito, senza
+scrivere nulla: il codice di uscita e' 0xC0000135 (3221225781, oppure
+-1073741515 in PowerShell). Controlla la versione con:
+  (Get-Item C:\Windows\System32\msvcp140.dll).VersionInfo.FileVersion
+e installa l'ultima da https://aka.ms/vc14/vc_redist.x64.exe
 "
 fi
 
