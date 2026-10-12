@@ -3,14 +3,14 @@
 ## Get the Code
 
 ```
-git clone --recursive https://github.com/leejet/stable-diffusion.cpp
-cd stable-diffusion.cpp
+git clone --recursive https://github.com/Filve/diffusione-in-tempo-reale
+cd diffusione-in-tempo-reale
 ```
 
 - If you have already cloned the repository, you can use the following command to update the repository to the latest code.
 
 ```
-cd stable-diffusion.cpp
+cd diffusione-in-tempo-reale
 git pull origin master
 git submodule init
 git submodule update

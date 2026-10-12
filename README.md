@@ -188,7 +188,7 @@ API and command-line option may change frequently.***
 
 ### Get the sd executable
 
-- Download pre-built binaries from the [releases page](https://github.com/leejet/stable-diffusion.cpp/releases)
+- Download pre-built binaries from the [releases page](https://github.com/Filve/diffusione-in-tempo-reale/releases)
 - Or build from source by following the [build guide](./docs/build.md)
 
 ### Download model weights
