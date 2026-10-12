@@ -194,7 +194,7 @@ jobs:
 
     strategy:
       matrix:
-        variant: [musa, sycl, vulkan, cuda]
+        variant: [cpu, musa, sycl, vulkan, cuda]
         platform: [linux/amd64]
         runner: [ubuntu-latest]
         build-args: [""]
@@ -269,7 +269,7 @@ jobs:
           context: .
           platforms: ${{ matrix.platform }}
           push: ${{ ( github.event_name == 'push' && github.ref == 'refs/heads/master' ) || github.event.inputs.create_release == 'true' }}
-          file: docker/Dockerfile.${{ matrix.variant }}
+          file: ${{ matrix.variant == 'cpu' && 'docker/Dockerfile' || format('docker/Dockerfile.{0}', matrix.variant) }}
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.BRANCH_NAME }}-${{ matrix.variant }}${{ matrix.tag-suffix }}
           labels: ${{ steps.meta.outputs.labels }}
           annotations: ${{ steps.meta.outputs.annotations }}
