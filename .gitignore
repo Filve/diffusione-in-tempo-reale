@@ -9,6 +9,7 @@ test/*
 !test/pe_imports_test.cpp
 !test/file_handle_pool_test.cpp
 !test/profile_test.cpp
+!test/backend_fit_plan_test.cpp
 !test/server_recovery_test.cpp
 !test/fuzz_model_loader.py
 tests/

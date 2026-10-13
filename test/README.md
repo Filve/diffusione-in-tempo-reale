@@ -11,7 +11,8 @@ sezione "Sicurezza".
 | `api_robustness.cpp` | API C: puntatori nulli, indici fuori range, buffer piccoli, stress multi-thread (con ASan/UBSan) | vedi intestazione del file |
 | `pe_imports_test.cpp` | lettore della tabella di importazione dei file PE (diagnostica delle DLL mancanti su Windows): file validi, troncati e corrotti (con ASan/UBSan) | vedi intestazione del file |
 | `file_handle_pool_test.cpp` | pool dei flussi aperti sui file modello: riuso, file modificato o sostituito, flussi in errore, limiti, uso concorrente (con ASan/UBSan e TSan) | vedi intestazione del file |
-| `profile_test.cpp` | profili di risorse (`--profile`): scelta automatica da dimensione del modello e memoria, ordine dei livelli, opzioni esplicite che vincono sul profilo | vedi intestazione del file |
+| `profile_test.cpp` | profili di risorse (`--profile`): scelta automatica da dimensione del modello e memoria (anche sommando la memoria di più GPU), ordine dei livelli, opzioni esplicite che vincono sul profilo | vedi intestazione del file |
+| `backend_fit_plan_test.cpp` | pianificatore multi-GPU dell'auto-fit (`--multi-gpu auto\|on\|off`) con GPU simulate: quale modulo va su quale GPU, quando il modello si divide per blocchi, nessun device riceve più pesi del suo budget, i moduli assegnati dall'utente non si muovono (include `src/core/backend_fit.cpp`, quindi serve la libreria compilata; nessuna GPU né modello) | vedi intestazione del file |
 | `server_recovery_test.cpp` | custode del contesto del server (`examples/server/recovery.*`): scala dei profili, discesa su memoria insufficiente, risalita dopo una pausa, ricarica dopo un errore, risposte HTTP 503/400/500 con `Retry-After`, uso da più thread. Non serve nessun modello: libreria e orologio sono simulati | vedi intestazione del file |
 | `fuzz_model_loader.py` | fuzzing a mutazione del caricamento modelli (safetensors/GGUF) | `python3 test/fuzz_model_loader.py <sd-cli> --seconds 300` |
 
