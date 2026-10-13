@@ -1,6 +1,7 @@
 #include "profile.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <filesystem>
 #include <system_error>
@@ -29,6 +30,24 @@ namespace sd_profile {
 
         bool mentions_module(const std::string& spec, const char* name) {
             return spec.find(std::string(name) + "=") != std::string::npos;
+        }
+
+        // Working memory each GPU after the first needs next to its share of the weights.
+        constexpr int64_t EXTRA_GPU_HEADROOM = 2 * GiB;
+
+        // CUDA0 and CUDA1 are one family, Vulkan0 is another: only GPUs of one family share a model.
+        std::string backend_family(const char* device_name) {
+            std::string family = device_name;
+            while (!family.empty() && std::isdigit(static_cast<unsigned char>(family.back()))) {
+                family.pop_back();
+            }
+            return family;
+        }
+
+        bool multi_gpu_off(const std::string& mode) {
+            std::string lowered = mode;
+            std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            return lowered == "off";
         }
 
     }  // namespace
@@ -80,6 +99,50 @@ namespace sd_profile {
         return Level::LITE_CPU;
     }
 
+    bool may_use_several_gpus(const SDContextParams& ctx) {
+        return ctx.auto_fit && ctx.backend.empty() && ctx.params_backend.empty() && !multi_gpu_off(ctx.multi_gpu);
+    }
+
+    int64_t usable_gpu_memory(const std::vector<sd_device_info_t>& devices, bool pool, int* count) {
+        if (count != nullptr) {
+            *count = 0;
+        }
+        // An integrated GPU draws on the system RAM, so only discrete GPUs and accelerators count.
+        const sd_device_info_t* best = nullptr;
+        for (const sd_device_info_t& device : devices) {
+            const bool counts = device.type == SD_DEVICE_TYPE_GPU || device.type == SD_DEVICE_TYPE_ACCEL;
+            if (counts && (best == nullptr || device.free_memory_bytes > best->free_memory_bytes)) {
+                best = &device;
+            }
+        }
+        if (best == nullptr || best->free_memory_bytes == 0) {
+            return 0;
+        }
+
+        int64_t total = static_cast<int64_t>(best->free_memory_bytes);
+        int gpus      = 1;
+        if (pool && best->type == SD_DEVICE_TYPE_GPU) {
+            const std::string family = backend_family(best->name);
+            int64_t sum              = 0;
+            int members              = 0;
+            for (const sd_device_info_t& device : devices) {
+                if (device.type == SD_DEVICE_TYPE_GPU && device.free_memory_bytes > 0 && backend_family(device.name) == family) {
+                    sum += static_cast<int64_t>(device.free_memory_bytes);
+                    ++members;
+                }
+            }
+            const int64_t pooled = sum - static_cast<int64_t>(members - 1) * EXTRA_GPU_HEADROOM;
+            if (members > 1 && pooled > total) {
+                total = pooled;
+                gpus  = members;
+            }
+        }
+        if (count != nullptr) {
+            *count = gpus;
+        }
+        return total;
+    }
+
     Resources probe(const SDContextParams& ctx) {
         Resources resources;
         const std::vector<const std::string*> files = {
@@ -96,16 +159,14 @@ namespace sd_profile {
             resources.ram_available = static_cast<int64_t>(memory.available_bytes);
         }
 
-        // An integrated GPU draws on the system RAM, so only discrete GPUs and accelerators count.
+        std::vector<sd_device_info_t> devices;
         for (size_t i = 0; i < sd_get_device_count(); ++i) {
             sd_device_info_t info;
-            if (!sd_get_device_info(i, &info)) {
-                continue;
-            }
-            if (info.type == SD_DEVICE_TYPE_GPU || info.type == SD_DEVICE_TYPE_ACCEL) {
-                resources.gpu_free = std::max<int64_t>(resources.gpu_free, static_cast<int64_t>(info.free_memory_bytes));
+            if (sd_get_device_info(i, &info)) {
+                devices.push_back(info);
             }
         }
+        resources.gpu_free = usable_gpu_memory(devices, may_use_several_gpus(ctx), &resources.gpu_count);
         return resources;
     }
 
@@ -133,6 +194,11 @@ namespace sd_profile {
         facts += resources.ram_available >= 0 ? "RAM available " + format_gib(ram) : std::string("RAM unknown");
         if (resources.gpu_free > 0) {
             facts += ", GPU free " + format_gib(resources.gpu_free);
+            if (resources.gpu_count > 1) {
+                facts += " over " + std::to_string(resources.gpu_count) + " GPUs";
+            }
+        } else {
+            facts += ", no GPU memory reported";
         }
 
         if (need + need / 4 <= fast && (resources.ram_available < 0 || ram >= GiB)) {

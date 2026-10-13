@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "common.h"
 
@@ -31,8 +32,20 @@ namespace sd_profile {
     struct Resources {
         int64_t model_bytes   = 0;   // size of the model files, 0 when unknown
         int64_t ram_available = -1;  // RAM a program can still use, -1 when unknown
-        int64_t gpu_free      = 0;   // free memory of the discrete GPU with the most, 0 without one
+        int64_t gpu_free      = 0;   // free memory of the discrete GPU with the most, or of the GPUs of one backend together when auto-fit may spread the model over them; 0 without one
+        int gpu_count         = 0;   // how many GPUs gpu_free adds up
     };
+
+    // True when --auto-fit plans where the weights go and neither --multi-gpu off nor an explicit --backend or
+    // --params-backend keeps a model on one GPU.
+    bool may_use_several_gpus(const SDContextParams& ctx);
+
+    // The memory the weights can sit in on the GPUs. With pool, the discrete GPUs of the backend that
+    // has the GPU with the most free memory (CUDA0, CUDA1, ...) count together, less 2 GiB of working
+    // memory for every GPU after the first; this is how --auto-fit with --multi-gpu spreads a model.
+    // Without pool, or with a single GPU, it is the free memory of the discrete GPU or accelerator
+    // that has the most. count receives the number of GPUs added up (0 when there is none).
+    int64_t usable_gpu_memory(const std::vector<sd_device_info_t>& devices, bool pool, int* count = nullptr);
 
     // Reads the sizes of the model files and the memory of the machine. Reads no model data.
     Resources probe(const SDContextParams& ctx);
