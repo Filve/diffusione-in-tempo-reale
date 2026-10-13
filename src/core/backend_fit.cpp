@@ -4,6 +4,7 @@
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <fstream>
 #include <utility>
 #include <vector>
@@ -42,6 +43,8 @@ namespace sd::backend_fit {
     struct Device {
         std::string name;
         std::string description;
+        std::string registry;
+        bool discrete        = false;
         int64_t free_bytes   = 0;
         int64_t budget_bytes = 0;
     };
@@ -56,11 +59,13 @@ namespace sd::backend_fit {
     struct Decision {
         ParamsLocation params_location = ParamsLocation::DISK;
         size_t params_device           = SIZE_MAX;
+        std::vector<int64_t> shares;
     };
 
     struct Runtime {
         std::string name;
         std::vector<size_t> devices;
+        bool estimate_shares = false;
     };
 
     struct Plan {
@@ -140,6 +145,10 @@ namespace sd::backend_fit {
             Device device;
             device.name        = ggml_backend_dev_name(dev);
             device.description = ggml_backend_dev_description(dev);
+            device.discrete    = type == GGML_BACKEND_DEVICE_TYPE_GPU;
+            if (ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev)) {
+                device.registry = ggml_backend_reg_name(reg);
+            }
             size_t free_bytes = 0, total_bytes = 0;
             ggml_backend_dev_memory(dev, &free_bytes, &total_bytes);
             device.free_bytes = (int64_t)free_bytes;
@@ -203,6 +212,32 @@ namespace sd::backend_fit {
         return main_device;
     }
 
+    static constexpr int64_t SPLIT_BOUNDARY_MARGIN = 256 * MiB;
+    static constexpr int64_t SPLIT_SLACK_PERCENT   = 10;
+
+    // The layer split fills the devices in order, each up to its capacity, so the first one takes as much as it can.
+    // The slack and the margin per boundary cover blocks that cannot be cut where the capacity ends.
+    static bool estimate_split_shares(int64_t params_bytes,
+                                      const std::vector<int64_t>& capacities,
+                                      std::vector<int64_t>& shares) {
+        int64_t total = 0;
+        for (int64_t capacity : capacities) {
+            total += capacity;
+        }
+        const int64_t boundaries = std::max<int64_t>((int64_t)capacities.size() - 1, 0);
+        const int64_t required   = params_bytes + params_bytes * SPLIT_SLACK_PERCENT / 100 + boundaries * SPLIT_BOUNDARY_MARGIN;
+        shares.assign(capacities.size(), 0);
+        if (total < required) {
+            return false;
+        }
+        int64_t left = params_bytes;
+        for (size_t i = 0; i < capacities.size() && left > 0; ++i) {
+            shares[i] = std::min(left, capacities[i]);
+            left -= shares[i];
+        }
+        return true;
+    }
+
     static Plan compute_plan(const std::vector<Component>& components,
                              const std::vector<Device>& devices,
                              int64_t ram_budget_bytes,
@@ -261,17 +296,28 @@ namespace sd::backend_fit {
             }
 
             const auto& runtime_devices = plan.runtimes[ci].devices;
-            const bool fits_runtime     = !runtime_devices.empty() &&
-                                      std::all_of(runtime_devices.begin(), runtime_devices.end(), [&](size_t di) {
-                                          const int64_t headroom = headroom_for(ci, di);
-                                          return headroom <= remaining[di] && comp.params_bytes <= remaining[di] - headroom;
-                                      });
+            std::vector<int64_t> shares;
+            bool fits_runtime = false;
+            if (plan.runtimes[ci].estimate_shares) {
+                std::vector<int64_t> capacities;
+                for (size_t di : runtime_devices) {
+                    capacities.push_back(std::max<int64_t>(remaining[di] - headroom_for(ci, di), 0));
+                }
+                fits_runtime = !runtime_devices.empty() && estimate_split_shares(comp.params_bytes, capacities, shares);
+            } else {
+                fits_runtime = !runtime_devices.empty() &&
+                               std::all_of(runtime_devices.begin(), runtime_devices.end(), [&](size_t di) {
+                                   const int64_t headroom = headroom_for(ci, di);
+                                   return headroom <= remaining[di] && comp.params_bytes <= remaining[di] - headroom;
+                               });
+            }
             if (fits_runtime) {
                 decision.params_location = ParamsLocation::MAIN_GPU;
                 decision.params_device   = runtime_devices.front();
+                decision.shares          = shares;
                 // Exact split allocations are unavailable until the runners build their plans.
-                for (size_t di : runtime_devices) {
-                    remaining[di] -= comp.params_bytes;
+                for (size_t i = 0; i < runtime_devices.size(); ++i) {
+                    remaining[runtime_devices[i]] -= shares.empty() ? comp.params_bytes : shares[i];
                 }
                 continue;
             }
@@ -315,6 +361,12 @@ namespace sd::backend_fit {
         return "disk";
     }
 
+    static std::string format_gib(int64_t bytes) {
+        char text[32];
+        snprintf(text, sizeof(text), "%.1f GiB", (double)bytes / (1024.0 * MiB));
+        return text;
+    }
+
     static void print_plan(const Plan& plan,
                            const std::vector<Component>& components,
                            const std::vector<Device>& devices,
@@ -346,6 +398,14 @@ namespace sd::backend_fit {
             LOG_INFO("    %-12s params %6lld MiB, compute reserve %5lld MiB -> compute %s, params %s",
                      comp.name, (long long)(comp.params_bytes / MiB), (long long)(comp.reserve_bytes / MiB),
                      plan.runtimes[ci].name.c_str(), params.c_str());
+            const auto& shares = plan.decisions[ci].shares;
+            if (shares.size() > 1) {
+                std::string split;
+                for (size_t i = 0; i < shares.size(); ++i) {
+                    split += (i == 0 ? "" : " + ") + format_gib(shares[i]) + " on " + devices[plan.runtimes[ci].devices[i]].name;
+                }
+                LOG_INFO("    %-12s split: %s", "", split.c_str());
+            }
         }
     }
 
@@ -370,10 +430,252 @@ namespace sd::backend_fit {
         return "";
     }
 
+    static std::string lowercase(std::string text) {
+        std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+        return text;
+    }
+
+    bool parse_multi_gpu_mode(const std::string& text, MultiGpuMode& mode) {
+        const std::string value = lowercase(trim(text));
+        if (value.empty() || value == "auto") {
+            mode = MultiGpuMode::AUTO;
+        } else if (value == "on") {
+            mode = MultiGpuMode::ON;
+        } else if (value == "off") {
+            mode = MultiGpuMode::OFF;
+        } else {
+            return false;
+        }
+        return true;
+    }
+
+    static void set_assignment(std::string& spec, const char* key, const std::string& value) {
+        const std::string prefix = std::string(key) + "=";
+        std::string out;
+        bool replaced = false;
+        for (const std::string& part : split_string(spec, ',')) {
+            std::string token = trim(part);
+            if (token.empty()) {
+                continue;
+            }
+            if (!replaced && token.compare(0, prefix.size(), prefix) == 0) {
+                token    = prefix + value;
+                replaced = true;
+            }
+            out += out.empty() ? "" : ",";
+            out += token;
+        }
+        if (!replaced) {
+            out += out.empty() ? "" : ",";
+            out += prefix + value;
+        }
+        spec = out;
+    }
+
+    static bool splittable(ComponentKind kind) {
+        return kind == ComponentKind::DIT || kind == ComponentKind::CONDITIONER;
+    }
+
+    // A module whose --split-mode is row is not split automatically: row split keeps its own weight distribution.
+    static std::vector<bool> split_allowed(const std::vector<Component>& components, const std::string& split_mode_spec) {
+        std::vector<bool> allowed(components.size(), true);
+        SDBackendAssignment assignment;
+        std::string error;
+        if (split_mode_spec.empty() || !sd_parse_backend_assignment(split_mode_spec, &assignment, &error)) {
+            return allowed;
+        }
+        const SDBackendModule modules[] = {SDBackendModule::DIFFUSION, SDBackendModule::TE, SDBackendModule::VAE};
+        for (size_t ci = 0; ci < components.size(); ++ci) {
+            if (lowercase(trim(assignment.get(modules[int(components[ci].kind)]))) == "row") {
+                allowed[ci] = false;
+            }
+        }
+        return allowed;
+    }
+
+    // The discrete GPUs of the backend that has the GPU with the most memory, largest budget first. Integrated
+    // GPUs share the system RAM and GPUs of another backend would need their own runtime, so neither is included.
+    static std::vector<size_t> multi_gpu_group(const std::vector<Device>& devices) {
+        auto usable = [&](size_t di) { return devices[di].discrete && devices[di].budget_bytes > 0; };
+        size_t best = SIZE_MAX;
+        for (size_t di = 0; di < devices.size(); ++di) {
+            if (usable(di) && (best == SIZE_MAX || devices[di].budget_bytes > devices[best].budget_bytes)) {
+                best = di;
+            }
+        }
+        std::vector<size_t> group;
+        for (size_t di = 0; best != SIZE_MAX && di < devices.size(); ++di) {
+            if (usable(di) && devices[di].registry == devices[best].registry) {
+                group.push_back(di);
+            }
+        }
+        std::stable_sort(group.begin(), group.end(), [&](size_t a, size_t b) {
+            return devices[a].budget_bytes > devices[b].budget_bytes;
+        });
+        return group;
+    }
+
+    static std::string join_device_names(const std::vector<Device>& devices, const std::vector<size_t>& indices, const char* separator) {
+        std::string out;
+        for (size_t di : indices) {
+            out += out.empty() ? "" : separator;
+            out += devices[di].name;
+        }
+        return out;
+    }
+
+    // Places the modules the user did not assign, in priority order, where their weights stay resident: a module
+    // keeps the device it has unless it does not fit there next to the modules placed before it, and then it moves
+    // to the first GPU of the group that can hold it. The diffusion model and the text encoder are split across GPUs
+    // when no single one can hold them. With --multi-gpu on, the text encoder and the VAE also move away from the
+    // diffusion GPU when they would fit. Returns true when a runtime changed.
+    static bool plan_multi_gpu_runtimes(const std::vector<Component>& components,
+                                        const std::vector<Device>& devices,
+                                        int64_t ram_budget_bytes,
+                                        MultiGpuMode mode,
+                                        const std::vector<bool>& explicit_runtime,
+                                        const std::vector<bool>& allow_split,
+                                        std::vector<Runtime>& runtimes,
+                                        std::vector<std::string>& notes) {
+        bool has_free_module = false;
+        for (size_t ci = 0; ci < components.size(); ++ci) {
+            has_free_module = has_free_module || (!explicit_runtime[ci] && components[ci].params_bytes > 0);
+        }
+        if (mode == MultiGpuMode::OFF || !has_free_module) {
+            return false;
+        }
+
+        const std::vector<size_t> group = multi_gpu_group(devices);
+        if (group.size() < 2) {
+            size_t discrete = 0;
+            for (const Device& device : devices) {
+                discrete += device.discrete && device.budget_bytes > 0 ? 1 : 0;
+            }
+            if (discrete >= 2) {
+                notes.push_back(
+                    "several GPUs were found but they belong to different backends; only the best one is used "
+                    "unless modules are assigned with --backend");
+            }
+            return false;
+        }
+
+        std::vector<size_t> order(components.size());
+        for (size_t ci = 0; ci < components.size(); ++ci) {
+            order[ci] = ci;
+        }
+        std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+            return components[a].kind < components[b].kind;
+        });
+
+        auto single   = [&](size_t di) { return Runtime{devices[di].name, {di}}; };
+        auto plan_now = [&]() { return compute_plan(components, devices, ram_budget_bytes, runtimes); };
+        auto resident = [](const Plan& plan, size_t ci) { return plan.decisions[ci].params_location == ParamsLocation::MAIN_GPU; };
+
+        const std::vector<Runtime> original = runtimes;
+        std::vector<std::string> planned_notes;
+        for (size_t ci : order) {
+            const Component& comp = components[ci];
+            if (explicit_runtime[ci] || comp.params_bytes == 0) {
+                continue;
+            }
+
+            const Runtime previous = runtimes[ci];
+            const bool fits_before = resident(plan_now(), ci);
+
+            std::vector<Runtime> candidates = {previous};
+            for (size_t di : group) {
+                if (devices[di].name != previous.name) {
+                    candidates.push_back(single(di));
+                }
+            }
+            if (mode == MultiGpuMode::ON && comp.kind != ComponentKind::DIT) {
+                std::vector<size_t> diffusion_devices;
+                for (size_t other = 0; other < components.size(); ++other) {
+                    if (components[other].kind == ComponentKind::DIT && components[other].params_bytes > 0) {
+                        diffusion_devices = runtimes[other].devices;
+                    }
+                }
+                std::stable_partition(candidates.begin(), candidates.end(), [&](const Runtime& candidate) {
+                    return std::none_of(candidate.devices.begin(), candidate.devices.end(), [&](size_t di) {
+                        return std::find(diffusion_devices.begin(), diffusion_devices.end(), di) != diffusion_devices.end();
+                    });
+                });
+            }
+            if (splittable(comp.kind) && allow_split[ci]) {
+                for (size_t count = 2; count <= group.size(); ++count) {
+                    Runtime split;
+                    split.devices         = std::vector<size_t>(group.begin(), group.begin() + count);
+                    split.name            = join_device_names(devices, split.devices, "&");
+                    split.estimate_shares = true;
+                    candidates.push_back(std::move(split));
+                }
+            }
+
+            Runtime chosen = previous;
+            for (const Runtime& candidate : candidates) {
+                runtimes[ci] = candidate;
+                if (resident(plan_now(), ci)) {
+                    chosen = candidate;
+                    break;
+                }
+            }
+            runtimes[ci] = chosen;
+            if (chosen.name == previous.name) {
+                continue;
+            }
+
+            const std::string module = module_key(comp.kind);
+            if (chosen.devices.size() > 1) {
+                planned_notes.push_back(module + " is split across " + chosen.name + ": its weights (" + format_gib(comp.params_bytes) +
+                                        ") do not fit on " + previous.name + " next to the modules placed before it");
+            } else if (fits_before) {
+                planned_notes.push_back(module + " runs on " + chosen.name + " (--multi-gpu on keeps " + previous.name + " for the diffusion model)");
+            } else {
+                planned_notes.push_back(module + " runs on " + chosen.name + ": it does not fit on " + previous.name + " next to the modules placed before it");
+            }
+        }
+
+        bool changed = false;
+        for (size_t ci = 0; ci < components.size(); ++ci) {
+            changed = changed || runtimes[ci].name != original[ci].name;
+        }
+        const Plan final_plan = plan_now();
+
+        if (!changed && mode == MultiGpuMode::AUTO) {
+            bool all_resident        = true;
+            std::vector<size_t> idle = group;
+            std::vector<std::string> hosts;
+            for (size_t ci = 0; ci < components.size(); ++ci) {
+                if (components[ci].params_bytes == 0) {
+                    continue;
+                }
+                all_resident = all_resident && resident(final_plan, ci);
+                if (std::find(hosts.begin(), hosts.end(), runtimes[ci].name) == hosts.end()) {
+                    hosts.push_back(runtimes[ci].name);
+                }
+                for (size_t di : runtimes[ci].devices) {
+                    idle.erase(std::remove(idle.begin(), idle.end(), di), idle.end());
+                }
+            }
+            if (all_resident && !idle.empty()) {
+                std::string host_names;
+                for (const std::string& host : hosts) {
+                    host_names += (host_names.empty() ? "" : ", ") + host;
+                }
+                planned_notes.push_back(std::to_string(group.size()) + " GPUs found (" + join_device_names(devices, group, ", ") +
+                                        "); everything fits on " + host_names + ", so " + join_device_names(devices, idle, ", ") +
+                                        " will not be used (--multi-gpu on would put the text encoder and the VAE on the other GPUs)");
+            }
+        }
+        notes.insert(notes.end(), planned_notes.begin(), planned_notes.end());
+        return changed;
+    }
+
     static bool resolve_runtimes(const std::vector<Component>& components,
                                  const std::vector<Device>& devices,
                                  std::string& runtime_spec,
                                  std::vector<Runtime>& runtimes,
+                                 std::vector<bool>& explicit_runtime,
                                  std::string& error) {
         SDBackendAssignment assignment;
         if (!sd_parse_backend_assignment(runtime_spec, &assignment, &error)) {
@@ -381,8 +683,10 @@ namespace sd::backend_fit {
         }
         const size_t main_device        = select_main_device(devices);
         const SDBackendModule modules[] = {SDBackendModule::DIFFUSION, SDBackendModule::TE, SDBackendModule::VAE};
-        for (const Component& comp : components) {
-            std::string name = assignment.get(modules[int(comp.kind)]);
+        for (size_t ci = 0; ci < components.size(); ++ci) {
+            const Component& comp = components[ci];
+            std::string name      = assignment.get(modules[int(comp.kind)]);
+            explicit_runtime[ci]  = !name.empty();
             if (name.empty()) {
                 name = main_device == SIZE_MAX ? "cpu" : devices[main_device].name;
                 if (comp.params_bytes > 0) {
@@ -420,7 +724,8 @@ namespace sd::backend_fit {
                               sd::ggml_graph_cut::MaxVramAssignment& budgets,
                               std::string& runtime_spec,
                               std::string& params_spec,
-                              int& memory_guard_percent) {
+                              int& memory_guard_percent,
+                              const Options& options) {
         std::string error;
         if (!budgets.canonicalize_backend_keys(&error)) {
             LOG_ERROR("%s", error.c_str());
@@ -432,7 +737,8 @@ namespace sd::backend_fit {
         const auto components = estimate_components(loader, override_wtype);
         const auto devices    = enumerate_gpu_devices(budgets, !runtime_spec.empty());
         std::vector<Runtime> runtimes;
-        if (!runtime_spec.empty() && !resolve_runtimes(components, devices, runtime_spec, runtimes, error)) {
+        std::vector<bool> explicit_runtime(components.size(), false);
+        if (!runtime_spec.empty() && !resolve_runtimes(components, devices, runtime_spec, runtimes, explicit_runtime, error)) {
             LOG_ERROR("%s", error.c_str());
             return false;
         }
@@ -455,7 +761,30 @@ namespace sd::backend_fit {
             }
         }
         const int64_t ram_budget = std::max<int64_t>(free_ram - std::max<int64_t>(2048 * MiB, free_ram / 10) - compute_reserve, 0);
-        const auto plan          = compute_plan(components, devices, ram_budget, runtimes);
+
+        const bool append_runtime_names = runtimes.empty();
+        std::vector<std::string> multi_gpu_notes;
+        if (!cpu_only) {
+            std::vector<Runtime> planned = runtimes;
+            if (planned.empty() && select_main_device(devices) != SIZE_MAX) {
+                const size_t main_device = select_main_device(devices);
+                planned.assign(components.size(), Runtime{devices[main_device].name, {main_device}});
+            }
+            if (!planned.empty() &&
+                plan_multi_gpu_runtimes(components, devices, ram_budget, options.multi_gpu, explicit_runtime,
+                                        split_allowed(components, options.split_mode_spec), planned, multi_gpu_notes)) {
+                if (!append_runtime_names) {
+                    for (size_t ci = 0; ci < components.size(); ++ci) {
+                        if (!explicit_runtime[ci] && components[ci].params_bytes > 0 && planned[ci].name != runtimes[ci].name) {
+                            set_assignment(runtime_spec, module_key(components[ci].kind), planned[ci].name);
+                        }
+                    }
+                }
+                runtimes = std::move(planned);
+            }
+        }
+
+        const auto plan = compute_plan(components, devices, ram_budget, runtimes);
         params_spec.clear();
         if (!plan.valid) {
             if (devices.empty()) {
@@ -468,6 +797,9 @@ namespace sd::backend_fit {
         }
 
         print_plan(plan, components, devices, free_ram, ram_budget);
+        for (const std::string& note : multi_gpu_notes) {
+            LOG_INFO("auto-fit: %s", note.c_str());
+        }
         if (cpu_only) {
             const bool streams_from_disk = std::any_of(plan.decisions.begin(), plan.decisions.end(), [](const Decision& decision) {
                 return decision.params_location == ParamsLocation::DISK;
@@ -486,7 +818,7 @@ namespace sd::backend_fit {
                 continue;
             }
             const char* key = module_key(components[ci].kind);
-            if (runtimes.empty()) {
+            if (append_runtime_names) {
                 append_assignment(runtime_spec, key, plan.runtimes[ci].name);
             }
             if (plan.decisions[ci].params_location != ParamsLocation::MAIN_GPU) {

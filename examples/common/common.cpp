@@ -584,6 +584,13 @@ ArgOptions SDContextParams::get_options() {
          (int)',',
          &split_mode},
         {"",
+         "--multi-gpu",
+         "how --auto-fit uses several discrete GPUs of the same backend: auto (default; the extra GPUs are used only when the weights do not fit on the best one, "
+         "first for the text encoder and the VAE, then by splitting the diffusion model), on (also moves the text encoder and the VAE away from the diffusion GPU "
+         "when everything would fit on one) or off (one GPU). Modules given in --backend are never moved or split",
+         0,
+         &multi_gpu},
+        {"",
          "--rpc-servers",
          "comma-separated list of RPC servers to connect to for offloading, in the format host:port, e.g. localhost:50052,192.168.1.3:50052",
          (int)',',
@@ -767,7 +774,8 @@ ArgOptions SDContextParams::get_options() {
          }},
         {"",
          "--auto-fit",
-         "on|off (default: on). Preserve --backend (otherwise select one GPU) and place weights on the compute GPU, "
+         "on|off (default: on). Preserve --backend (otherwise select the GPU with the most memory, or several, see --multi-gpu) "
+         "and place weights on the compute GPU, "
          "RAM, another GPU, or disk in that order, according to available memory (--max-vram limits GPU budgets). "
          "With no GPU, each component stays in RAM if it fits in the available RAM and is read from disk otherwise. "
          "Disabled by explicit --params-backend; uses automatic graph segmentation when needed",
@@ -910,6 +918,15 @@ bool SDContextParams::validate(SDMode mode, bool require_model) {
         return false;
     }
 
+    if (!multi_gpu.empty()) {
+        std::string mode = multi_gpu;
+        std::transform(mode.begin(), mode.end(), mode.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (mode != "auto" && mode != "on" && mode != "off") {
+            LOG_ERROR("error: --multi-gpu must be one of auto, on, off (got '%s')", multi_gpu.c_str());
+            return false;
+        }
+    }
+
     return true;
 }
 
@@ -999,6 +1016,7 @@ std::string SDContextParams::to_string() const {
         << "  backend: \"" << backend << "\",\n"
         << "  params_backend: \"" << params_backend << "\",\n"
         << "  split_mode: \"" << split_mode << "\",\n"
+        << "  multi_gpu: \"" << multi_gpu << "\",\n"
         << "  model_args: \"" << model_args << "\",\n"
         << "  auto_fit: " << (auto_fit ? "true" : "false") << ",\n"
         << "  enable_mmap: " << (enable_mmap ? "true" : "false") << ",\n"
@@ -1084,6 +1102,7 @@ sd_ctx_params_t SDContextParams::to_sd_ctx_params_t(bool taesd_preview) {
     sd_ctx_params.backend                         = effective_backend.c_str();
     sd_ctx_params.params_backend                  = effective_params_backend.c_str();
     sd_ctx_params.split_mode                      = split_mode.c_str();
+    sd_ctx_params.multi_gpu                       = multi_gpu.c_str();
     sd_ctx_params.auto_fit                        = auto_fit;
     sd_ctx_params.rpc_servers                     = rpc_servers.c_str();
     sd_ctx_params.model_args                      = model_args.empty() ? nullptr : model_args.c_str();

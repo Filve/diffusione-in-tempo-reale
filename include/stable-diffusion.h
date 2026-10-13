@@ -253,6 +253,7 @@ typedef struct {
     int conditioning_cache_size;    // Maximum cached conditioning entries per context; 0 disables caching (default: 4)
     int memory_guard;               // Memory usage percent (device memory, or system RAM on CPU backends) that triggers pressure reduction (weight eviction, prefetch pause, segmented CPU graphs for weights read from disk); 0 disables (default). Auto-fit uses 90 for a CPU-only plan that reads weights from disk
     bool disable_backend_fallback;  // Fail context creation instead of falling back to the CPU backend when the requested backend is unavailable
+    const char* multi_gpu;          // How auto-fit uses several discrete GPUs of one backend: "auto" (default; extra GPUs only when the weights do not fit on the best one), "on" (also move the text encoder and the VAE away from the diffusion GPU) or "off"
 } sd_ctx_params_t;
 
 typedef struct {
