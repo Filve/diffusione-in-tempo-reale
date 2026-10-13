@@ -225,13 +225,21 @@ needs two forwards per step).
 `auto` adds up the size of the model files and a working-memory reserve (1 GiB
 plus a fifth of the weights) and compares it with the memory where the compute
 happens: the free memory of the discrete GPU with the most, or the available RAM
-without one. `max` when it fits with a quarter to spare, `balanced` when it fits,
+without one. With several discrete GPUs of the same backend it counts their free
+memory together (less 2 GiB of working memory for each GPU after the first), because
+`--auto-fit` can spread a model over them (see `--multi-gpu` in
+[backend.md](./backend.md#several-gpus---multi-gpu-autoonoff)); `--multi-gpu off`, an
+explicit `--backend` or `--params-backend`, or `--auto-fit off` keep the count to one
+GPU. `max` when it fits with a quarter to spare, `balanced` when it fits,
 `lite` when it does not and the weights will have to be streamed. The decision and
 the figures are logged, for example:
 
 ```
 [INFO ] profile auto -> lite (model 6.9 GiB + 2.4 GiB working memory, RAM available 5.0 GiB, GPU free 5.5 GiB: does not fit, weights will be streamed)
+[INFO ] profile auto -> balanced (model 14.0 GiB + 3.8 GiB working memory, RAM available 8.0 GiB, GPU free 22.0 GiB over 2 GPUs: fits with little margin)
 ```
+
+With no GPU the line says `no GPU memory reported` and the available RAM decides.
 
 The estimate comes from the file sizes (it does not read the models) and does not
 account for `--type` conversions at load time. When the sizes or the memory are
