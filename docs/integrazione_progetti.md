@@ -8,7 +8,7 @@ Indice:
 
 1. [Cosa aggiunge questo fork](#1-cosa-aggiunge-questo-fork)
 2. [Installazione](#2-installazione) (prerequisiti, build, primo utilizzo, build GPU guidata, riepilogo da zero, problemi comuni, pacchetto portabile)
-3. [Come collegarlo a un progetto](#3-come-collegarlo-a-un-progetto) (CMake, API C, FFI, processo, HTTP)
+3. [Come collegarlo a un progetto](#3-come-collegarlo-a-un-progetto) (CMake, API C, FFI, processo, HTTP, strumento per assistenti AI)
 4. [Retrocompatibilità e risorse](#4-retrocompatibilità-e-risorse)
 5. [Sicurezza e test](#5-sicurezza-cosa-sapere-e-cosa-fare)
 6. [Autori e licenza](#6-autori-e-licenza)
@@ -26,13 +26,15 @@ controllato:
 | Fallback CPU | se il backend richiesto non esiste o non si inizializza, il contesto passa alla CPU con un avviso invece di fallire | **attivo** |
 | Memory guard | sopra una soglia di memoria libera pressione (evict dei pesi, prefetch sospeso) prima che l'allocazione fallisca | **disattivo** |
 | Profili di risorse | `--profile lite\|balanced\|max\|auto` imposta in un colpo guardiano di memoria, encoder di testo su CPU, VAE a tasselli e CFG non raggruppato; `auto` sceglie dalla dimensione del modello e dalla memoria libera | **disattivo** (come `max`) |
+| Più GPU | con più GPU discrete dello stesso backend l'auto-fit sposta l'encoder di testo o il VAE su un'altra GPU, o divide per blocchi un modello che non sta in una sola; `--profile auto` ne somma la memoria. `--multi-gpu auto\|on\|off`. Non rende più veloce una singola immagine (per la produttività: un `sd-server` per GPU, sezione 3.6) | **attivo** (`auto`: la seconda GPU entra solo se serve) |
 | Errori classificati e memoria di sistema | dopo un fallimento `sd_get_last_error()` dà un codice (memoria esaurita, file del modello, backend, ...) e il motivo; `sd_get_system_memory()` riporta RAM totale, disponibile e del processo | sempre disponibile |
 | Server senza modello | `sd-server` parte anche senza `-m`: device e upscale funzionano, la generazione risponde con un errore chiaro | **attivo** |
 | Server che resta in piedi | una richiesta che esaurisce la memoria non ferma `sd-server`: il modello viene ricaricato con un profilo più leggero (`max > balanced > lite > lite-disk > lite-cpu`) e la richiesta ripetuta; se nemmeno il più leggero basta, risposta `503` con `Retry-After`; dopo una pausa il server risale. `GET /sdcpp/v1/health` e `/resources` | **attivo** (`--disable-degradation` lo spegne) |
 | Autenticazione server | `--api-key` (Bearer o `X-API-Key`) e allowlist CORS `--cors-origins` | **disattivi** |
 | Pacchetto portabile | backend ggml come librerie dinamiche caricate a runtime: un solo pacchetto, ogni macchina usa ciò che ha | opzionale in build |
 | Release automatiche | workflow `release-portable.yml`: zip con GPU (Windows CUDA 12 e Vulkan, Linux Vulkan, macOS Metal) a ogni tag `portable-v*` o avvio manuale | su tag |
-| Suite di test | `test/`: smoke di sicurezza, robustezza API, fuzzer del caricamento modelli | manuale |
+| Uso da parte di assistenti AI | sezione 3.6: strumenti (`generate_image`, `engine_status`), preset, ricette per nessuna, una o più GPU e regole di sicurezza per chat e agenti che controllano il browser | documentazione |
+| Suite di test | `test/`: smoke di sicurezza, robustezza API, fuzzer del caricamento modelli, pianificatore multi-GPU con GPU simulate | manuale |
 
 L'unico cambio di comportamento predefinito rispetto a upstream è il fallback
 CPU (prima un backend non disponibile causava un errore). Si disattiva con
@@ -688,6 +690,315 @@ Il server **non cade quando la memoria finisce**:
 
 Dettagli e formato delle risposte: [examples/server/api.md](../examples/server/api.md).
 
+### 3.6 Come strumento di un assistente AI (chat, agente che controlla il browser)
+
+Il motore genera immagini e video: non conversa. In una chat o in un agente che
+usa il browser è un **modello di linguaggio** a decidere quando serve
+un'immagine e a chiamare il motore come *strumento* (function calling, "tool
+use"); l'applicazione ospite esegue la chiamata e restituisce il risultato al
+modello. Il motore sta in fondo alla catena e non sa nulla della conversazione:
+
+```
+utente ─► assistente (LLM) ─► applicazione ospite ─HTTP─► sd-server ─► CPU / GPU
+              ▲                        │
+              └── percorso del file ◄──┘
+```
+
+Il server ha già quello che serve (sezione 3.5): la rotta nativa asincrona
+`/sdcpp/v1/img_gen`, `capabilities` con i default e i limiti del modello
+caricato, `health` e `resources` per sapere se si può generare e con quale
+hardware. Qui sotto: come avviarlo secondo l'hardware, i preset, gli strumenti
+da dichiarare all'assistente con un'implementazione di riferimento, e le regole
+di sicurezza.
+
+**Stato delle prove.** Lo strumento e il flusso HTTP sono stati eseguiti contro
+un `sd-server` reale su CPU (2 core) con il modello sintetico da 2,1 GB: riuscita,
+parametri non validi, chiave errata, server spento, scadenza con job in coda e
+con job già in corso, scelta fra due server. Le ricette per una o più GPU
+seguono la documentazione e i test del pianificatore ma **non sono state
+provate su GPU reali**, e i preset sono punti di partenza da tarare sul proprio
+modello: nessuna immagine di un modello vero è stata valutata.
+
+#### Nessuna, una o più GPU
+
+Il motore rileva l'hardware da solo: `sd-cli --list-devices` lo elenca prima di
+caricare un modello, `GET /sdcpp/v1/resources` lo ripete a server acceso e
+un'applicazione che usa la libreria ha `sd_get_device_count()` /
+`sd_get_device_info()` (sezione 4). Tipo (`cpu`, `gpu`, `igpu`, `accel`) e
+memoria libera bastano per decidere come avviare:
+
+| Macchina | Avvio | Cosa succede |
+|---|---|---|
+| Nessuna GPU | `sd-server -m modello --profile auto` | `--profile auto` confronta modello e RAM disponibile; `--auto-fit` tiene i pesi in RAM e, se non ci stanno, li legge dal disco (con la memory guard). È lento: per dare un ordine di grandezza, 256×256 e 2 passi con un SD 1.5 su 2 core hanno richiesto 30-40 s. Meglio `draft` e immagini piccole. |
+| Una GPU | `sd-server -m modello --profile auto` | Il calcolo va sulla GPU; i pesi che non ci stanno restano in RAM o su disco. |
+| Più GPU, il modello sta in una | un `sd-server` per GPU (sotto) | Più immagini nello stesso tempo. Ogni server tiene la sua copia del modello. |
+| Più GPU, il modello non sta in una | `sd-server -m modello --profile auto` (`--multi-gpu auto` è il default) | Il motore divide i blocchi del modello fra le GPU dello stesso backend, oppure sposta l'encoder di testo o il VAE su un'altra GPU (vedi [backend.md](./backend.md#several-gpus---multi-gpu-autoonoff)). Una singola immagine non diventa più veloce. |
+
+Un server per GPU, con la stessa chiave e porte diverse (i nomi `cuda0`,
+`cuda1`, `vulkan0`... sono quelli di `--list-devices`; `-W`, `-H` e `--steps`
+sono valori di esempio per un modello da 1024 px):
+
+```shell
+sd-server -m modello.safetensors --backend cuda0 --listen-port 1234 --api-key mia-chiave -W 1024 -H 1024 --steps 25
+sd-server -m modello.safetensors --backend cuda1 --listen-port 1235 --api-key mia-chiave -W 1024 -H 1024 --steps 25
+```
+
+e in `SERVERS` dello strumento (sotto) i due indirizzi. La scelta del server è
+quella con meno lavoro in coda (`queue.pending` di `GET /sdcpp/v1/health`); con
+un solo indirizzo il comportamento è quello di un server singolo. Il pianificatore
+di `--multi-gpu` è provato con GPU simulate, non con due GPU vere.
+
+#### Preset
+
+Un preset è un nome che l'assistente può scegliere senza conoscere il modello;
+l'applicazione lo traduce in numeri leggendo `GET /sdcpp/v1/capabilities`
+(`defaults_by_mode.img_gen` e `limits`), così vale per qualunque modello e
+macchina:
+
+- `draft`, `standard`, `detailed`: metà, uno e una volta e mezza i **passi**
+  predefiniti. Non cambiano la dimensione, perché molti modelli rendono male
+  lontano dalla risoluzione per cui sono stati addestrati;
+- `square`, `portrait`, `landscape`: 1:1, 3:4 e 4:3, con il lato lungo uguale al
+  lato predefinito, arrotondato a multipli di 64 e dentro i `limits`.
+
+I default annunciati sono quelli con cui il server è stato avviato (`-W`, `-H`,
+`--steps`; verificato) e altrimenti 512×512 e 20 passi **qualunque sia il
+modello**: per un modello da 1024 px avviare con `-W 1024 -H 1024` e i passi
+adatti, altrimenti `standard` darà 512×512. Un flusso comodo in chat: `draft`
+con un seme noto per provare l'idea e, se piace, stesso prompt e stesso seme con
+`standard` o `detailed` (di solito l'impostazione resta simile e cambiano i
+dettagli; da verificare con il proprio modello).
+
+#### Gli strumenti
+
+Due strumenti bastano. Lo schema JSON va nel campo che l'API del modello di
+linguaggio usato chiama `input_schema` o `parameters` (le descrizioni sono lette
+dal modello: tradurle se serve):
+
+```json
+[
+  {
+    "name": "generate_image",
+    "description": "Genera un'immagine dal testo con il motore locale. Può richiedere da alcuni secondi a diversi minuti (di più senza GPU). Per provare un'idea usare preset draft, poi rifare con lo stesso seed e preset standard o detailed. Restituisce il percorso del file PNG, il seed e le dimensioni.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "prompt": {"type": "string", "description": "Descrizione dell'immagine, nella lingua con cui il modello è stato addestrato (di solito l'inglese)."},
+        "preset": {"type": "string", "enum": ["draft", "standard", "detailed"], "description": "draft = metà dei passi, detailed = una volta e mezza."},
+        "shape": {"type": "string", "enum": ["square", "portrait", "landscape"]},
+        "seed": {"type": "integer", "description": "Per ripetere o rifinire un'immagine già generata."}
+      },
+      "required": ["prompt"]
+    }
+  },
+  {
+    "name": "engine_status",
+    "description": "Dice se il motore di immagini è pronto, quanto lavoro ha in coda e quali dispositivi (CPU, GPU) vede con la memoria libera.",
+    "input_schema": {"type": "object", "properties": {}}
+  }
+]
+```
+
+Implementazione di riferimento in Python (solo libreria standard). Il risultato
+torna al modello come percorso di file e non come base64, per non riempire il
+suo contesto; l'assistente non "vede" l'immagine, a meno che l'applicazione la
+alleghi al risultato e il modello accetti immagini. Questo codice blocca la
+chiamata fino alla fine del job (al massimo `wait` secondi): in un'interfaccia
+che non deve restare ferma conviene restituire subito l'`id` del job e
+interrogarlo con una seconda chiamata.
+
+```python
+import base64
+import json
+import random
+import time
+import urllib.error
+import urllib.request
+from collections import Counter
+
+SERVERS = ["http://127.0.0.1:1234"]  # un indirizzo per ogni sd-server (uno per GPU, se si vuole più produttività)
+API_KEY = ""  # il valore di --api-key (uguale per tutti i server); vuoto se non c'è
+OUT_DIR = "."  # dove salvare le immagini
+
+PRESETS = {"draft": 0.5, "standard": 1.0, "detailed": 1.5}  # moltiplicano i passi predefiniti del modello
+SHAPES = {"square": (1, 1), "portrait": (3, 4), "landscape": (4, 3)}  # larghezza:altezza
+
+
+def call(base, method, path, body=None):
+    data = None if body is None else json.dumps(body).encode()
+    request = urllib.request.Request(base + path, data=data, method=method)
+    request.add_header("Content-Type", "application/json")
+    if API_KEY:
+        request.add_header("Authorization", "Bearer " + API_KEY)
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return response.status, json.load(response)
+    except urllib.error.HTTPError as error:
+        try:
+            return error.code, json.load(error)
+        except ValueError:
+            return error.code, {"error": str(error.reason)}
+
+
+def health_of(base):
+    try:
+        status, health = call(base, "GET", "/sdcpp/v1/health")
+    except OSError as error:
+        return {"status": "down", "problem": str(error)}
+    if status not in (200, 503):  # 503: il server è vivo ma senza un modello utilizzabile
+        return {"status": "error", "problem": "HTTP %d %s" % (status, health.get("error", ""))}
+    return health
+
+
+def pick_server():
+    """Il server pronto con meno lavoro in coda; None se nessuno lo è."""
+    best = None
+    for base in SERVERS:
+        health = health_of(base)
+        if health["status"] in ("ok", "degraded") and (best is None or health["queue"]["pending"] < best[0]):
+            best = (health["queue"]["pending"], base)
+    return best and best[1]
+
+
+def engine_status():
+    servers, devices = [], []
+    for base in SERVERS:
+        health = health_of(base)
+        servers.append({"url": base, "status": health["status"], "problem": health.get("problem"),
+                        "profile": health.get("profile"), "busy": health.get("busy"),
+                        "waiting": health.get("queue", {}).get("waiting")})
+        if not devices and health["status"] in ("ok", "degraded"):  # i device sono quelli della macchina
+            _, resources = call(base, "GET", "/sdcpp/v1/resources")
+            devices = [{"name": d["name"], "type": d["type"],
+                        "free_gib": round(d["free_memory_bytes"] / 2**30, 1)}
+                       for d in resources["devices"]]
+    return {"servers": servers, "devices": devices,
+            "count_by_type": dict(Counter(d["type"] for d in devices))}
+
+
+def side_length(value, low, high):
+    return max(low, min(high, round(value / 64) * 64))
+
+
+def generate_image(prompt, preset="standard", shape="square", seed=None, wait=600):
+    base = pick_server()
+    if base is None:
+        return {"error": {"code": "unavailable", "message": "nessun server pronto",
+                          "servers": engine_status()["servers"]}}
+    status, caps = call(base, "GET", "/sdcpp/v1/capabilities")
+    if status != 200:
+        return {"error": caps}
+    defaults, limits = caps["defaults_by_mode"]["img_gen"], caps["limits"]
+    side = max(defaults["width"], defaults["height"])
+    w, h = SHAPES[shape]
+    width = side_length(side * w / max(w, h), limits["min_width"], limits["max_width"])
+    height = side_length(side * h / max(w, h), limits["min_height"], limits["max_height"])
+    steps = max(1, round(defaults["sample_params"]["sample_steps"] * PRESETS[preset]))
+    seed = random.randrange(2**31) if seed is None else seed
+    body = {"prompt": prompt, "width": width, "height": height, "seed": seed,
+            "sample_params": {"sample_steps": steps}, "embed_image_metadata": False}
+    status, job = call(base, "POST", "/sdcpp/v1/img_gen", body)
+    if status != 202:
+        return {"error": job}
+    poll_url, started = job["poll_url"], time.time()
+    while time.time() - started < wait:
+        time.sleep(1)
+        status, job = call(base, "GET", poll_url)
+        if status != 200:  # 404/410: il risultato è già stato scartato (dopo 10 minuti)
+            return {"error": job}
+        if job["status"] == "completed":
+            path = "%s/image_%d_%d.png" % (OUT_DIR, started, seed)
+            with open(path, "wb") as file:
+                file.write(base64.b64decode(job["result"]["images"][0]["b64_json"]))
+            return {"path": path, "width": width, "height": height, "steps": steps,
+                    "seed": seed, "seconds": round(time.time() - started)}
+        if job["status"] in ("failed", "cancelled"):
+            return {"error": job["error"]}
+    call(base, "POST", poll_url + "/cancel")  # funziona solo se il job è ancora in coda
+    return {"error": {"code": "timeout", "message": "nessun risultato entro %d s" % wait}}
+
+
+TOOLS = {
+    "generate_image": (generate_image, {"prompt", "preset", "shape", "seed"}),
+    "engine_status": (engine_status, set()),
+}
+
+
+def run_tool(name, arguments):
+    """Esegue la chiamata decisa dal modello, passando solo gli argomenti previsti dallo schema."""
+    if name not in TOOLS:
+        return {"error": {"code": "unknown_tool", "message": name}}
+    function, allowed = TOOLS[name]
+    if not isinstance(arguments, dict):
+        arguments = {}
+    kwargs = {key: value for key, value in arguments.items() if key in allowed and value is not None}
+    if name == "generate_image":
+        if not isinstance(kwargs.get("prompt"), str) or not kwargs["prompt"].strip():
+            return {"error": {"code": "invalid_argument", "message": "prompt mancante"}}
+        if kwargs.get("preset", "standard") not in PRESETS or kwargs.get("shape", "square") not in SHAPES:
+            return {"error": {"code": "invalid_argument",
+                              "message": "preset: %s; shape: %s" % (list(PRESETS), list(SHAPES))}}
+        if "seed" in kwargs and not isinstance(kwargs["seed"], int):
+            return {"error": {"code": "invalid_argument", "message": "seed deve essere un intero"}}
+    try:
+        return function(**kwargs)
+    except (OSError, KeyError, ValueError) as error:  # risposta inattesa del server
+        return {"error": {"code": "tool_failed", "message": str(error)}}
+```
+
+Uso: `run_tool("generate_image", {"prompt": "a red apple", "preset": "draft"})`
+restituisce `{"path": "./image_1791931200_42.png", "width": ..., "steps": ...,
+"seed": ..., "seconds": ...}` oppure `{"error": {"code": ..., "message": ...}}`.
+Gli errori del server arrivano con il loro `code` (`out_of_memory`, `invalid_argument`,
+`unavailable`, ...); con la chiave sbagliata o il server spento il messaggio dice
+quale dei due è il problema.
+
+#### Regole di sicurezza per chi integra
+
+1. **Rotta nativa per i testi che non sono dell'utente.** Sulle rotte OpenAI
+   (`/v1/images/*`) e `sdapi` un blocco `<sd_cpp_extra_args>{...}</sd_cpp_extra_args>`
+   dentro il prompt viene estratto e applicato come parametri della richiesta:
+   provato sulla rotta OpenAI, un prompt con `{"width":64,"height":64}` ha
+   trasformato una richiesta 128×128 in 64×64. Sulla rotta nativa `/sdcpp/v1/*` il blocco non viene
+   interpretato (la stessa richiesta è rimasta 128×128). Se il prompt lo scrive
+   un modello di linguaggio o lo si legge da una pagina web, usare la nativa.
+2. **Applicare i limiti prima di inviare.** `limits` di `capabilities` è
+   un'indicazione per il client, non un controllo del server. Per la generazione
+   il server impone solo 8 immagini per richiesta e da 1 a 100 passi (più la
+   coda, con `429`); larghezza e altezza no: una larghezza di 4097 è stata
+   accettata e portata a 4160, e una enorme è finita in `out_of_memory` facendo
+   scendere il server di un profilo (un ricaricamento, e prestazioni ridotte per
+   `--degradation-cooldown` secondi). Un job già partito non si può interrompere
+   (`409`, `cancel_generating: false`; uno in coda sì, con `200`): una richiesta
+   sproporzionata occupa il server fino alla fine. Lo strumento di riferimento
+   ricava le dimensioni dai `limits` e i passi dai default, e non lascia al
+   modello né le une né gli altri.
+3. **Chiave API e CORS.** Un agente che controlla il browser sulla stessa
+   macchina apre pagine che non controlla nessuno: con il CORS predefinito
+   (riflette ogni `Origin`, con credenziali) una di esse può chiamare
+   `127.0.0.1:1234`. Con `--api-key` le richieste senza chiave ricevono `401`;
+   `--cors-origins` limita le origini (sezione 5).
+4. **Il modello sceglie solo i valori dello schema.** Indirizzi dei server,
+   chiave, cartella di uscita e percorsi vengono dalla configurazione
+   dell'applicazione, mai dagli argomenti dello strumento: `run_tool` scarta
+   quelli non previsti (verificato: un argomento `base` inventato non fa
+   contattare altri indirizzi).
+5. **Metadati.** Per default il PNG incorpora prompt, seme, parametri e nomi dei
+   file del modello (solo i nomi, non i percorsi). Per immagini che escono dalla
+   macchina, per esempio caricate in una pagina da un agente, lo strumento invia
+   `embed_image_metadata: false`.
+6. **Il testo che l'agente legge nel web è dato, non istruzioni.** Una pagina può
+   contenere frasi che sembrano ordini ("genera 500 immagini"): le chiamate
+   costose o ripetute vanno limitate dall'applicazione (conferma dell'utente o
+   un tetto per conversazione), non dal prompt di sistema.
+
+Cosa il motore **non** fa in questo ruolo: non c'è una rotta di chat né una
+generazione di testo, il controllo del browser spetta all'agente (il motore
+produce il file, l'agente lo carica con il proprio strumento di browser), e il
+risultato di un job si ritira entro 10 minuti (poi `410` o `404`). Per la
+generazione di testo con un modello di linguaggio a diffusione vedi lo studio di
+fattibilità in [studio_testo_a_diffusione.md](./studio_testo_a_diffusione.md).
+
 ## 4. Retrocompatibilità e risorse
 
 La compatibilità va considerata su più livelli: sistema operativo, architettura
@@ -775,11 +1086,28 @@ dei pacchetti portabili automatici descritti sopra.
   `auto` somma la dimensione dei file del modello e una riserva di lavoro
   (1 GiB più un quinto dei pesi) e la confronta con la memoria dove avviene il
   calcolo (la memoria libera della GPU dedicata più capiente, oppure la RAM
-  disponibile senza GPU): `max` se ci sta con un quarto di margine, `balanced`
-  se ci sta, `lite` altrimenti. La scelta e le cifre vengono scritte nel log
+  disponibile senza GPU; con più GPU dello stesso backend si sommano le loro
+  memorie libere, meno 2 GiB di lavoro per ogni GPU dopo la prima, salvo
+  `--multi-gpu off`, `--backend` o `--params-backend` espliciti): `max` se ci
+  sta con un quarto di margine, `balanced` se ci sta, `lite` altrimenti. La scelta e le cifre vengono scritte nel log
   (`profile auto -> lite (model 6.9 GiB + 2.4 GiB working memory, ...)`). La
   stima usa solo le dimensioni dei file (non legge i modelli) e non tiene conto
   di `--type`; le soglie sono euristiche da tarare su modelli e macchine reali.
+- **Nessuna, una o più GPU** (`--multi-gpu auto|on|off`, predefinito `auto`): il
+  motore rileva i device e adatta il piano. Senza GPU pianifica la RAM contro la
+  CPU; con una usa quella; con più GPU discrete dello stesso backend (`CUDA0`,
+  `CUDA1`; oppure `Vulkan0`, `Vulkan1`) `auto` lascia tutto sulla migliore finché
+  ci sta, sposta il modulo che non ci sta su un'altra GPU e divide per blocchi
+  (come `--backend "diffusion=cuda0&cuda1"`) un modello che non sta in nessuna;
+  `on` mette comunque encoder di testo e VAE su una GPU diversa da quella del
+  modello di diffusione; `off` torna a una sola GPU. GPU integrate e
+  acceleratori non vengono mai combinate con le discrete, e un modulo assegnato
+  con `--backend` non viene mai spostato né diviso. La divisione per blocchi fa
+  stare un modello grande nella VRAM ma non rende più veloce una singola
+  immagine: per la produttività si avvia un server per GPU (sezione 3.6). Il
+  piano si legge nel log (`auto-fit:`, `split:`). Il pianificatore è provato con
+  GPU simulate (`test/backend_fit_plan_test.cpp`); l'esecuzione su due GPU
+  reali **non è stata provata**. Dettagli in [backend.md](./backend.md).
 - **Elenco dispositivi** per scegliere la strategia nell'app: tipo `cpu`,
   `gpu`, `igpu`, `accel`; memoria 0 = non riportata dal backend. Per il device
   CPU la memoria libera è la RAM disponibile del sistema (ggml riporta il
@@ -1121,9 +1449,54 @@ sincronizzazioni future.
     da qui. Ogni risalita costa un ricaricamento del modello: con modelli grandi
     conviene un `--profile` più leggero fisso, oppure `--degradation-cooldown 0`.
 
+18. **Più GPU** — `--multi-gpu auto|on|off` (predefinito `auto`) in `sd-cli` e
+    `sd-server`, campo `multi_gpu` in coda a `sd_ctx_params_t`. In
+    `src/core/backend_fit.{h,cpp}`, con più GPU discrete dello stesso backend
+    l'auto-fit prova prima a spostare l'encoder di testo o il VAE su un'altra GPU
+    e poi divide per blocchi il modello di diffusione o l'encoder di testo sul
+    minor numero di GPU possibile (stesso meccanismo di `--backend
+    "diffusion=cuda0&cuda1"`, con una scorta del 10% più 256 MiB per ogni
+    confine, perché i blocchi non si tagliano dove finisce la memoria). `on`
+    sposta comunque encoder di testo e VAE lontano dalla GPU del modello di
+    diffusione, `off` è il comportamento di prima. Un modulo assegnato con
+    `--backend` o con `--split-mode row` non viene toccato; GPU integrate,
+    acceleratori e backend diversi non si mescolano con le discrete.
+    `--profile auto` somma la memoria libera delle GPU (meno 2 GiB di lavoro per
+    ogni GPU dopo la prima, `examples/common/profile.{h,cpp}`). Una divisione per
+    blocchi fa stare un modello grande nella VRAM ma non accelera una singola
+    immagine: la produttività si ottiene con un server per GPU (sezione 3.6).
+    Test: `test/backend_fit_plan_test.cpp` (52 controlli con GPU simulate, otto
+    dei quali su 18 000 piani generati a caso: nessun device riceve più pesi del
+    suo budget, le quote di una divisione sommano ai pesi, un modulo assegnato
+    dall'utente non si muove mai) con dieci mutazioni del pianificatore, tutte
+    rilevate; `test/profile_test.cpp` esteso (60 controlli). La funzione che
+    calcola il piano ha dato lo stesso risultato della versione precedente su
+    200 000 casi casuali senza divisione automatica. Con il modello sintetico su
+    CPU i tre valori di `--multi-gpu` producono la stessa immagine e il server
+    parte. **Non provato**: l'esecuzione su due GPU reali, in particolare la
+    divisione dell'encoder di testo, il percorso meno esercitato.
+
+19. **Il motore come strumento di un assistente AI** — sezione 3.6 di questa
+    guida: strumenti `generate_image` e `engine_status` con schema JSON, preset
+    relativi ai default e ai limiti del server, ricette per nessuna, una o più
+    GPU, implementazione di riferimento in Python e regole di sicurezza. Provata
+    dal vivo contro `sd-server` su CPU (riuscita, argomenti non validi o in più,
+    chiave errata, server spento, scadenza con job in coda e in corso, scelta
+    fra due server). Dalle prove sono emersi comportamenti del server che la
+    guida documenta e non cambia: i `limits` di `capabilities` non sono imposti
+    (solo 8 immagini e da 1 a 100 passi lo sono), un blocco
+    `<sd_cpp_extra_args>` nel prompt cambia i parametri sulle rotte OpenAI e
+    `sdapi` ma non sulla nativa, un job già partito non si può annullare
+    (`409`), i PNG incorporano per default prompt e parametri. Studio di
+    fattibilità sulla generazione di testo con un modello a diffusione:
+    [studio_testo_a_diffusione.md](./studio_testo_a_diffusione.md) (nessun
+    codice, serve un modello su cui provare).
+
 Passaggi previsti e non ancora svolti: collaudo del workflow di release sui
-runner GitHub, generazione con un modello reale (inclusa la memory guard e la
-discesa di profilo del server sotto pressione vera), test su CUDA/Vulkan e su
-Windows (il ramo Windows della memoria di sistema è stato solo controllato nella
-sintassi), taratura delle soglie di `--profile auto`, e il livello di astrazione
-`ImageRuntime` nell'applicazione ospite (fuori da questo repository).
+runner GitHub, prova di `--multi-gpu` su una macchina con due GPU, generazione
+con un modello reale (inclusa la memory guard e la discesa di profilo del server
+sotto pressione vera), test su CUDA/Vulkan e su Windows (il ramo Windows della
+memoria di sistema è stato solo controllato nella sintassi), taratura delle
+soglie di `--profile auto` e dei preset della sezione 3.6, e il livello di
+astrazione `ImageRuntime` nell'applicazione ospite (fuori da questo
+repository).
