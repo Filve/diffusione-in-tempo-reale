@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./assets/logo.png" width="360x">
+  <img src="./assets/logo-1.png" width="360x">
 </p>
 
 # diffusione-in-tempo-reale
