@@ -559,7 +559,7 @@ namespace sd::pipeline {
 
         for (size_t i = 0; i < final_latents.size(); i++) {
             if (sd->get_cancel_flag() == SD_CANCEL_ALL) {
-                LOG_ERROR("cancelling latent decodings");
+                LOG_INFO("cancelling latent decodings");
                 cancelled = true;
                 break;
             }
@@ -574,7 +574,7 @@ namespace sd::pipeline {
                 }
                 for (int layer_index = 0; layer_index < qwen_image_latent_layers; layer_index++) {
                     if (sd->get_cancel_flag() == SD_CANCEL_ALL) {
-                        LOG_ERROR("cancelling latent decodings");
+                        LOG_INFO("cancelling latent decodings");
                         cancelled = true;
                         break;
                     }
@@ -596,7 +596,7 @@ namespace sd::pipeline {
                 int n_frames = sd->animatediff_num_frames;
                 for (int f = 0; f < n_frames; ++f) {
                     if (sd->get_cancel_flag() == SD_CANCEL_ALL) {
-                        LOG_ERROR("cancelling latent decodings");
+                        LOG_INFO("cancelling latent decodings");
                         cancelled = true;
                         break;
                     }
@@ -623,7 +623,11 @@ namespace sd::pipeline {
         int64_t t4 = ggml_time_ms();
         LOG_INFO("decode_first_stage completed, taking %.2fs", (t4 - t0) * 1.0f / 1000);
         if (decoded_images.empty()) {
-            LOG_ERROR(cancelled ? "cancelled before any latent images were decoded" : "no decoded images");
+            if (cancelled) {
+                LOG_INFO("cancelled before any latent images were decoded");
+            } else {
+                LOG_ERROR("no decoded images");
+            }
             return nullptr;
         }
 
@@ -648,7 +652,7 @@ namespace sd::pipeline {
                                                   const GenerationRequest& request,
                                                   UpscalerGGML* upscaler) {
         if (sd->get_cancel_flag() == SD_CANCEL_ALL) {
-            LOG_ERROR("cancelling hires latent upscale");
+            LOG_INFO("cancelling hires latent upscale");
             return {};
         }
 
@@ -725,7 +729,7 @@ namespace sd::pipeline {
                 return {};
             }
             if (sd->get_cancel_flag() == SD_CANCEL_ALL) {
-                LOG_ERROR("cancelling hires image upscale");
+                LOG_INFO("cancelling hires image upscale");
                 return {};
             }
 
@@ -765,7 +769,7 @@ namespace sd::pipeline {
             }
 
             if (sd->get_cancel_flag() == SD_CANCEL_ALL) {
-                LOG_ERROR("cancelling hires latent encode");
+                LOG_INFO("cancelling hires latent encode");
                 return {};
             }
             sd::Tensor<float> upscaled_latent = sd->encode_first_stage(upscaled_tensor);
@@ -851,7 +855,7 @@ namespace sd::pipeline {
         for (int b = 0; b < request.batch_count; b++) {
             sd_cancel_mode_t cancel = sd->get_cancel_flag();
             if (cancel == SD_CANCEL_ALL) {
-                LOG_ERROR("cancelling generation");
+                LOG_INFO("cancelling generation");
                 return false;
             }
             if (cancel == SD_CANCEL_NEW_LATENTS) {
@@ -901,6 +905,13 @@ namespace sd::pipeline {
                 continue;
             }
 
+            if (sd->get_cancel_flag() == SD_CANCEL_ALL) {
+                LOG_INFO("sampling for image %d/%d cancelled after %.2fs",
+                         b + 1,
+                         request.batch_count,
+                         (sampling_end - sampling_start) * 1.0f / 1000);
+                return false;
+            }
             LOG_ERROR("sampling for image %d/%d failed after %.2fs",
                       b + 1,
                       request.batch_count,
@@ -918,7 +929,7 @@ namespace sd::pipeline {
 
         if (request.hires.enabled && request.hires.target_width > 0) {
             if (sd->get_cancel_flag() == SD_CANCEL_ALL) {
-                LOG_ERROR("cancelling generation before hires fix");
+                LOG_INFO("cancelling generation before hires fix");
                 return false;
             }
             LOG_INFO("hires fix: upscaling to %dx%d", request.hires.target_width, request.hires.target_height);
@@ -926,7 +937,7 @@ namespace sd::pipeline {
             std::unique_ptr<UpscalerGGML> hires_upscaler;
             if (request.hires.upscaler == SD_HIRES_UPSCALER_MODEL) {
                 if (sd->get_cancel_flag() == SD_CANCEL_ALL) {
-                    LOG_ERROR("cancelling generation before hires model load");
+                    LOG_INFO("cancelling generation before hires model load");
                     return false;
                 }
                 LOG_INFO("hires fix: loading model upscaler from '%s'", request.hires.model_path);
@@ -963,7 +974,7 @@ namespace sd::pipeline {
             int64_t hires_denoise_start = ggml_time_ms();
             for (int b = 0; b < (int)final_latents.size(); b++) {
                 if (sd->get_cancel_flag() == SD_CANCEL_ALL) {
-                    LOG_ERROR("cancelling generation during hires fix");
+                    LOG_INFO("cancelling generation during hires fix");
                     return false;
                 }
                 int64_t cur_seed = request.seed + b;
