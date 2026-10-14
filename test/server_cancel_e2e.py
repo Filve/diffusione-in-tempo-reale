@@ -25,6 +25,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 failures = 0
@@ -128,6 +129,34 @@ def wait_ready(client, process, timeout):
     raise Abort("the server was not ready after %d s" % timeout)
 
 
+def post_without_length(base_url, path, api_key):
+    """What `curl -X POST url` sends: a POST with neither a body nor a Content-Length header.
+
+    Python's own clients add Content-Length: 0, so this one is written on a socket. Returns the status, the
+    JSON body (None when it is not JSON) and the seconds the answer took."""
+    parsed = urllib.parse.urlparse(base_url)
+    request = "POST %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n" % (path, parsed.netloc)
+    if api_key:
+        request += "Authorization: Bearer %s\r\n" % api_key
+    request += "\r\n"
+    started = time.time()
+    data = b""
+    with socket.create_connection((parsed.hostname, parsed.port), timeout=60) as sock:
+        sock.sendall(request.encode())
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+    seconds = time.time() - started
+    head, _, payload = data.partition(b"\r\n\r\n")
+    try:
+        body = json.loads(payload.decode())
+    except ValueError:
+        body = None
+    return int(head.split(b" ", 2)[1]), body, seconds
+
+
 def png_looks_valid(image_b64):
     return isinstance(image_b64, str) and image_b64.startswith("iVBORw0KGgo")
 
@@ -191,8 +220,9 @@ def run_scenarios(client, args, mark_log):
     check(status == 200 and body["status"] == "cancelled" and body["started"] is None,
           "a queued job is cancelled at once, without ever starting")
     time.sleep(1.0)
-    status, body, seconds = client.call("POST", "/sdcpp/v1/jobs/%s/cancel?wait=0" % running)
-    check(status in (200, 202) and seconds < 2.0, "?wait=0 answers at once")
+    status, body, seconds = post_without_length(client.base_url, "/sdcpp/v1/jobs/%s/cancel?wait=0" % running, args.api_key)
+    check(status in (200, 202) and seconds < 2.0,
+          "?wait=0 answers at once, also to a POST with no body and no Content-Length (%.2f s)" % seconds)
     if status == 202:
         check(body.get("cancel_requested") is True, "and says the stop is pending")
         check(client.job(running)["status"] in ("generating", "cancelled"),
@@ -229,6 +259,9 @@ def run_scenarios(client, args, mark_log):
           "cancelling a job that already completed leaves it completed")
     status, body, _ = client.call("POST", "/sdcpp/v1/jobs/job_does_not_exist/cancel")
     check(status == 404, "an unknown job is 404")
+    status, body, seconds = post_without_length(client.base_url, "/sdcpp/v1/jobs/%s/cancel" % job_id, args.api_key)
+    check(status == 200 and body is not None and body["status"] == "completed" and seconds < 2.0,
+          "a POST with no body and no Content-Length (what curl -X POST sends) is answered at once (%.2f s)" % seconds)
     for wrong in ("abc", "-1", "1.5", ""):
         status, body, _ = client.call("POST", "/sdcpp/v1/jobs/%s/cancel?wait=%s" % (job_id, wrong))
         check(status == 400, "wait=%r is rejected with 400" % wrong)
