@@ -25,6 +25,7 @@ progetto originale. Modifiche del fork di **Francesco Simeoni**
 - **Errori leggibili dalle app**: `sd_get_last_error()` distingue memoria esaurita, file del modello e backend; `sd_get_system_memory()` riporta la RAM di sistema
 - **Server robusto**: parte anche senza modello, autenticazione opzionale (`--api-key`) e allowlist CORS (`--cors-origins`)
 - **Server che non cade per la memoria**: una richiesta che esaurisce la RAM/VRAM non ferma `sd-server`; il modello viene ricaricato con un profilo più leggero e la richiesta ripetuta, altrimenti risposta `503` con `Retry-After`; `GET /sdcpp/v1/health` e `/resources` mostrano lo stato (`--disable-degradation` per spegnerlo)
+- **Fermare un job che sta generando**: `POST /sdcpp/v1/jobs/{id}/cancel` ferma anche un job già partito (`200` con il job annullato, `202` se sta ancora finendo; `?wait=` da 0 a 60 secondi). Non è un errore: il modello resta caricato, il server non scende di profilo e `/health` conta `cancelled`. Esempi `curl` e limiti in [docs/integrazione_progetti.md](./docs/integrazione_progetti.md), sezione 3.5
 - **Pacchetto portabile**: backend ggml come librerie dinamiche caricate a runtime — un solo zip per macchine vecchie e nuove (`scripts/package_portable.sh`); pacchetti con GPU pronti: Windows CUDA 12 (NVIDIA, DLL incluse), Windows/Linux Vulkan, macOS Metal
 - **Suite di test di sicurezza** in [test/](./test/): file modello ostili, fuzzing, sanitizer
 

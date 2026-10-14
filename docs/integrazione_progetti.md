@@ -684,10 +684,55 @@ Il server **non cade quando la memoria finisce**:
   a creare i thread del server HTTP, esce con codice 1 e un messaggio
   invece di terminare in silenzio;
 - `GET /sdcpp/v1/health` riporta stato (`ok`, `degraded`, `recovering`,
-  `unavailable`, `no_model`), profilo in uso, contatori (richieste, discese,
-  risalite, ricaricamenti), ultimo errore e coda dei job, e risponde subito
-  anche durante una generazione; `GET /sdcpp/v1/resources` riporta RAM del
-  sistema e memoria dei device. Entrambi richiedono la chiave API se impostata.
+  `unavailable`, `no_model`), profilo in uso, contatori (richieste, riuscite,
+  fallite, annullate, discese, risalite, ricaricamenti), ultimo errore e coda dei
+  job, e risponde subito anche durante una generazione;
+  `GET /sdcpp/v1/resources` riporta RAM del sistema e memoria dei device.
+  Entrambi richiedono la chiave API se impostata.
+
+Il server **sa fermare un job che sta generando** (non solo uno in coda):
+
+```shell
+# crea un job; la risposta contiene "id" e "poll_url"
+curl -s -X POST http://127.0.0.1:1234/sdcpp/v1/img_gen \
+     -H "Content-Type: application/json" \
+     -d '{"prompt": "a red apple", "width": 512, "height": 512, "sample_params": {"sample_steps": 30}}'
+
+# fermalo: aspetta fino a 10 secondi che il job finisca davvero
+curl -s -X POST http://127.0.0.1:1234/sdcpp/v1/jobs/job_6acf9114_00000000/cancel
+
+# oppure chiedi lo stop e torna subito, poi controlla con calma
+curl -s -X POST "http://127.0.0.1:1234/sdcpp/v1/jobs/job_6acf9114_00000000/cancel?wait=0"
+curl -s http://127.0.0.1:1234/sdcpp/v1/jobs/job_6acf9114_00000000
+```
+
+- Cosa dice la risposta. `200` = il job è in uno stato finale e la risposta lo
+  contiene (`"status": "cancelled"`, `error.code` `cancelled`). `202` = lo stop è
+  stato chiesto ma il job sta ancora finendo (`"status": "generating"` e
+  `"cancel_requested": true`): richiedi lo stesso `cancel` o interroga
+  `GET /sdcpp/v1/jobs/{id}` finché diventa `cancelled`. Ripetere la richiesta non
+  fa danni. Un job in coda esce subito dalla coda (`200`) e non parte mai; un job
+  già finito resta com'è (`200`); un id sconosciuto è `404`.
+- `?wait=` sono i secondi che la richiesta può aspettare: da `0` (risponde subito)
+  a `60`, predefinito `10`. Un valore che non è un numero intero di secondi dà
+  `400`. La richiesta tiene aperta la connessione per tutto il tempo che aspetta.
+- Quanto ci mette. Il motore controlla lo stop alla fine di ogni passo di
+  campionamento e fra le fasi (testo, decodifica, secondo passaggio): su una macchina
+  lenta un passo dura secondi, e la prima generazione dopo l'avvio può passare
+  molto tempo a leggere i pesi dal disco prima del primo controllo. Se lo stop non
+  basta nel tempo di `wait` la risposta è `202`, non un errore.
+- Se il job finisce prima che lo stop faccia effetto, la risposta è il job
+  completato (`200`, `"status": "completed"`): non c'è niente da fermare.
+- Fermare non è un errore. Il modello non si ricarica, il server non scende a un
+  profilo più leggero, `last_error` non cambia e `/health` conta il job in
+  `counters.cancelled`. Il job successivo parte subito sullo stesso contesto. Un
+  job fermato non restituisce immagini, nemmeno quelle già pronte di un gruppo.
+- Le rotte sincrone (`/sdapi/...`, `/v1/images/...`) non sono job e non si
+  possono fermare: se una di esse aspetta il modello dietro a un job che viene
+  annullato, parte subito dopo e finisce normalmente.
+- Per sapere se un server lo supporta: `features.cancel_generating` in
+  `GET /sdcpp/v1/capabilities`. Un server più vecchio risponde `409` a un job già
+  partito.
 
 Dettagli e formato delle risposte: [examples/server/api.md](../examples/server/api.md).
 
@@ -915,7 +960,7 @@ def generate_image(prompt, preset="standard", shape="square", seed=None, wait=60
                     "seed": seed, "seconds": round(time.time() - started)}
         if job["status"] in ("failed", "cancelled"):
             return {"error": job["error"]}
-    call(base, "POST", poll_url + "/cancel")  # funziona solo se il job è ancora in coda
+    call(base, "POST", poll_url + "/cancel?wait=0")  # ferma il job, anche se sta già generando, senza attendere
     return {"error": {"code": "timeout", "message": "nessun risultato entro %d s" % wait}}
 
 
@@ -969,11 +1014,12 @@ quale dei due è il problema.
    coda, con `429`); larghezza e altezza no: una larghezza di 4097 è stata
    accettata e portata a 4160, e una enorme è finita in `out_of_memory` facendo
    scendere il server di un profilo (un ricaricamento, e prestazioni ridotte per
-   `--degradation-cooldown` secondi). Un job già partito non si può interrompere
-   (`409`, `cancel_generating: false`; uno in coda sì, con `200`): una richiesta
-   sproporzionata occupa il server fino alla fine. Lo strumento di riferimento
-   ricava le dimensioni dai `limits` e i passi dai default, e non lascia al
-   modello né le une né gli altri.
+   `--degradation-cooldown` secondi). Un job già partito si può fermare
+   (`POST /sdcpp/v1/jobs/{id}/cancel`, sezione 3.5), ma lo stop arriva al controllo
+   successivo e le rotte sincrone non si fermano: una richiesta sproporzionata
+   occupa comunque il server per un po'. Lo strumento di riferimento ricava le
+   dimensioni dai `limits` e i passi dai default, e non lascia al modello né le
+   une né gli altri.
 3. **Chiave API e CORS.** Un agente che controlla il browser sulla stessa
    macchina apre pagine che non controlla nessuno: con il CORS predefinito
    (riflette ogni `Origin`, con credenziali) una di esse può chiamare
@@ -1496,8 +1542,8 @@ sincronizzazioni future.
     guida documenta e non cambia: i `limits` di `capabilities` non sono imposti
     (solo 8 immagini e da 1 a 100 passi lo sono), un blocco
     `<sd_cpp_extra_args>` nel prompt cambia i parametri sulle rotte OpenAI e
-    `sdapi` ma non sulla nativa, un job già partito non si può annullare
-    (`409`), i PNG incorporano per default prompt e parametri. Studio di
+    `sdapi` ma non sulla nativa, un job già partito non si poteva annullare
+    (`409`; risolto: voce 21), i PNG incorporano per default prompt e parametri. Studio di
     fattibilità sulla generazione di testo con un modello a diffusione:
     [studio_testo_a_diffusione.md](./studio_testo_a_diffusione.md) (nessun
     codice, serve un modello su cui provare).
@@ -1518,6 +1564,33 @@ sincronizzazioni future.
     HTTP inclusa imposta `SO_REUSEPORT`) e, con un `--backend` scritto a mano,
     `--profile lite` non sposta l'encoder di testo sulla CPU. Nessuna prova su
     una GPU reale.
+
+21. **Annullamento di un job in corso** — `POST /sdcpp/v1/jobs/{id}/cancel`
+    ferma anche un job che sta generando (prima: `409`). Ogni job ha il proprio
+    token di annullamento (`CancelToken`, `examples/server/recovery.{h,cpp}`),
+    registrato nel custode del contesto solo mentre quel job sta generando: lo
+    stop di un job non può raggiungere un'altra richiesta, un job annullato prima
+    di partire non genera niente e un contesto liberato o ricostruito non viene
+    mai toccato. La libreria dimentica una richiesta di stop quando una
+    generazione comincia, quindi la rotta la ripete ogni 100 ms finché il job è
+    finito. Risposta `200` con il job annullato, o `202` con
+    `"cancel_requested": true` se dopo `?wait=` secondi (0-60, predefinito 10)
+    sta ancora finendo. Un job fermato non è un errore: nessuna ricarica del
+    modello, nessuna discesa di profilo, nessun `last_error`, contatore
+    `counters.cancelled` in `/health`; `cancel_generating` è `true` in
+    `/capabilities`. I messaggi della libreria per uno stop voluto passano da
+    ERRORE a INFO. La rotta legge il corpo della richiesta tramite il lettore di
+    contenuti della libreria HTTP: un gestore normale parte solo dopo che il corpo
+    è stato letto, e per un POST senza `Content-Length` (quello di
+    `curl -X POST`) la libreria aspetta 5 secondi di timeout prima di accorgersi
+    che non c'è; così `curl -X POST …/cancel` risponde subito. Test: `test/server_recovery_test.cpp` (149 controlli, con
+    ASan/UBSan e TSan; sette guasti inseriti di proposito nel custode sono tutti
+    rilevati) e `test/server_cancel_e2e.py` (32 controlli su un vero
+    `sd-server`). Provato su CPU con il modello sintetico: lo stop arriva in circa
+    un passo di campionamento, il contesto resta riutilizzabile e una richiesta
+    sincrona in attesa dietro il job annullato finisce normalmente. **Non
+    provato**: l'annullamento su una GPU reale (CUDA/Vulkan) e con un modello
+    video.
 
 Passaggi previsti e non ancora svolti: collaudo del workflow di release sui
 runner GitHub, prova di `--multi-gpu` su una macchina con due GPU, generazione

@@ -161,10 +161,14 @@ Da sapere:
 - Il motore non può chiedere all'altra applicazione di scaricare il suo modello,
   né il contrario: serve qualcuno che coordini (l'utente o il programma
   ospite).
-- `POST /sdcpp/v1/jobs/{id}/cancel` annulla un job **in coda**; su uno **in
-  esecuzione** risponde `409` ("cannot be interrupted yet"). Per fermare una
-  generazione in corso bisogna aspettare che finisca o terminare il processo e
-  perdere il lavoro.
+- `POST /sdcpp/v1/jobs/{id}/cancel` ferma un job **in coda** (subito) e uno **in
+  esecuzione** (al passo di campionamento successivo): risposta `200` con il job
+  annullato, oppure `202` se sta ancora finendo (vedi
+  [integrazione_progetti.md](./integrazione_progetti.md), sezione 3.5). Il modello
+  resta in memoria e il server non scende di profilo, quindi è il modo giusto per
+  fare posto all'altra applicazione senza spegnere il server. Le richieste
+  sincrone (`/sdapi`, `/v1/images`) non sono job e non si fermano; un server più
+  vecchio risponde `409` a un job già partito.
 - Per richieste isolate `sd-cli` è la scelta più semplice: carica il modello,
   genera e restituisce tutto uscendo. Ogni esecuzione paga il caricamento del
   modello.
@@ -282,7 +286,8 @@ momento.
 | `503` `unavailable` | il server sta ricaricando il modello dopo un errore (`cause` dice quale) | riprova dopo `Retry-After` |
 | `503` `busy` | il modello era in uso | riprova dopo `Retry-After` |
 | `429` | coda piena (`queue.max` in `/health`, 64) | riprova dopo `Retry-After` (10 secondi) |
-| `409` su `cancel` | il job sta generando | aspetta o termina il processo |
+| `202` su `cancel` | lo stop è stato chiesto e il job sta ancora finendo (`cancel_requested: true`) | ripeti `cancel` o interroga il job finché diventa `cancelled` |
+| `409` su `cancel` | server più vecchio: il job sta generando e non si può fermare | aspetta o termina il processo |
 | `401` | manca la chiave API | `Authorization: Bearer <chiave>` oppure `X-API-Key` |
 | `400` `invalid_argument` | la richiesta non è generabile così | non ripeterla uguale |
 | `200` dopo una discesa di profilo | servita con un profilo più leggero | `/health` mostra `status: degraded` e il `profile` in uso; dopo `--degradation-cooldown` il server prova a risalire |
