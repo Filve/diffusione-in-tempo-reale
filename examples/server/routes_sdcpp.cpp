@@ -856,7 +856,14 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
         res.set_content(make_async_job_json(manager, *it->second).dump(), "application/json");
     });
 
-    svr.Post(R"(/sdcpp/v1/jobs/([A-Za-z0-9_\-]+)/cancel)", [runtime](const httplib::Request& req, httplib::Response& res) {
+    // The route takes the body through a content reader because it has none: a plain handler is called only after the
+    // HTTP library has read the body, and for a POST without Content-Length (what `curl -X POST` sends) it waits for
+    // its read timeout of 5 seconds to be sure there is none.
+    svr.Post(R"(/sdcpp/v1/jobs/([A-Za-z0-9_\-]+)/cancel)", [runtime](const httplib::Request& req, httplib::Response& res, const httplib::ContentReader& body) {
+        if (req.has_header("Content-Length") || req.has_header("Transfer-Encoding")) {
+            body([](const char*, size_t) { return true; });
+        }
+
         int wait_seconds = k_default_cancel_wait_seconds;
         if (req.has_param("wait") && !parse_cancel_wait(req.get_param_value("wait"), wait_seconds)) {
             res.status = 400;
