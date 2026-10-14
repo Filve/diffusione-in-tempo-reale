@@ -11,6 +11,7 @@ test/*
 !test/profile_test.cpp
 !test/backend_fit_plan_test.cpp
 !test/server_recovery_test.cpp
+!test/server_cancel_e2e.py
 !test/fuzz_model_loader.py
 tests/
 .vscode/
