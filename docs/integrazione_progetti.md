@@ -1046,6 +1046,12 @@ risultato di un job si ritira entro 10 minuti (poi `410` o `404`). Per la
 generazione di testo con un modello di linguaggio a diffusione vedi lo studio di
 fattibilità in [studio_testo_a_diffusione.md](./studio_testo_a_diffusione.md).
 
+Se l'assistente deve essere un agente **indipendente** (decide con il proprio
+giudizio, usa i dati della GPU e del motore, non esegue i comandi alla cieca,
+non si lascia sovraccaricare né sovraccarica la macchina), la guida
+[agenti_indipendenti.md](./agenti_indipendenti.md) ne fa dei requisiti e dà un
+guardiano d'esempio che ferma i job quando la GPU è troppo calda.
+
 ## 4. Retrocompatibilità e risorse
 
 La compatibilità va considerata su più livelli: sistema operativo, architettura
@@ -1592,12 +1598,69 @@ sincronizzazioni future.
     provato**: l'annullamento su una GPU reale (CUDA/Vulkan) e con un modello
     video.
 
+22. **Diagnostica termica** —
+    [scripts/diagnostica_termica/](../scripts/diagnostica_termica/README.md),
+    con la guida in italiano. `termico.py` misura con `nvidia-smi` temperatura,
+    potenza, frequenza e motivi di throttling, a fasi (sessione guidata) o in
+    continuo (`osserva`); con `--motore` affianca sulla stessa linea del tempo
+    lo stato che `sd-server` dichiara in `/health` e `/resources`; scrive un
+    CSV, un riepilogo in JSON (`termico-riepilogo/1`) e un testo; `confronta`
+    mette a fianco più prove (`termico-confronto/1`). Per gli altri programmi
+    `osserva --file-stato` tiene aggiornato un file con l'ultima lettura
+    (`termico-stato/1`, scritto in modo atomico) e `stato` la legge dal
+    terminale con i codici di uscita 0, 1, 2 e 3. `carico_motore.py` fa generare
+    il server di continuo con sempre lo stesso lavoro, per avere un carico
+    ripetibile. Le fasce di temperatura partono dai limiti dichiarati dal driver
+    (attenzione a 10 °C sotto il limite, critica a 3 °C) o, se mancano, da 80 e
+    87 °C; le fasce e i giudizi sono indicativi, e i giudizi compaiono solo per
+    le fasi con il motore, con la chat o con tutti e due e per un'osservazione
+    di almeno 180 secondi. Test: `test/termico_test.py` (127 controlli, circa 80
+    secondi, con una GPU finta che risponde come `nvidia-smi` e un motore
+    finto); provato anche contro un vero `sd-server` su CPU con il modello
+    sintetico (sei job completati e uno fermato, i contatori uguali a quelli di
+    `/health`, nessuna discesa di profilo); 42 errori inseriti di proposito nei
+    due programmi sono stati tutti individuati. **Non provato**: una GPU NVIDIA
+    reale (i formati veri dell'uscita del driver), Windows, computer con più GPU
+    o grafica ibrida, sessioni di molte ore.
+
+23. **Agenti indipendenti accanto al motore** —
+    [agenti_indipendenti.md](./agenti_indipendenti.md): per chi costruisce fuori
+    da questo repository un'IA, un agente o un nodo principale che usa il motore
+    e i dati di `termico.py`. Il motore non è il cervello né un controllo in
+    tempo reale (lavora in secondi e minuti, non in millisecondi); la guida dice
+    come dovrebbe comportarsi chi lo è, come requisiti da controllare e non come
+    programma già pronto: tre livelli (macchina, guardiano deterministico,
+    agente), fedeltà ai comandi flessibile ma non cieca, indipendenza che non
+    esclude lo stop (l'interruttore della persona, `cancel`, chiusura dei
+    propri job all'uscita), giustizia (solo i propri job, stessa regola per gli stessi
+    casi, misura minima, spiegata e contestabile), un dato più vecchio di 10
+    secondi è sconosciuto e non normale, una tabella contro il sovraccarico (un
+    osservatore e molti lettori, intervalli, un job alla volta, scadenze,
+    ritentativi con attesa crescente, interruttore dopo gli errori di fila,
+    tetti al ragionamento, pulizia all'uscita). Include un guardiano d'esempio di 137
+    righe di Python, senza dipendenze, che ferma i job quando la GPU è critica e
+    riparte solo dopo 60 secondi di fila di valori normali. Test:
+    `test/agenti_guardiano_test.py` estrae il codice dal documento e lo esegue:
+    66 controlli con orologio e motore finti (circa 10 secondi) e, con
+    `--server` e `--model`, 25 controlli contro un vero `sd-server` su CPU con
+    `termico.py` e una GPU simulata (circa 2 minuti: GPU critica, job fermato,
+    `/health` con un annullato in più e nessuna discesa di profilo; attesa prima
+    di ripartire; job di un altro programma intatto; osservatore fermo e dati
+    vecchi; file stop); 26 errori inseriti di proposito nel guardiano sono stati
+    tutti individuati. I requisiti di carattere sono requisiti di progetto, non
+    comportamenti dimostrati, e la guida non afferma né esclude che un'IA possa
+    essere senziente. **Non provato**: un agente reale (un modello di
+    linguaggio), una GPU reale, Windows, più macchine, i tempi di reazione con
+    un carico vero.
+
 Passaggi previsti e non ancora svolti: collaudo del workflow di release sui
 runner GitHub, prova di `--multi-gpu` su una macchina con due GPU, generazione
 con un modello reale (inclusa la memory guard e la discesa di profilo del server
 sotto pressione vera), prova della convivenza con un'altra applicazione sulla
 stessa GPU (scenari in [convivenza_applicazioni.md](./convivenza_applicazioni.md),
-sezione 5), test su CUDA/Vulkan e su Windows (il ramo Windows della
+sezione 5), prova di `termico.py` su una GPU NVIDIA reale e su Windows e del
+guardiano della guida sugli agenti con una GPU vera sotto carico, test su
+CUDA/Vulkan e su Windows (il ramo Windows della
 memoria di sistema è stato solo controllato nella sintassi), taratura delle
 soglie di `--profile auto` e dei preset della sezione 3.6, e il livello di
 astrazione `ImageRuntime` nell'applicazione ospite (fuori da questo

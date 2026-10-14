@@ -307,6 +307,12 @@ figlio e mostralo all'utente quando qualcosa va storto. Le righe
 `trying profile ...` dicono cosa il motore ha visto e perché ha ridotto
 qualcosa. Con `-v` il log è più dettagliato.
 
+Se il programma che avvia il motore è un agente che decide con il proprio
+giudizio (un assistente, un modello di linguaggio, un nodo principale), le regole
+di questa sezione valgono anche per lui. Come si comporta, perché non deve
+sovraccaricare né farsi sovraccaricare e come si ferma un job quando la GPU è
+troppo calda sono in [agenti_indipendenti.md](./agenti_indipendenti.md).
+
 ## 5. Provarlo sul proprio PC
 
 È la prova che manca (sezione [6](#6-cosa-è-verificato-e-cosa-no)). Servono il
@@ -322,6 +328,15 @@ motore, l'altra applicazione e un modello per ciascuno.
    Su Linux lo stesso comando, con `| tee -a vram.csv` al posto del
    `ForEach-Object`. Senza una GPU NVIDIA, Gestione attività (Prestazioni, GPU)
    mostra la memoria dedicata e quella condivisa.
+
+   Con una GPU NVIDIA c'è anche un programma pronto,
+   [`termico.py`](../scripts/diagnostica_termica/README.md), che registra la
+   memoria video insieme a temperatura, potenza, frequenza e motivi di
+   throttling, e con `--motore` affianca lo stato che `sd-server` dichiara in
+   `/health` e `/resources`. La sua sessione guidata ha già le fasi di questa
+   prova (solo il motore, solo l'altra applicazione, tutte e due insieme) e
+   alla fine scrive un riepilogo e un file JSON da allegare, se qualcosa va
+   storto, insieme ai log.
 
 2. Ripeti gli scenari e annota i valori:
 
@@ -368,6 +383,9 @@ Verificato, su Linux, **solo CPU**, con un modello sintetico:
 - L'ordine dei dispositivi Vulkan su un portatile con GPU integrata e discreta.
 - Il comportamento del motore con il ripiego sulla RAM dei driver NVIDIA.
 - Il costo del ricaricamento di un modello reale.
+- Quanto si scalda la macchina con il motore e l'altra applicazione accesi per
+  molti minuti: lo misura [`termico.py`](../scripts/diagnostica_termica/README.md),
+  che finora è stato provato solo con una GPU simulata.
 
 ## Fonti
 
