@@ -1,7 +1,7 @@
 // Test of the context keeper of the server (examples/server/recovery.*): the ladder of profiles, stepping
 // down when a request runs out of memory, climbing back, loading the model again after a failure, the
-// HTTP answers for failures, and use from several threads. No model is needed: the library is replaced by
-// scripted answers and the clock by a variable.
+// HTTP answers for failures, stopping a generation that is running, and use from several threads. No model
+// is needed: the library is replaced by scripted answers and the clock by a variable.
 // Build (from the repository root, after building the library into build/); the sources go in one command:
 //   cc -c thirdparty/zip.c -o zip.o
 //   c++ -std=c++17 -Iexamples -Iexamples/server -Iinclude -Ithirdparty -Isrc test/server_recovery_test.cpp
@@ -14,7 +14,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <memory>
+#include <mutex>
 #include <new>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -88,6 +91,11 @@ struct Env {
     Clock::time_point now = Clock::now();
     bool accelerator      = true;
 
+    // The contexts the keeper asked the library to stop, in order. on_cancel runs on the thread that called cancel().
+    std::mutex cancel_mutex;
+    std::vector<sd_ctx_t*> cancel_calls;
+    std::function<void(sd_ctx_t*)> on_cancel;
+
     ContextKeeper::Hooks hooks() {
         ContextKeeper::Hooks hooks;
         hooks.create_context = [this](const sd_ctx_params_t& params, GenerationFailure& failure) -> SDCtxPtr {
@@ -108,6 +116,15 @@ struct Env {
         hooks.read_failure    = [this] { return next_failure; };
         hooks.has_accelerator = [this] { return accelerator; };
         hooks.now             = [this] { return now; };
+        hooks.cancel_context  = [this](sd_ctx_t* ctx) {
+            // Touching the memory of a context the keeper no longer owns is what the address sanitizer reports.
+            reinterpret_cast<volatile char*>(ctx)[63] = 1;
+            std::lock_guard<std::mutex> lock(cancel_mutex);
+            cancel_calls.push_back(ctx);
+            if (on_cancel) {
+                on_cancel(ctx);
+            }
+        };
         return hooks;
     }
 
@@ -124,7 +141,12 @@ struct Seen {
 
 using Script = std::function<GenerationFailure(const ContextKeeper::ContextView&)>;
 
-static bool run_with(ContextKeeper& keeper, Env& env, Seen& seen, const Script& script, GenerationFailure& failure) {
+static bool run_with(ContextKeeper& keeper,
+                     Env& env,
+                     Seen& seen,
+                     const Script& script,
+                     GenerationFailure& failure,
+                     const CancelToken* token = nullptr) {
     return keeper.run(
         [&](const ContextKeeper::ContextView& view) {
             seen.levels.push_back(view.level);
@@ -137,7 +159,8 @@ static bool run_with(ContextKeeper& keeper, Env& env, Seen& seen, const Script& 
             env.next_failure = result;
             return false;
         },
-        failure);
+        failure,
+        token);
 }
 
 static SDContextParams base_params() {
@@ -707,6 +730,339 @@ static void test_threads() {
     CHECK(counter(health, "step_downs") >= 1 && health["status"] == "degraded", "the steps down of one request serve the next ones");
 }
 
+static GenerationFailure cancelled_failure() {
+    return failure_of(SD_ERROR_CANCELLED, "the generation was cancelled");
+}
+
+// Waits (at most five seconds, so that a broken keeper fails the test instead of hanging it) for a flag.
+static bool wait_for(const std::atomic<bool>& flag) {
+    for (int i = 0; i < 5000 && !flag; i++) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return flag;
+}
+
+// A generation on its own thread. It goes on until the library is told to stop it (the cancel hook sets
+// told_to_stop) or until the test lets it finish (release), like a real generation that checks the flag.
+struct Generation {
+    std::atomic<bool> entered{false};
+    std::atomic<bool> told_to_stop{false};
+    std::atomic<bool> release{false};
+    sd_ctx_t* ctx = nullptr;
+    GenerationFailure failure;
+    bool ok = true;
+    std::thread thread;
+};
+
+static void start_generation(ContextKeeper& keeper, Env& env, const CancelToken* token, Generation& gen) {
+    gen.thread = std::thread([&keeper, &env, token, &gen] {
+        gen.ok = keeper.run(
+            [&](const ContextKeeper::ContextView& view) {
+                gen.ctx     = view.ctx;
+                gen.entered = true;
+                for (int i = 0; i < 5000 && !gen.told_to_stop && !gen.release; i++) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+                if (gen.told_to_stop) {
+                    env.next_failure = cancelled_failure();
+                    return false;
+                }
+                return true;
+            },
+            gen.failure,
+            token);
+    });
+}
+
+static void test_cancel() {
+    // A job that is generating is stopped through its token.
+    {
+        Env env;
+        ContextKeeper keeper(base_params(), Level::MAX, settings(), env.hooks());
+        GenerationFailure failure;
+        keeper.start(failure);
+
+        Generation gen;
+        CancelToken token;
+        env.on_cancel = [&gen](sd_ctx_t*) { gen.told_to_stop = true; };
+        start_generation(keeper, env, &token, gen);
+        CHECK(wait_for(gen.entered), "the generation is running");
+        CHECK(keeper.health_json()["busy"] == true, "and the keeper reports it busy");
+
+        const bool told = keeper.cancel(token);
+        gen.thread.join();
+        const json health = keeper.health_json();
+        CHECK(told && token.requested, "cancel() reaches the library while the job generates");
+        CHECK(env.cancel_calls.size() == 1 && env.cancel_calls[0] == gen.ctx, "and tells the context that job is using");
+        CHECK(!gen.ok && gen.failure.code == SD_ERROR_CANCELLED, "the run reports a cancellation");
+        CHECK(counter(health, "cancelled") == 1 && counter(health, "failed") == 0 && counter(health, "succeeded") == 0 &&
+                  counter(health, "requests") == 1,
+              "a cancelled run is counted on its own, not as a failure");
+        CHECK(counter(health, "step_downs") == 0 && env.loads.size() == 1 && health["status"] == "ok",
+              "it does not make the server step down or load the model again");
+        CHECK(health["last_error"].is_null() && health["busy"] == false, "it is not an error of the server, and the keeper is idle");
+        CHECK(!keeper.cancel(token) && env.cancel_calls.size() == 1, "once the job has ended, cancel() reaches nobody");
+
+        Seen seen;
+        CancelToken next;
+        CHECK(run_with(keeper, env, seen, succeed, failure, &next) && seen.contexts.size() == 1 && seen.contexts[0] == gen.ctx,
+              "the next job runs on the same context");
+        CHECK(counter(keeper.health_json(), "succeeded") == 1, "and succeeds");
+        CHECK(!keeper.cancel(next) && env.cancel_calls.size() == 1, "and a stop for it, once it has ended, reaches nobody either");
+    }
+
+    // A stop request that arrives before the job reaches the context: the job generates nothing.
+    {
+        Env env;
+        ContextKeeper keeper(base_params(), Level::MAX, settings(), env.hooks());
+        GenerationFailure failure;
+        keeper.start(failure);
+
+        CancelToken token;
+        CHECK(!keeper.cancel(token) && token.requested, "with nothing running, cancel() only records the request");
+        CHECK(env.cancel_calls.empty(), "and the library is not told");
+        Seen seen;
+        const bool ok     = run_with(keeper, env, seen, succeed, failure, &token);
+        const json health = keeper.health_json();
+        CHECK(!ok && failure.code == SD_ERROR_CANCELLED && seen.levels.empty(), "a job cancelled before it starts generates nothing");
+        CHECK(counter(health, "cancelled") == 1 && counter(health, "failed") == 0 && health["busy"] == false,
+              "and counts as cancelled");
+    }
+
+    // A job nobody wants any more does not cost a reload of the model.
+    {
+        Env env;
+        env.accelerator = false;
+        ContextKeeper keeper(base_params(), Level::MAX, settings(), env.hooks());
+        GenerationFailure failure;
+        keeper.start(failure);
+        Seen first;
+        run_with(keeper, env, first, [](const ContextKeeper::ContextView& view) { return view.level < Level::LITE ? oom() : ok_result; }, failure);
+        const size_t loads = env.loads.size();
+        env.advance(100);
+
+        CancelToken token;
+        keeper.cancel(token);
+        Seen seen;
+        run_with(keeper, env, seen, succeed, failure, &token);
+        CHECK(env.loads.size() == loads && counter(keeper.health_json(), "promotions") == 0,
+              "a cancelled job does not trigger the climb back to a heavier profile");
+        Seen later;
+        run_with(keeper, env, later, succeed, failure);
+        CHECK(env.loads.size() == loads + 1 && later.levels == std::vector<Level>({Level::BALANCED}),
+              "the next job does");
+    }
+
+    // A stop and a failure that the server would recover from: the stop wins.
+    {
+        Env env;
+        ContextKeeper keeper(base_params(), Level::MAX, settings(), env.hooks());
+        GenerationFailure failure;
+        keeper.start(failure);
+
+        CancelToken token;
+        Seen seen;
+        const Script cancel_then_fail = [&](const ContextKeeper::ContextView&) {
+            keeper.cancel(token);
+            return oom();
+        };
+        const bool ok     = run_with(keeper, env, seen, cancel_then_fail, failure, &token);
+        const json health = keeper.health_json();
+        CHECK(!ok && failure.code == SD_ERROR_CANCELLED, "a job cancelled while it ran out of memory is reported as cancelled");
+        CHECK(env.loads.size() == 1 && counter(health, "step_downs") == 0 && seen.levels.size() == 1,
+              "and the model is not loaded again for a job nobody waits for");
+        CHECK(counter(health, "cancelled") == 1 && counter(health, "failed") == 0, "it is counted as cancelled");
+    }
+
+    // A stop that arrives while the model is being loaded again: the job does not run on the new context.
+    {
+        Env env;
+        CancelToken token;
+        env.load_result = [&](const Load& load) {
+            if (load.level() == Level::BALANCED) {
+                token.requested = true;
+            }
+            return ok_result;
+        };
+        ContextKeeper keeper(base_params(), Level::MAX, settings(), env.hooks());
+        GenerationFailure failure;
+        keeper.start(failure);
+
+        Seen seen;
+        const bool ok     = run_with(keeper, env, seen, [](const ContextKeeper::ContextView&) { return oom(); }, failure, &token);
+        const json health = keeper.health_json();
+        CHECK(!ok && failure.code == SD_ERROR_CANCELLED, "a job cancelled while the model is loaded again is reported as cancelled");
+        CHECK(seen.levels.size() == 1, "and it does not run again on the new context");
+        CHECK(counter(health, "step_downs") == 1 && health["profile"] == "balanced" && counter(health, "cancelled") == 1 &&
+                  counter(health, "failed") == 0,
+              "the server stays on the profile it loaded, and counts the job as cancelled");
+    }
+
+    // The library reports a cancellation: never a failure of the server, whoever asked.
+    {
+        Env env;
+        ContextKeeper keeper(base_params(), Level::MAX, settings(), env.hooks());
+        GenerationFailure failure;
+        keeper.start(failure);
+        Seen seen;
+        const bool ok     = run_with(keeper, env, seen, [](const ContextKeeper::ContextView&) { return cancelled_failure(); }, failure);
+        const json health = keeper.health_json();
+        CHECK(!ok && failure.code == SD_ERROR_CANCELLED && counter(health, "cancelled") == 1 && counter(health, "failed") == 0,
+              "a cancellation reported without a token is still not a failure");
+        CHECK(env.loads.size() == 1 && health["last_error"].is_null(), "and leaves no error behind");
+    }
+
+    // A stop for one job never reaches another request.
+    {
+        Env env;
+        ContextKeeper keeper(base_params(), Level::MAX, settings(), env.hooks());
+        GenerationFailure failure;
+        keeper.start(failure);
+
+        Generation gen;  // a synchronous request: no token
+        env.on_cancel = [&gen](sd_ctx_t*) { gen.told_to_stop = true; };
+        start_generation(keeper, env, nullptr, gen);
+        CHECK(wait_for(gen.entered), "a request without a token is running");
+        CancelToken other;
+        CHECK(!keeper.cancel(other) && env.cancel_calls.empty() && !gen.told_to_stop,
+              "a stop for a job that is not running does not reach it");
+        gen.release = true;
+        gen.thread.join();
+        CHECK(gen.ok && counter(keeper.health_json(), "succeeded") == 1, "which finishes normally");
+    }
+
+    // The library forgets a stop request when a generation begins, so the caller repeats it.
+    {
+        Env env;
+        ContextKeeper keeper(base_params(), Level::MAX, settings(), env.hooks());
+        GenerationFailure start_failure;
+        keeper.start(start_failure);
+
+        std::atomic<bool> entered{false};
+        std::atomic<bool> first_seen{false};
+        std::atomic<bool> forgotten{false};
+        std::atomic<bool> second_seen{false};
+        env.on_cancel = [&](sd_ctx_t*) {
+            if (!first_seen) {
+                first_seen = true;
+            } else {
+                second_seen = true;
+            }
+        };
+        CancelToken token;
+        GenerationFailure failure;
+        bool ok = true;
+        std::thread generation([&] {
+            ok = keeper.run(
+                [&](const ContextKeeper::ContextView&) {
+                    entered = true;
+                    wait_for(first_seen);
+                    forgotten = true;  // what the library does at the start of generate_image()
+                    if (!wait_for(second_seen)) {
+                        return true;
+                    }
+                    env.next_failure = cancelled_failure();
+                    return false;
+                },
+                failure,
+                &token);
+        });
+        wait_for(entered);
+        keeper.cancel(token);
+        wait_for(forgotten);
+        keeper.cancel(token);
+        generation.join();
+        CHECK(!ok && failure.code == SD_ERROR_CANCELLED, "a request repeated after the library forgot the first one stops the job");
+        CHECK(env.cancel_calls.size() == 2, "every call reaches the library while the job runs");
+    }
+}
+
+// Stops arrive from other threads while jobs run, fail and make the server rebuild its context. Under the
+// address sanitizer a stop that reached a released context is reported by the hook of Env.
+static void test_cancel_threads() {
+    Env env;
+    env.accelerator = false;
+    ContextKeeper keeper(base_params(), Level::MAX, settings(), env.hooks());
+    GenerationFailure start_failure;
+    keeper.start(start_failure);
+
+    constexpr int kThreads = 4;
+    constexpr int kJobs    = 40;
+    std::vector<std::unique_ptr<CancelToken>> tokens;
+    for (int i = 0; i < kThreads * kJobs; i++) {
+        tokens.push_back(std::make_unique<CancelToken>());
+        // Every fifth job is cancelled before it reaches the keeper, whatever the threads do.
+        tokens.back()->requested = i % 5 == 0;
+    }
+
+    std::atomic<int> inside{0};
+    std::atomic<int> max_inside{0};
+    std::atomic<bool> done{false};
+    std::atomic<int> succeeded{0};
+    std::atomic<int> failed{0};
+    std::atomic<int> cancelled{0};
+
+    std::thread canceller([&] {
+        std::mt19937 rng(1234);
+        while (!done) {
+            keeper.cancel(*tokens[rng() % tokens.size()]);
+            (void)keeper.health_json();
+        }
+    });
+
+    std::vector<std::thread> workers;
+    for (int t = 0; t < kThreads; t++) {
+        workers.emplace_back([&, t] {
+            for (int i = 0; i < kJobs; i++) {
+                const CancelToken& token = *tokens[t * kJobs + i];
+                GenerationFailure failure;
+                const bool ok = keeper.run(
+                    [&](const ContextKeeper::ContextView& view) {
+                        const int now_inside = ++inside;
+                        int seen_max         = max_inside.load();
+                        while (now_inside > seen_max && !max_inside.compare_exchange_weak(seen_max, now_inside)) {
+                        }
+                        for (int step = 0; step < 4 && !token.requested; step++) {
+                            std::this_thread::sleep_for(std::chrono::microseconds(100));
+                        }
+                        --inside;
+                        if (token.requested) {
+                            env.next_failure = cancelled_failure();
+                            return false;
+                        }
+                        if ((i + t) % 7 == 0 && view.level < Level::LITE) {
+                            env.next_failure = oom();
+                            return false;
+                        }
+                        return true;
+                    },
+                    failure,
+                    &token);
+                if (ok) {
+                    succeeded++;
+                } else if (failure.code == SD_ERROR_CANCELLED) {
+                    cancelled++;
+                } else {
+                    failed++;
+                }
+            }
+        });
+    }
+    for (auto& worker : workers) {
+        worker.join();
+    }
+    done = true;
+    canceller.join();
+
+    const json health = keeper.health_json();
+    CHECK(max_inside.load() == 1, "with stops arriving, still never two generations at the same time");
+    CHECK(succeeded + failed + cancelled == kThreads * kJobs && counter(health, "requests") == kThreads * kJobs,
+          "every job ends as succeeded, failed or cancelled");
+    CHECK(counter(health, "succeeded") == succeeded && counter(health, "failed") == failed && counter(health, "cancelled") == cancelled,
+          "and the counters of the keeper agree with what the callers saw");
+    CHECK(cancelled >= kThreads * kJobs / 5 && health["busy"] == false, "the jobs cancelled beforehand were stopped, and the keeper is idle at the end");
+}
+
 int main() {
     sd_set_log_callback([](enum sd_log_level_t, const char*, void*) {}, nullptr);
 
@@ -718,6 +1074,8 @@ int main() {
     test_reporting();
     test_backend_choice();
     test_threads();
+    test_cancel();
+    test_cancel_threads();
 
     printf("\n%s (%d failures)\n", failures ? "TEST FAILED" : "ALL TESTS PASSED", failures);
     return failures ? 1 : 0;
