@@ -34,6 +34,7 @@ controllato:
 | Pacchetto portabile | backend ggml come librerie dinamiche caricate a runtime: un solo pacchetto, ogni macchina usa ciò che ha | opzionale in build |
 | Release automatiche | workflow `release-portable.yml`: zip con GPU (Windows CUDA 12 e Vulkan, Linux Vulkan, macOS Metal) a ogni tag `portable-v*` o avvio manuale | su tag |
 | Uso da parte di assistenti AI | sezione 3.6: strumenti (`generate_image`, `engine_status`), preset, ricette per nessuna, una o più GPU e regole di sicurezza per chat e agenti che controllano il browser | documentazione |
+| Convivenza con altre applicazioni | guida [convivenza_applicazioni.md](./convivenza_applicazioni.md): risorse condivise con una chat locale o un altro programma, ricette (dispositivi separati, a turni, insieme con un budget), contratto per chi avvia il motore da un altro programma, prova da fare sul proprio PC | documentazione |
 | Suite di test | `test/`: smoke di sicurezza, robustezza API, fuzzer del caricamento modelli, pianificatore multi-GPU con GPU simulate | manuale |
 
 L'unico cambio di comportamento predefinito rispetto a upstream è il fallback
@@ -1113,6 +1114,15 @@ dei pacchetti portabili automatici descritti sopra.
   CPU la memoria libera è la RAM disponibile del sistema (ggml riporta il
   totale su Linux e macOS). Su Linux la RAM disponibile viene da
   `/proc/meminfo` e non conosce il limite di memoria di un container.
+- **Altre applicazioni sulla stessa macchina** (una chat con un modello locale,
+  un altro generatore): il motore condivide con loro memoria video, tempo di
+  calcolo, RAM, core e una porta TCP. Legge la memoria libera all'avvio
+  (`--profile auto`) e ne controlla la pressione mentre lavora
+  (`--memory-guard`), ma non restituisce la memoria da inattivo e non limita il
+  calcolo della GPU. Ricette, contratto per chi lo avvia da un altro programma e
+  prova da fare sul proprio PC in
+  [convivenza_applicazioni.md](./convivenza_applicazioni.md); non è stata
+  provata su una GPU reale.
 - **Altri motori** (MNN, ncnn, ONNX Runtime): non sono integrati in questo
   repository, perché tutto il motore è basato su ggml. Vanno trattati come
   implementazioni alternative in un livello di astrazione dell'applicazione.
@@ -1491,11 +1501,30 @@ sincronizzazioni future.
     fattibilità sulla generazione di testo con un modello a diffusione:
     [studio_testo_a_diffusione.md](./studio_testo_a_diffusione.md) (nessun
     codice, serve un modello su cui provare).
+20. **Convivenza con altre applicazioni** —
+    [convivenza_applicazioni.md](./convivenza_applicazioni.md): guida generica,
+    valida per qualunque programma che stia accanto al motore (chat locale,
+    altro generatore, editor, gioco). Elenca le risorse condivise (memoria
+    video, tempo di calcolo della GPU, RAM, core, disco, porta), cosa il motore
+    fa già (`--profile auto` una volta all'avvio, `--auto-fit`,
+    `--memory-guard`, scala di recupero del server) e cosa no (nessuna
+    restituzione della memoria da inattivo, nessun limite di calcolo,
+    `--profile auto` che guarda la GPU più libera anche con `--backend` fisso),
+    tre ricette (dispositivi separati, a turni, insieme con un budget), il
+    contratto minimo per chi avvia il motore da un altro programma e gli
+    scenari da provare su un PC con GPU. Dalle prove su CPU sono emersi due
+    comportamenti che la guida documenta e non cambia: su Linux due `sd-server`
+    possono mettersi in ascolto sulla stessa porta senza errore (la libreria
+    HTTP inclusa imposta `SO_REUSEPORT`) e, con un `--backend` scritto a mano,
+    `--profile lite` non sposta l'encoder di testo sulla CPU. Nessuna prova su
+    una GPU reale.
 
 Passaggi previsti e non ancora svolti: collaudo del workflow di release sui
 runner GitHub, prova di `--multi-gpu` su una macchina con due GPU, generazione
 con un modello reale (inclusa la memory guard e la discesa di profilo del server
-sotto pressione vera), test su CUDA/Vulkan e su Windows (il ramo Windows della
+sotto pressione vera), prova della convivenza con un'altra applicazione sulla
+stessa GPU (scenari in [convivenza_applicazioni.md](./convivenza_applicazioni.md),
+sezione 5), test su CUDA/Vulkan e su Windows (il ramo Windows della
 memoria di sistema è stato solo controllato nella sintassi), taratura delle
 soglie di `--profile auto` e dei preset della sezione 3.6, e il livello di
 astrazione `ImageRuntime` nell'applicazione ospite (fuori da questo
