@@ -281,6 +281,15 @@ What it does and does not do:
 - Only discrete GPUs of the same backend are combined. Integrated GPUs share the
   system RAM, and a CUDA GPU cannot share a module with a Vulkan one; in that case
   the log says so and only the best GPU is used unless modules are assigned with `--backend`.
+- A card that two backends list counts once. With the CUDA and the Vulkan builds
+  installed side by side, an NVIDIA card is both `CUDA0` and `Vulkan0`. Listings that
+  report the same PCI bus id are one GPU: the vendor's backend keeps it, and the Vulkan
+  or OpenCL listing appears in the plan as `same GPU as CUDA0, not used automatically`.
+  It can still be named with `--backend`. A backend that reports no PCI bus id is not matched.
+- An integrated GPU is the main device only when no graphics card has memory left.
+  Its memory is the system RAM, so it reports more than a card does, and it computes
+  several times slower. Weights are never parked in it either, because that is the
+  same RAM the plan has just found too small.
 - A module assigned with `--backend` is never moved or split, and a module whose
   `--split-mode` is `row` is never split automatically. An explicit
   `--params-backend` disables auto-fit, and with it this planning.
