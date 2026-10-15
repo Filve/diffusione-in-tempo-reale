@@ -37,6 +37,11 @@ static Device make_gpu(const std::string& name, const char* registry, double fre
     return device;
 }
 
+static Device with_id(Device device, const char* device_id) {
+    device.device_id = device_id;
+    return device;
+}
+
 // staging is the size of the largest tensor of a module, which the compute device must be able to hold at once.
 static std::vector<Component> make_components(double dit_gib, double te_gib, double vae_gib, int64_t te_staging = 256 * MiB, int64_t vae_staging = 128 * MiB) {
     return {
@@ -265,6 +270,227 @@ static void check_random_machines() {
     CHECK(legacy_changed == 0, "random machines: off, a single GPU, and a plan that already fits change nothing");
 }
 
+// Machines with several backends installed side by side: the same card is listed by CUDA and by Vulkan, and an
+// integrated GPU reports the shared system RAM as its own memory.
+static void check_mixed_backends() {
+    const char* const card_id = "0000:01:00.0";
+    const char* const igpu_id = "0000:05:00.0";
+
+    {
+        const std::vector<Device> card_and_igpu = {make_gpu("Vulkan0", "Vulkan", 5), make_gpu("Vulkan1", "Vulkan", 7.5, false)};
+        CHECK(select_main_device(card_and_igpu) == 0, "a graphics card is the main device even when an integrated GPU reports more memory");
+        const std::vector<Device> card_full = {make_gpu("Vulkan0", "Vulkan", 0.3), make_gpu("Vulkan1", "Vulkan", 7.5, false)};
+        CHECK(select_main_device(card_full) == 1, "an integrated GPU is the main device when no graphics card has a budget");
+        CHECK(select_main_device({make_gpu("Vulkan0", "Vulkan", 7.5, false)}) == 0, "and when it is the only GPU");
+        CHECK(select_main_device({}) == SIZE_MAX && select_main_device({make_gpu("CUDA0", "CUDA", 0.2)}) == SIZE_MAX,
+              "without a GPU, or without one that has a budget, there is no main device");
+        const std::vector<Device> cards = {make_gpu("CUDA0", "CUDA", 8), make_gpu("CUDA1", "CUDA", 12), make_gpu("Vulkan0", "Vulkan", 30, false)};
+        CHECK(select_main_device(cards) == 1, "among graphics cards the largest budget still wins");
+    }
+
+    {
+        std::vector<Device> listed = {with_id(make_gpu("CUDA0", "CUDA", 5), card_id),
+                                      with_id(make_gpu("Vulkan0", "Vulkan", 5), card_id),
+                                      with_id(make_gpu("Vulkan1", "Vulkan", 7.5, false), igpu_id)};
+        mark_shadowed_devices(listed);
+        CHECK(listed[0].shadowed_by.empty() && listed[1].shadowed_by == "CUDA0" && listed[2].shadowed_by.empty(),
+              "a card listed by CUDA and by Vulkan is one GPU: the Vulkan listing is shadowed by the CUDA one");
+        CHECK(has_own_memory(listed[0]) && !has_own_memory(listed[1]) && !has_own_memory(listed[2]),
+              "only the CUDA listing counts as memory of its own: not its Vulkan twin, not the integrated GPU");
+        CHECK(device_note(listed[1]) == " (same GPU as CUDA0, not used automatically)" && device_note(listed[2]) == " (shares the system memory)" &&
+                  device_note(listed[0]).empty(),
+              "the plan says which listing is not used and why");
+
+        std::vector<Device> reversed = {listed[2], listed[1], listed[0]};
+        for (Device& device : reversed) {
+            device.shadowed_by.clear();
+        }
+        mark_shadowed_devices(reversed);
+        CHECK(reversed[1].shadowed_by == "CUDA0" && reversed[2].shadowed_by.empty(), "the backend keeps the card whatever the order of the listing");
+
+        std::vector<Device> chain = {with_id(make_gpu("Vulkan0", "Vulkan", 8), card_id), with_id(make_gpu("OpenCL0", "OpenCL", 8), card_id),
+                                     with_id(make_gpu("CUDA0", "CUDA", 8), card_id), make_gpu("Vulkan1", "Vulkan", 8)};
+        mark_shadowed_devices(chain);
+        CHECK(chain[0].shadowed_by == "CUDA0" && chain[1].shadowed_by == "CUDA0" && chain[2].shadowed_by.empty(),
+              "a card listed by three backends is kept by the vendor's own");
+        CHECK(chain[3].shadowed_by.empty(), "and a listing without a PCI id is never matched with another");
+
+        std::vector<Device> same_backend = {with_id(make_gpu("Vulkan0", "Vulkan", 8), card_id), with_id(make_gpu("Vulkan1", "Vulkan", 8), card_id)};
+        mark_shadowed_devices(same_backend);
+        CHECK(same_backend[0].shadowed_by.empty() && same_backend[1].shadowed_by == "Vulkan0", "two listings by the same backend: the first one keeps the card");
+
+        std::vector<Device> unknown = {make_gpu("CUDA0", "CUDA", 12), make_gpu("Vulkan0", "Vulkan", 12)};
+        mark_shadowed_devices(unknown);
+        CHECK(unknown[0].shadowed_by.empty() && unknown[1].shadowed_by.empty(), "devices that report no PCI id are left as they are");
+    }
+
+    {
+        // A laptop with a graphics card (5 GiB free) next to an integrated GPU (7.5 GiB of shared RAM), CUDA and
+        // Vulkan both installed, Pony-sized weights, the text encoder on the CPU. The integrated GPU used to be the
+        // main device and took the whole model, which then ran several times slower than on the card.
+        std::vector<Device> devices = {with_id(make_gpu("CUDA0", "CUDA", 5), card_id),
+                                       with_id(make_gpu("Vulkan0", "Vulkan", 5), card_id),
+                                       with_id(make_gpu("Vulkan1", "Vulkan", 7.5, false), igpu_id)};
+        mark_shadowed_devices(devices);
+        const std::vector<Component> components = make_components(4.8, 1.5, 0.15);
+        const size_t main_device                = select_main_device(devices);
+        CHECK(main_device == 0, "laptop with two backends: the main device is the card, seen through CUDA");
+
+        const Runtime on_main{devices[main_device].name, {main_device}};
+        const Outcome out = run(components, devices, MultiGpuMode::AUTO, 3, {false, true, false}, {}, {on_main, Runtime{"CPU", {}}, on_main});
+        CHECK(unchanged(out) && out.notes.empty(), "and the planner finds nothing to move, and nothing to say about other backends");
+        CHECK(out.plan.decisions[0].params_location == ParamsLocation::DISK,
+              "the diffusion weights, too big for the card and for the RAM budget, wait on disk");
+        CHECK(out.plan.decisions[1].params_location == ParamsLocation::CPU && out.plan.decisions[2].params_location == ParamsLocation::CPU,
+              "the text encoder and the VAE wait in RAM");
+        bool parked_on_gpu = false;
+        for (const Decision& decision : out.plan.decisions) {
+            parked_on_gpu = parked_on_gpu || decision.params_location == ParamsLocation::OTHER_GPU;
+        }
+        CHECK(!parked_on_gpu, "no weights are parked in the memory of the integrated GPU, which is the RAM that was found too small");
+    }
+
+    {
+        const std::vector<Device> card_and_igpu = {make_gpu("CUDA0", "CUDA", 12), make_gpu("Vulkan0", "Vulkan", 30, false)};
+        const std::vector<Runtime> on_card(3, Runtime{"CUDA0", {0}});
+        const Plan on_disk = compute_plan(make_components(20, 2, 0.3), card_and_igpu, 0, on_card);
+        CHECK(on_disk.decisions[0].params_location == ParamsLocation::DISK,
+              "weights that fit neither the card nor RAM wait on disk, not in an integrated GPU's shared memory");
+        const Plan in_ram = compute_plan(make_components(20, 2, 0.3), card_and_igpu, 64 * GiB, on_card);
+        CHECK(in_ram.decisions[0].params_location == ParamsLocation::CPU, "and wait in RAM when there is room");
+
+        const std::vector<Device> two_cards = {make_gpu("CUDA0", "CUDA", 12), make_gpu("CUDA1", "CUDA", 12)};
+        const Plan other_card               = compute_plan(make_components(11, 0, 0), two_cards, 0, on_card);
+        CHECK(other_card.decisions[0].params_location == ParamsLocation::OTHER_GPU && other_card.decisions[0].params_device == 1,
+              "weights still wait in the memory of a second graphics card when the first cannot keep them resident");
+    }
+
+    {
+        std::vector<Device> card = {with_id(make_gpu("CUDA0", "CUDA", 8), card_id), with_id(make_gpu("Vulkan0", "Vulkan", 8), card_id)};
+        mark_shadowed_devices(card);
+        const std::vector<Runtime> on_vulkan(3, Runtime{"Vulkan0", {1}});
+        const Plan plan = compute_plan(make_components(6.5, 0, 0), card, 0, on_vulkan);
+        CHECK(plan.decisions[0].params_location == ParamsLocation::DISK,
+              "a module the user put on the Vulkan listing does not park its weights in the same card's CUDA memory");
+    }
+
+    {
+        // Two cards, each listed by CUDA and by Vulkan; Vulkan reports slightly more memory than CUDA does.
+        std::vector<Device> rig = {with_id(make_gpu("Vulkan1", "Vulkan", 12.02), "0000:02:00.0"), with_id(make_gpu("CUDA0", "CUDA", 12), "0000:01:00.0"),
+                                   with_id(make_gpu("Vulkan0", "Vulkan", 12.02), "0000:01:00.0"), with_id(make_gpu("CUDA1", "CUDA", 12), "0000:02:00.0")};
+        mark_shadowed_devices(rig);
+        CHECK(rig[select_main_device(rig)].name == "CUDA0", "a Vulkan listing that reports a little more memory than CUDA does not become the main device");
+        const Outcome out = run(make_components(16, 2, 0.3), rig, MultiGpuMode::AUTO);
+        CHECK(out.runtimes[0].name == "CUDA0&CUDA1" && resident(out.plan, 0) && !mentions(out, "different backends"),
+              "two cards, each listed twice: the diffusion model is split across the two CUDA devices, and the Vulkan twins are not mentioned");
+    }
+}
+
+// Random machines with a card listed by one or two backends and sometimes an integrated GPU, in a random order:
+// whatever the plan, nothing is placed on a listing that is not the GPU's own.
+static void check_random_mixed_backends() {
+    std::mt19937 rng(2024);
+    auto pick = [&](double lo, double hi) { return std::uniform_real_distribution<double>(lo, hi)(rng); };
+
+    int plans = 0, with_twins = 0, with_igpu = 0, parked = 0;
+    int shadowed_main = 0, igpu_main = 0, bad_group = 0, on_shadowed = 0, bad_parking = 0, over_budget = 0;
+    std::string first_problem;
+
+    for (int round = 0; round < 4000; ++round) {
+        std::vector<Device> devices;
+        const int cards = 1 + (int)(rng() % 3);
+        for (int i = 0; i < cards; ++i) {
+            const std::string id = "0000:0" + std::to_string(i + 1) + ":00.0";
+            const double memory  = pick(2, 24);
+            const bool native    = rng() % 3 != 0;
+            const bool twin      = !native || rng() % 2 == 0;
+            if (native) {
+                devices.push_back(with_id(make_gpu("CUDA" + std::to_string(i), "CUDA", memory), id.c_str()));
+            }
+            if (twin) {
+                devices.push_back(with_id(make_gpu("Vulkan" + std::to_string(i), "Vulkan", memory + pick(-0.05, 0.05)), id.c_str()));
+            }
+            with_twins += native && twin ? 1 : 0;
+        }
+        if (rng() % 2 == 0) {
+            devices.push_back(with_id(make_gpu("Vulkan" + std::to_string(cards), "Vulkan", pick(2, 40), false), "0000:0f:00.0"));
+            ++with_igpu;
+        }
+        std::shuffle(devices.begin(), devices.end(), rng);
+        mark_shadowed_devices(devices);
+
+        const size_t main_device = select_main_device(devices);
+        auto problem             = [&](const char* what) {
+            if (first_problem.empty()) {
+                first_problem = std::string(what) + " (round " + std::to_string(round) + ")";
+            }
+        };
+        if (main_device == SIZE_MAX || !devices[main_device].shadowed_by.empty()) {
+            ++shadowed_main;
+            problem("the main device is missing or shadowed");
+            continue;
+        }
+        if (!devices[main_device].discrete) {
+            ++igpu_main;
+            problem("an integrated GPU is the main device although a graphics card has a budget");
+        }
+        const std::vector<size_t> group = multi_gpu_group(devices);
+        for (size_t di : group) {
+            if (!has_own_memory(devices[di]) || devices[di].registry != devices[group.front()].registry) {
+                ++bad_group;
+                problem("the multi-GPU group holds a shadowed or integrated device, or mixes backends");
+            }
+        }
+
+        const std::vector<Component> components = make_components(pick(0.5, 40), rng() % 5 == 0 ? 0 : pick(0.2, 12), pick(0.1, 2));
+        const int64_t ram_gib                   = (int64_t)pick(0, 32);
+        for (MultiGpuMode mode : {MultiGpuMode::AUTO, MultiGpuMode::ON, MultiGpuMode::OFF}) {
+            const Outcome out = run(components, devices, mode, ram_gib);
+            ++plans;
+            const std::vector<int64_t> used = weights_per_device(components, devices, out);
+            for (size_t di = 0; di < devices.size(); ++di) {
+                if (used[di] + reserve_per_device(components, di, out) > devices[di].budget_bytes) {
+                    ++over_budget;
+                    problem("a device is given more than its budget");
+                }
+            }
+            for (size_t ci = 0; ci < components.size(); ++ci) {
+                for (size_t di : out.plan.runtimes[ci].devices) {
+                    if (!devices[di].shadowed_by.empty()) {
+                        ++on_shadowed;
+                        problem("a module was placed on a listing of a card that another backend lists");
+                    }
+                }
+                const Decision& decision = out.plan.decisions[ci];
+                if (decision.params_location != ParamsLocation::OTHER_GPU) {
+                    continue;
+                }
+                ++parked;
+                const Device& target = devices[decision.params_device];
+                bool computes_there  = false;
+                for (size_t di : out.plan.runtimes[ci].devices) {
+                    computes_there = computes_there || di == decision.params_device || devices[di].device_id == target.device_id;
+                }
+                if (!has_own_memory(target) || computes_there) {
+                    ++bad_parking;
+                    problem("weights were parked on an integrated GPU, a shadowed listing, or the card the module computes on");
+                }
+            }
+        }
+    }
+
+    printf("      %d plans, %d cards listed by two backends, %d integrated GPUs, %d weights parked on another GPU\n", plans, with_twins, with_igpu, parked);
+    if (!first_problem.empty()) {
+        printf("      first problem: %s\n", first_problem.c_str());
+    }
+    CHECK(with_twins > 0 && with_igpu > 0 && parked > 0, "mixed backends: the cases cover twin listings, integrated GPUs and weights parked on another GPU");
+    CHECK(shadowed_main == 0 && igpu_main == 0, "mixed backends: the main device is always a graphics card listed once, never an integrated GPU while a card has a budget");
+    CHECK(bad_group == 0, "mixed backends: the multi-GPU group holds only graphics cards of one backend, each listed once");
+    CHECK(on_shadowed == 0, "mixed backends: no module is ever placed on the second listing of a card");
+    CHECK(bad_parking == 0, "mixed backends: weights are only parked in the memory of another graphics card");
+    CHECK(over_budget == 0, "mixed backends: no device is given more weights than its budget less the compute reserve");
+}
+
 int main() {
     MultiGpuMode mode = MultiGpuMode::OFF;
     CHECK(parse_multi_gpu_mode("", mode) && mode == MultiGpuMode::AUTO, "an empty --multi-gpu means auto");
@@ -394,10 +620,11 @@ int main() {
     }
     {
         const std::vector<Device> with_igpu = {make_gpu("CUDA0", "CUDA", 8), make_gpu("CUDA1", "CUDA", 8), make_gpu("Vulkan0", "Vulkan", 30, false)};
-        const Outcome out                   = run(make_components(6, 2, 0.3), with_igpu, MultiGpuMode::AUTO);
+        const std::vector<Runtime> on_igpu(3, Runtime{"Vulkan0", {2}});
+        const Outcome out = run(make_components(6, 2, 0.3), with_igpu, MultiGpuMode::AUTO, 0, {}, {}, on_igpu);
         CHECK(unchanged(out) && same_names(out, "Vulkan0", "Vulkan0", "Vulkan0"), "an integrated GPU keeps the modules it hosts when they fit");
         CHECK(mentions(out, "everything fits on Vulkan0, so CUDA0, CUDA1 will not be used"), "and the note names the device that hosts them");
-        const Outcome big = run(make_components(40, 2, 0.3), with_igpu, MultiGpuMode::AUTO, 64);
+        const Outcome big = run(make_components(40, 2, 0.3), with_igpu, MultiGpuMode::AUTO, 64, {}, {}, on_igpu);
         CHECK(big.runtimes[0].name == "Vulkan0" && !resident(big.plan, 0), "and is never part of a split");
     }
     {
@@ -431,7 +658,9 @@ int main() {
               "the split diffusion model keeps its place when the text encoder and the VAE cannot move next to it");
     }
 
+    check_mixed_backends();
     check_random_machines();
+    check_random_mixed_backends();
 
     printf("\n%s (%d failures)\n", failures ? "TEST FAILED" : "ALL TESTS PASSED", failures);
     return failures ? 1 : 0;
