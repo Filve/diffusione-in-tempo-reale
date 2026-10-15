@@ -1393,20 +1393,25 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
         }
         last_n_threads = std::max(1, static_cast<int>(workers.size()));
 
+        // Completion is polled every millisecond; only the progress line keeps its own cadence. Sleeping a whole
+        // progress interval here added up to 200 ms to every load, which dominates when weights are streamed.
+        const int64_t progress_interval_ms = total_tensors_to_process <= 4 ? 10 : 200;
+        int64_t next_progress_ms           = 0;
         while (true) {
             size_t current_idx = tensor_idx.load();
             if (current_idx >= tensors_to_process.size() || failed) {
                 break;
             }
-            size_t curr_num       = total_tensors_processed + current_idx;
-            float elapsed_seconds = (ggml_time_ms() - t_start) / 1000.0f;
-            if (log_progress && total_tensors_to_process > 0) {
+            const int64_t now_ms = ggml_time_ms();
+            if (log_progress && total_tensors_to_process > 0 && now_ms >= next_progress_ms) {
+                size_t curr_num = total_tensors_processed + current_idx;
                 pretty_bytes_progress(static_cast<int>(curr_num),
                                       static_cast<int>(total_tensors_to_process),
                                       bytes_processed.load(),
-                                      elapsed_seconds);
+                                      (now_ms - t_start) / 1000.0f);
+                next_progress_ms = now_ms + progress_interval_ms;
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(total_tensors_to_process <= 4 ? 10 : 200));
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
 
         for (auto& w : workers) {
