@@ -142,6 +142,15 @@ Da sapere:
   GPU del motore se il modello non sta nella prima. Per tenere il motore su una
   GPU sola: `--multi-gpu off`. Un modulo assegnato con `--backend` non viene mai
   spostato.
+- **CUDA e Vulkan nella stessa cartella** (per esempio per avere anche la GPU
+  AMD): la stessa scheda NVIDIA compare due volte, come `CUDA0` e `Vulkan0`. Il
+  motore la riconosce dall'indirizzo PCI che entrambi i backend riportano, la
+  conta una volta e usa CUDA; nel piano la riga di `Vulkan0` dice
+  `same GPU as CUDA0, not used automatically`. La GPU integrata (`Vulkan1` su un
+  portatile AMD) non viene scelta finché una scheda ha memoria libera, perché la
+  sua «memoria» è la RAM di sistema, e non ospita mai i pesi. Si possono
+  comunque nominare con `--backend`. Non aggiunge velocità: il motore non
+  divide un modulo fra backend diversi.
 - **La GPU integrata** usa la RAM di sistema: per `--profile auto` non conta
   come memoria veloce (contano solo GPU discrete e acceleratori), e per una
   chat sulla GPU integrata la risorsa contesa è la RAM, non la memoria video.
@@ -381,6 +390,9 @@ Verificato, su Linux, **solo CPU**, con un modello sintetico:
 - La convivenza con una chat reale (llama.cpp, LM Studio, WebGPU).
 - Windows: condivisione della porta, chiusura del processo figlio.
 - L'ordine dei dispositivi Vulkan su un portatile con GPU integrata e discreta.
+- La corrispondenza degli indirizzi PCI fra CUDA e Vulkan su una macchina reale
+  (la riga `same GPU as` nel piano): la logica è provata solo con dispositivi
+  simulati.
 - Il comportamento del motore con il ripiego sulla RAM dei driver NVIDIA.
 - Il costo del ricaricamento di un modello reale.
 - Quanto si scalda la macchina con il motore e l'altra applicazione accesi per

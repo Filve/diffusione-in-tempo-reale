@@ -44,6 +44,8 @@ namespace sd::backend_fit {
         std::string name;
         std::string description;
         std::string registry;
+        std::string device_id;
+        std::string shadowed_by;
         bool discrete        = false;
         int64_t free_bytes   = 0;
         int64_t budget_bytes = 0;
@@ -132,6 +134,43 @@ namespace sd::backend_fit {
         return name;
     }
 
+    // A GPU with memory of its own, listed once: not an integrated GPU, whose memory is the system RAM, and not the
+    // second listing of a card that a preferred backend already lists.
+    static bool has_own_memory(const Device& device) {
+        return device.discrete && device.shadowed_by.empty();
+    }
+
+    // Backends built on a generic graphics API rank after the backend the GPU vendor provides.
+    static int registry_rank(const std::string& registry) {
+        return registry == "Vulkan" || registry == "OpenCL" ? 1 : 0;
+    }
+
+    // A GPU is listed once per backend that supports it: an NVIDIA card is both CUDA0 and Vulkan0. Counting it twice
+    // makes a plan promise memory that exists once, so the listings that share a PCI bus id are reduced to the one
+    // of the best-ranked backend, and the others are marked as shadowed by it. They stay in the list, because the
+    // user can still name them. Devices whose backend reports no PCI bus id cannot be matched and are left alone.
+    static void mark_shadowed_devices(std::vector<Device>& devices) {
+        auto preferred_over = [&](size_t a, size_t b) {
+            const int rank_a = registry_rank(devices[a].registry);
+            const int rank_b = registry_rank(devices[b].registry);
+            return rank_a < rank_b || (rank_a == rank_b && a < b);
+        };
+        for (size_t di = 0; di < devices.size(); ++di) {
+            if (devices[di].device_id.empty()) {
+                continue;
+            }
+            size_t owner = di;
+            for (size_t other = 0; other < devices.size(); ++other) {
+                if (devices[other].device_id == devices[di].device_id && preferred_over(other, owner)) {
+                    owner = other;
+                }
+            }
+            if (owner != di) {
+                devices[di].shadowed_by = devices[owner].name;
+            }
+        }
+    }
+
     static std::vector<Device> enumerate_gpu_devices(const sd::ggml_graph_cut::MaxVramAssignment& budgets,
                                                      bool include_other_devices) {
         std::vector<Device> out;
@@ -148,6 +187,11 @@ namespace sd::backend_fit {
             device.discrete    = type == GGML_BACKEND_DEVICE_TYPE_GPU;
             if (ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev)) {
                 device.registry = ggml_backend_reg_name(reg);
+            }
+            ggml_backend_dev_props props{};
+            ggml_backend_dev_get_props(dev, &props);
+            if (props.device_id != nullptr) {
+                device.device_id = props.device_id;
             }
             size_t free_bytes = 0, total_bytes = 0;
             ggml_backend_dev_memory(dev, &free_bytes, &total_bytes);
@@ -167,6 +211,7 @@ namespace sd::backend_fit {
             }
             out.push_back(std::move(device));
         }
+        mark_shadowed_devices(out);
         return out;
     }
 
@@ -201,11 +246,18 @@ namespace sd::backend_fit {
         return -1;
     }
 
+    // The device with the largest budget, preferring a graphics card. An integrated GPU reports the shared system
+    // RAM as its memory, which is more than a card has but computes several times slower, so it is chosen only when
+    // no card has a budget. The second listing of a card that another backend lists is never chosen.
     static size_t select_main_device(const std::vector<Device>& devices) {
         size_t main_device = SIZE_MAX;
         for (size_t di = 0; di < devices.size(); ++di) {
-            if (devices[di].budget_bytes > 0 &&
-                (main_device == SIZE_MAX || devices[di].budget_bytes > devices[main_device].budget_bytes)) {
+            if (devices[di].budget_bytes <= 0 || !devices[di].shadowed_by.empty()) {
+                continue;
+            }
+            if (main_device == SIZE_MAX || devices[di].discrete > devices[main_device].discrete ||
+                (devices[di].discrete == devices[main_device].discrete &&
+                 devices[di].budget_bytes > devices[main_device].budget_bytes)) {
                 main_device = di;
             }
         }
@@ -271,6 +323,12 @@ namespace sd::backend_fit {
             const auto& runtime_devices = plan.runtimes[ci].devices;
             return std::find(runtime_devices.begin(), runtime_devices.end(), di) != runtime_devices.end();
         };
+        auto uses_gpu = [&](size_t ci, size_t di) {
+            const auto& runtime_devices = plan.runtimes[ci].devices;
+            return std::any_of(runtime_devices.begin(), runtime_devices.end(), [&](size_t used) {
+                return used == di || (!devices[di].device_id.empty() && devices[used].device_id == devices[di].device_id);
+            });
+        };
         auto headroom_for = [&](size_t ci, size_t di) {
             // Higher-priority offloaded weights need cache space on their compute devices.
             int64_t headroom = 0;
@@ -330,10 +388,16 @@ namespace sd::backend_fit {
                 continue;
             }
 
+            // Weights wait on another GPU only if the memory there is that GPU's own: not the system RAM an
+            // integrated GPU shares, which the RAM budget above has just found too small, and not the card the
+            // module computes on, seen through another backend.
             size_t best = SIZE_MAX;
             for (size_t di = 0; di < devices.size(); ++di) {
+                if (!has_own_memory(devices[di]) || uses_gpu(ci, di)) {
+                    continue;
+                }
                 const int64_t headroom = headroom_for(ci, di);
-                if (!uses_device(ci, di) && headroom <= remaining[di] && comp.params_bytes <= remaining[di] - headroom &&
+                if (headroom <= remaining[di] && comp.params_bytes <= remaining[di] - headroom &&
                     (best == SIZE_MAX || remaining[di] > remaining[best])) {
                     best = di;
                 }
@@ -367,6 +431,13 @@ namespace sd::backend_fit {
         return text;
     }
 
+    static std::string device_note(const Device& device) {
+        if (!device.shadowed_by.empty()) {
+            return " (same GPU as " + device.shadowed_by + ", not used automatically)";
+        }
+        return device.discrete ? "" : " (shares the system memory)";
+    }
+
     static void print_plan(const Plan& plan,
                            const std::vector<Component>& components,
                            const std::vector<Device>& devices,
@@ -375,9 +446,10 @@ namespace sd::backend_fit {
         LOG_INFO("auto-fit plan:");
         LOG_INFO("  devices:");
         for (const Device& device : devices) {
-            LOG_INFO("    %-12s %-32s free %6lld MiB, budget %6lld MiB",
+            LOG_INFO("    %-12s %-32s free %6lld MiB, budget %6lld MiB%s",
                      device.name.c_str(), device.description.c_str(),
-                     (long long)(device.free_bytes / MiB), (long long)(device.budget_bytes / MiB));
+                     (long long)(device.free_bytes / MiB), (long long)(device.budget_bytes / MiB),
+                     device_note(device).c_str());
         }
         if (free_ram < 0) {
             LOG_WARN("auto-fit: available RAM is unknown; skipping CPU parameter residency");
@@ -494,9 +566,10 @@ namespace sd::backend_fit {
     }
 
     // The discrete GPUs of the backend that has the GPU with the most memory, largest budget first. Integrated
-    // GPUs share the system RAM and GPUs of another backend would need their own runtime, so neither is included.
+    // GPUs share the system RAM and GPUs of another backend would need their own runtime, so neither is included,
+    // and a card is included once even when two backends list it.
     static std::vector<size_t> multi_gpu_group(const std::vector<Device>& devices) {
-        auto usable = [&](size_t di) { return devices[di].discrete && devices[di].budget_bytes > 0; };
+        auto usable = [&](size_t di) { return has_own_memory(devices[di]) && devices[di].budget_bytes > 0; };
         size_t best = SIZE_MAX;
         for (size_t di = 0; di < devices.size(); ++di) {
             if (usable(di) && (best == SIZE_MAX || devices[di].budget_bytes > devices[best].budget_bytes)) {
@@ -549,7 +622,7 @@ namespace sd::backend_fit {
         if (group.size() < 2) {
             size_t discrete = 0;
             for (const Device& device : devices) {
-                discrete += device.discrete && device.budget_bytes > 0 ? 1 : 0;
+                discrete += has_own_memory(device) && device.budget_bytes > 0 ? 1 : 0;
             }
             if (discrete >= 2) {
                 notes.push_back(
