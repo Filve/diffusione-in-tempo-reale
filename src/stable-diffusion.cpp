@@ -355,6 +355,7 @@ void sd_ctx_params_init(sd_ctx_params_t* sd_ctx_params) {
     sd_ctx_params->pulid_weights_path        = nullptr;
     sd_ctx_params->memory_guard              = 0;
     sd_ctx_params->disable_backend_fallback  = false;
+    sd_ctx_params->multi_gpu                 = nullptr;
 }
 
 char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
@@ -398,6 +399,7 @@ char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
              "backend: %s\n"
              "params_backend: %s\n"
              "split_mode: %s\n"
+             "multi_gpu: %s\n"
              "model_args: %s\n"
              "auto_fit: %s\n"
              "disable_backend_fallback: %s\n"
@@ -441,6 +443,7 @@ char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
              SAFE_STR(sd_ctx_params->backend),
              SAFE_STR(sd_ctx_params->params_backend),
              SAFE_STR(sd_ctx_params->split_mode),
+             SAFE_STR(sd_ctx_params->multi_gpu),
              SAFE_STR(sd_ctx_params->model_args),
              BOOL_STR(sd_ctx_params->auto_fit),
              BOOL_STR(sd_ctx_params->disable_backend_fallback),

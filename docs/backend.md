@@ -65,9 +65,10 @@ sd-cli -m model.safetensors -p "a cat" --backend "diffusion=cuda0&cuda1"
 ```
 
 The module's transformer blocks are then distributed across the listed devices
-in contiguous ranges sized proportionally to each device's free memory (minus a
-compute-buffer headroom of about 2 GiB per device), and the
-module's graphs are executed with a `ggml_backend_sched` that runs each block
+in contiguous ranges: the first device takes blocks until its free memory (minus a
+compute-buffer headroom of about 2 GiB, and any `--max-vram` limit) is used up,
+then the next device, and so on. The module's graphs are executed with a
+`ggml_backend_sched` that runs each block
 on the device holding its weights, copying the residual stream at the range
 boundaries. The first device in the list is the module's main device: it also
 holds the non-block tensors (embeddings, final norms, small sub-runners such as
@@ -159,10 +160,11 @@ regardless of argument order, even with `--auto-fit on`.
 
 Auto-fit preserves explicit `--backend` assignments, including per-module
 assignments and device lists. For modules without a runtime assignment, it chooses
-the GPU with the largest available memory budget (the first device on a tie).
-It then derives parameter placements from the model metadata, each module's
-compute devices, and the remaining memory budgets. The chosen backend
-specifications are printed.
+the GPU with the largest available memory budget (the first device on a tie); with
+several GPUs of the same backend it can also move or split modules across them, see
+[Several GPUs](#several-gpus---multi-gpu-autoonoff). It then derives parameter
+placements from the model metadata, each module's compute devices, and the remaining
+memory budgets. The chosen backend specifications are printed.
 
 ```shell
 sd-cli -m model.safetensors -p "a cat" --auto-fit on
@@ -209,7 +211,9 @@ weight to be copied again at every step.
 
 RAM and GPU budgets are shared across components. Each component uses a single
 parameter backend; several other GPUs' capacities are not combined to store
-one component. If available RAM cannot be queried, RAM residency is skipped.
+one component (a module that auto-fit splits across GPUs, see below, keeps its
+weights on those GPUs instead). If available RAM cannot be queried, RAM residency
+is skipped.
 
 Without a GPU (a CPU-only machine, or every GPU backend unavailable) the same
 planning runs against the CPU: the diffusion model, text encoder and VAE are
@@ -226,12 +230,12 @@ execution. CPU modules use RAM or disk. Compute reserves and cache priority are
 accounted for separately on each device, so a CPU module does not reserve GPU
 space. Storage on another module's GPU also leaves room for that module's work.
 
-Auto-fit does not select multi-GPU layer/row computation itself. Explicit device
-lists and `--split-mode` still control that computation. Before the runners have
-built their split plans, auto-fit conservatively counts the full component size
-on each listed GPU when checking residency and cache space. This can offload
-parameters even when a split layout would fit; use `--auto-fit off` to keep the
-default split-device parameter placement.
+Explicit device lists and `--split-mode` still control the computation of the
+modules they name. Before the runners have built their split plans, auto-fit
+conservatively counts the full component size on each listed GPU when checking
+residency and cache space. This can offload parameters even when a split layout
+would fit; use `--auto-fit off` to keep the default split-device parameter
+placement, or leave the module out of `--backend` and let `--multi-gpu` split it.
 
 For example, a diffusion model whose full weights exceed the main GPU's budget
 can use `--backend diffusion=cuda0 --params-backend diffusion=cpu` when RAM is
@@ -249,6 +253,48 @@ component to CPU computation solely because its full weights exceed VRAM.
 If a VAE decode fails, decoding retries with spatial tiling even when `--auto-fit`
 is off; supported video decoders try temporal tiling first and can then add
 spatial tiling. Spatial retries use half-size tiles along each latent dimension.
+
+### Several GPUs (`--multi-gpu auto|on|off`)
+
+With more than one discrete GPU of the same backend (`CUDA0` and `CUDA1`, or
+`Vulkan0` and `Vulkan1`), auto-fit also decides which of them runs which module.
+`--multi-gpu` selects how far it goes and defaults to `auto`:
+
+| Value | Behavior |
+| --- | --- |
+| `auto` | Everything that fits stays on the GPU with the largest budget. A module that does not fit there next to the modules placed before it moves to the first other GPU that can hold it (in practice the text encoder or the VAE, because the diffusion model has priority). A diffusion model or text encoder that fits on no single GPU is split across the fewest GPUs that can hold it, as with `--backend "diffusion=cuda0&cuda1"`. |
+| `on` | As `auto`, and in addition the text encoder and the VAE run on a GPU other than the one running the diffusion model even when everything would fit on one, so the diffusion model keeps its GPU's memory for itself. |
+| `off` | One GPU, as before this option existed. |
+
+```shell
+sd-cli -m model.safetensors -p "a cat"                    # auto: uses the second GPU only if the model needs it
+sd-cli -m model.safetensors -p "a cat" --multi-gpu on     # also puts the text encoder and the VAE on the second GPU
+sd-cli -m model.safetensors -p "a cat" --multi-gpu off    # only the best GPU
+```
+
+The plan the log prints shows the result: `split:` lines give the share of the
+weights on each GPU, and `auto-fit:` notes say which module moved and why, or
+that the other GPUs stay idle because everything already fits on one.
+
+What it does and does not do:
+
+- Only discrete GPUs of the same backend are combined. Integrated GPUs share the
+  system RAM, and a CUDA GPU cannot share a module with a Vulkan one; in that case
+  the log says so and only the best GPU is used unless modules are assigned with `--backend`.
+- A module assigned with `--backend` is never moved or split, and a module whose
+  `--split-mode` is `row` is never split automatically. An explicit
+  `--params-backend` disables auto-fit, and with it this planning.
+- The split is a layer split: whole transformer blocks run on one GPU after
+  another. It lets a model that does not fit in one GPU's memory stay in VRAM
+  instead of streaming from RAM or disk, but a single image is not generated faster
+  by a second GPU. To use several GPUs for throughput, run one process (or
+  `sd-server`) per GPU, each with its own `--backend cudaN`.
+- The planner is conservative about a split: the free memory of the GPUs, less the compute
+  reserve of each, must exceed the weights by 10% plus 256 MiB for every boundary between
+  GPUs, because blocks cannot be cut exactly where the memory ends. When it does not,
+  the module keeps its old placement (parameters in RAM or on disk).
+- `--profile auto` counts the free memory of the GPUs together (less 2 GiB of
+  working memory for each GPU after the first) when `--multi-gpu` is not `off`.
 
 ## Modules
 

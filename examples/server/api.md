@@ -497,6 +497,7 @@ Field types:
 | `result` | `object \| null` |
 | `error` | `object \| null` |
 | `preview` | `object \| null` |
+| `cancel_requested` | `boolean`, present (and `true`) only while a job that is generating has been asked to stop |
 
 `preview` sub-fields:
 
@@ -714,6 +715,11 @@ Fields returned in `features_by_mode.vid_gen`:
 - `cancel_generating`
 - `preview`
 
+`cancel_queued` and `cancel_generating` tell whether [`POST /sdcpp/v1/jobs/{id}/cancel`](#post-sdcppv1jobsidcancel)
+can stop a job that is waiting and one that is generating. Both are `true` in this version; a client that must also
+talk to older servers checks `cancel_generating` before offering a stop button, because an older server answers `409`
+for a job that has started.
+
 #### `GET /sdcpp/v1/health`
 
 Reports whether the server can generate and how it is coping with the memory of the machine. It never waits for a
@@ -733,6 +739,7 @@ Example response:
     "requests": 12,
     "succeeded": 11,
     "failed": 1,
+    "cancelled": 3,
     "recovered": 2,
     "step_downs": 3,
     "promotions": 1,
@@ -763,7 +770,7 @@ Example response:
 | `base_profile` | `string` | Profile the server was started with |
 | `degradation` | `boolean` | `false` with `--disable-degradation` |
 | `busy` | `boolean` | A generation is running |
-| `counters` | `object` | Since the start. `requests`, `succeeded`, `failed`; `recovered` is the number of requests served after a step-down; `step_downs`, `promotions`, `failed_promotions` and `rebuilds` (times the model was loaded again) |
+| `counters` | `object` | Since the start. `requests`, `succeeded`, `failed`; `cancelled` is the number of generations stopped on request (not failures, and they never make the server step down); `recovered` is the number of requests served after a step-down; `step_downs`, `promotions`, `failed_promotions` and `rebuilds` (times the model was loaded again). A job cancelled while it was still queued never reaches the model and is not counted |
 | `last_error` | `object \| null` | Last failure the server saw (`code`, `message`, `at` as a Unix time). Invalid requests are not recorded |
 | `next_promotion_seconds` | `integer \| null` | Seconds until the next attempt to climb back; `null` when the server is on its base profile or does not climb |
 | `uptime_seconds` | `integer` | |
@@ -894,14 +901,88 @@ Notes:
 
 #### `POST /sdcpp/v1/jobs/{id}/cancel`
 
-Attempts to cancel an accepted job.
+Stops a job, whether it is still waiting in the queue or already generating. There is no body: the URL is enough,
+and `curl -X POST <url>` works as it is.
+
+What happens depends on the state of the job:
+
+| State of the job | What the server does | Answer |
+| --- | --- | --- |
+| `queued` | Takes it out of the queue; it never starts. | `200` with the job, `status: "cancelled"` |
+| `generating` | Tells the library to stop and waits for the job to end. | `200` with the job (`status: "cancelled"`) as soon as it has ended; `202` with the job (`status: "generating"`, `"cancel_requested": true`) if it is still stopping after `wait` seconds |
+| `completed`, `failed`, `cancelled` | Nothing to stop. | `200` with the job as it is |
+| unknown id | | `404`; `410` if the job existed but was removed after its retention time |
+
+Query parameter:
+
+| Parameter | Type | Notes |
+| --- | --- | --- |
+| `wait` | `integer` | Whole seconds the call may wait for a generating job to end: `0` to `60`, default `10`. `0` asks for the stop and answers at once; a larger number is shortened to `60`. Anything that is not a whole number of seconds, 0 or more, is `400`. |
+
+Example, stopping a job and reading the answer:
+
+```shell
+curl -s -X POST http://127.0.0.1:1234/sdcpp/v1/jobs/job_6acf9114_00000000/cancel
+```
+
+```json
+{
+  "id": "job_6acf9114_00000000",
+  "kind": "img_gen",
+  "status": "cancelled",
+  "created": 1775401200,
+  "started": 1775401203,
+  "completed": 1775401209,
+  "queue_position": 0,
+  "result": null,
+  "error": { "code": "cancelled", "message": "job cancelled by client" }
+}
+```
+
+When the job is still stopping at the end of the wait, the answer is `202` and the job is still `generating`:
+
+```json
+{
+  "id": "job_6acf9114_00000000",
+  "kind": "img_gen",
+  "status": "generating",
+  "cancel_requested": true,
+  "created": 1775401200,
+  "started": 1775401203,
+  "completed": null,
+  "queue_position": 0,
+  "result": null,
+  "error": null
+}
+```
+
+Keep polling `GET /sdcpp/v1/jobs/{id}` (`cancel_requested` stays visible while the job is generating) or send the
+same request again: repeating it is harmless.
 
 Typical status codes:
 
-- `200 OK`
+- `200 OK`: the job is in a final state (the answer carries it)
+- `202 Accepted`: the stop was requested and the job had not ended yet
+- `400 Bad Request`: invalid `wait`
 - `404 Not Found`
-- `409 Conflict`
+- `409 Conflict`: only for a queued job that left the queue at the very moment of the request; ask again
 - `410 Gone`
+
+Notes:
+
+- A generation stops at its next check: at the end of the sampling step it is in, and between the stages around it
+  (encoding the prompt, decoding the image, a second pass). On a slow machine one step can take seconds, and the
+  first generation after the start can spend a long time reading the weights before it reaches a check, so the stop
+  may need longer than `wait`. That is what the `202` is for.
+- If the job finishes before the stop takes effect, the answer is the finished job: `200` with
+  `status: "completed"` and its result.
+- A stopped job returns no images, not even the ones of a batch that were already done.
+- A stop is not a failure. The model is not loaded again, the server does not step down to a lighter profile, nothing
+  is recorded in `last_error`, and [`GET /sdcpp/v1/health`](#get-sdcppv1health) counts it in `counters.cancelled`.
+  The next job runs on the same context.
+- Only the jobs of this API can be stopped. The synchronous endpoints (`/sdapi/...`, `/v1/images/...`) are not jobs:
+  a request that is waiting for the model behind a job that gets cancelled simply runs afterwards, as usual.
+- The call keeps its HTTP connection open for up to `wait` seconds.
 
 ### Request Body
 
@@ -1193,7 +1274,7 @@ A job that failed for lack of memory has already been tried on every lighter pro
 
 ### Cancelled Result
 
-Example cancelled job:
+Example cancelled job (it was still waiting in the queue; a job stopped while it was generating has `started` set):
 
 ```json
 {
@@ -1608,7 +1689,7 @@ Example failed job:
 
 ### Cancelled Result
 
-Example cancelled job:
+Example cancelled job (it was still waiting in the queue; a job stopped while it was generating has `started` set):
 
 ```json
 {

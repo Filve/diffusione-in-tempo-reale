@@ -31,6 +31,12 @@ struct GenerationFailure {
     int retry_after_seconds = 0;
 };
 
+// A client's request to stop one generation, shared between the thread that asks and the one that generates.
+// Setting it directly only records the wish; ContextKeeper::cancel() also tells the library.
+struct CancelToken {
+    std::atomic<bool> requested{false};
+};
+
 // Out of memory and backend failures are the ones a lighter configuration can get around.
 bool failure_is_recoverable(sd_error_code_t code);
 // "out_of_memory", "backend", "model_file", "invalid_argument", "unavailable", ..., and
@@ -72,6 +78,8 @@ public:
         // Whether a device other than the CPU is present. Default: asks the library.
         std::function<bool()> has_accelerator;
         std::function<Clock::time_point()> now;
+        // Asks the library to stop the generation running on a context. Default: sd_cancel_generation(SD_CANCEL_ALL).
+        std::function<void(sd_ctx_t*)> cancel_context;
     };
 
     // What an attempt needs to run one generation.
@@ -114,7 +122,17 @@ public:
 
     // Runs attempt on the context, recovering from a lack of memory as described above. Returns true when
     // an attempt succeeded.
-    bool run(const Attempt& attempt, GenerationFailure& failure);
+    //
+    // With a token, cancel() can stop this run: failure.code is then SD_ERROR_CANCELLED, the run counts as
+    // cancelled (not as failed) and never makes the server step down. A token that was already requested
+    // before the run reached the context stops it without generating anything.
+    bool run(const Attempt& attempt, GenerationFailure& failure, const CancelToken* token = nullptr);
+
+    // Records the request in the token and, if the run that owns it is generating at this moment, tells the
+    // library to stop. Safe from any thread, never waits for the generation, and returns whether the library
+    // was told. The library forgets a stop request when a generation begins, so a caller that cannot tell
+    // whether the generation has begun yet repeats the call until the job ends (see the cancel route).
+    bool cancel(CancelToken& token);
 
     // The settings the context in use was created with; for the upscale endpoint, which loads its own model.
     struct BackendChoice {
@@ -146,6 +164,7 @@ private:
         uint64_t requests          = 0;
         uint64_t succeeded         = 0;
         uint64_t failed            = 0;
+        uint64_t cancelled         = 0;  // stopped on request; neither a success nor a failure
         uint64_t recovered         = 0;  // requests that succeeded after a step down
         uint64_t step_downs        = 0;
         uint64_t promotions        = 0;
@@ -202,6 +221,10 @@ private:
     BackendChoice backend_choice_;
     const Clock::time_point started_at_;
     int active_runs_ = 0;
+    // Set only while an attempt is executing, and cleared before the context can be released, so cancel()
+    // never reaches a context that is gone.
+    const CancelToken* running_token_ = nullptr;
+    sd_ctx_t* running_ctx_            = nullptr;
 
     std::atomic<bool> model_loaded_{false};
     std::atomic<bool> supports_image_{false};

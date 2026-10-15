@@ -974,6 +974,7 @@ bool StableDiffusionGGML::init(const sd_ctx_params_t* sd_ctx_params) {
     backend_spec              = SAFE_STR(sd_ctx_params->backend);
     params_backend_spec       = SAFE_STR(sd_ctx_params->params_backend);
     split_mode_spec           = SAFE_STR(sd_ctx_params->split_mode);
+    multi_gpu_spec            = SAFE_STR(sd_ctx_params->multi_gpu);
     auto_fit_enabled          = sd_ctx_params->auto_fit && params_backend_spec.empty();
     backend_fallback_disabled = sd_ctx_params->disable_backend_fallback;
     max_vram_assignment.reset(0.f);
@@ -1017,6 +1018,13 @@ bool StableDiffusionGGML::init(const sd_ctx_params_t* sd_ctx_params) {
         LOG_INFO("Version: %s ", model_version_to_str[version]);
     }
 
+    sd::backend_fit::Options fit_options;
+    if (!sd::backend_fit::parse_multi_gpu_mode(multi_gpu_spec, fit_options.multi_gpu)) {
+        LOG_ERROR("multi_gpu must be 'auto', 'on' or 'off' (got '%s')", multi_gpu_spec.c_str());
+        return false;
+    }
+    fit_options.split_mode_spec = split_mode_spec;
+
     if (auto_fit_enabled) {
         int memory_guard_percent = sd_ctx_params->memory_guard;
         if (!sd::backend_fit::derive_backend_specs(model_loader,
@@ -1024,7 +1032,8 @@ bool StableDiffusionGGML::init(const sd_ctx_params_t* sd_ctx_params) {
                                                    max_vram_assignment,
                                                    backend_spec,
                                                    params_backend_spec,
-                                                   memory_guard_percent)) {
+                                                   memory_guard_percent,
+                                                   fit_options)) {
             return false;
         }
         if (memory_guard_percent != sd_ctx_params->memory_guard) {
@@ -2868,7 +2877,11 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
 
     auto x0_opt = sample_k_diffusion(method, denoise, x_t, sigmas, sampler_rng, eta, is_flow_denoiser, extra_sample_args, denoiser);
     if (x0_opt.empty()) {
-        LOG_ERROR("Diffusion model sampling failed");
+        if (get_cancel_flag() == SD_CANCEL_ALL) {
+            LOG_INFO("Diffusion model sampling cancelled");
+        } else {
+            LOG_ERROR("Diffusion model sampling failed");
+        }
         if (control_net) {
             control_net->free_control_ctx();
         }

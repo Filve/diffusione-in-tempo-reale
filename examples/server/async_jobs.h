@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -44,6 +45,8 @@ struct AsyncGenerationJob {
     int result_fps         = 0;
     std::string error_code;
     std::string error_message;
+    // Set when a client asked to stop the job while it was generating.
+    CancelToken cancel;
     mutable std::mutex preview_mutex;
     std::string preview_b64;
     int preview_pass          = 0;
@@ -54,6 +57,8 @@ struct AsyncGenerationJob {
 struct AsyncJobManager {
     std::mutex mutex;
     std::condition_variable cv;
+    // Notified, with mutex held, whenever a job that was generating reaches a final state.
+    std::condition_variable finished_cv;
     std::unordered_map<std::string, std::shared_ptr<AsyncGenerationJob>> jobs;
     std::unordered_map<std::string, int64_t> expired_jobs;
     std::deque<std::string> queue;
@@ -68,6 +73,12 @@ void purge_expired_jobs(AsyncJobManager& manager);
 size_t count_pending_jobs(const AsyncJobManager& manager);
 std::string make_async_job_id(AsyncJobManager& manager);
 bool cancel_queued_job(AsyncJobManager& manager, AsyncGenerationJob& job);
+// Asks the generating job to stop and waits, at most for the given time, until it has ended. The request is
+// repeated while waiting, because the library forgets a stop request that arrives before the generation has
+// begun. Returns true when the job has reached a final state. Call it without holding manager.mutex.
+bool cancel_generating_job(ServerRuntime& runtime,
+                           const std::shared_ptr<AsyncGenerationJob>& job,
+                           std::chrono::milliseconds wait);
 json make_async_job_json(const AsyncJobManager& manager, const AsyncGenerationJob& job);
 bool execute_img_gen_job(ServerRuntime& runtime,
                          AsyncGenerationJob& job,

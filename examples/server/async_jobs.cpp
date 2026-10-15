@@ -154,6 +154,27 @@ bool cancel_queued_job(AsyncJobManager& manager, AsyncGenerationJob& job) {
     return true;
 }
 
+bool cancel_generating_job(ServerRuntime& runtime,
+                           const std::shared_ptr<AsyncGenerationJob>& job,
+                           std::chrono::milliseconds wait) {
+    constexpr std::chrono::milliseconds kRepeatInterval(100);
+
+    AsyncJobManager& manager = *runtime.async_job_manager;
+    const auto deadline      = std::chrono::steady_clock::now() + wait;
+    for (;;) {
+        runtime.keeper->cancel(job->cancel);
+
+        std::unique_lock<std::mutex> lock(manager.mutex);
+        const auto next = std::min(deadline, std::chrono::steady_clock::now() + kRepeatInterval);
+        if (manager.finished_cv.wait_until(lock, next, [&]() { return job->status != AsyncJobStatus::Generating; })) {
+            return true;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return false;
+        }
+    }
+}
+
 json make_async_job_json(const AsyncJobManager& manager, const AsyncGenerationJob& job) {
     json result;
     result["id"]             = job.id;
@@ -211,6 +232,9 @@ json make_async_job_json(const AsyncJobManager& manager, const AsyncGenerationJo
     }
 
     if (job.status == AsyncJobStatus::Generating) {
+        if (job.cancel.requested) {
+            result["cancel_requested"] = true;
+        }
         std::lock_guard<std::mutex> lock(job.preview_mutex);
         if (!job.preview_b64.empty()) {
             result["preview"] = {
@@ -256,7 +280,8 @@ bool execute_img_gen_job(ServerRuntime& runtime,
             results.adopt(raw_results, num_results);
             return true;
         },
-        failure);
+        failure,
+        &job.cancel);
     if (!generated) {
         return false;
     }
@@ -342,7 +367,8 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
             output_fps      = fps;
             return true;
         },
-        failure);
+        failure,
+        &job.cancel);
     if (!generated) {
         return false;
     }
@@ -452,17 +478,23 @@ void async_job_worker(ServerRuntime& runtime) {
                 job->error_code.clear();
                 job->error_message.clear();
             } else {
-                job->status        = AsyncJobStatus::Failed;
-                job->error_code    = failure_code_name(failure);
-                job->error_message = failure.message.empty() ? "unknown generation error" : failure.message;
+                const bool cancelled = failure.code == SD_ERROR_CANCELLED;
+                job->status          = cancelled ? AsyncJobStatus::Cancelled : AsyncJobStatus::Failed;
+                job->error_code      = failure_code_name(failure);
+                job->error_message   = cancelled ? "job cancelled by client"
+                                                 : (failure.message.empty() ? "unknown generation error" : failure.message);
                 job->result_images_b64.clear();
                 job->result_media_b64.clear();
                 job->result_media_mime_type.clear();
                 job->result_frame_count = 0;
                 job->result_fps         = 0;
+                if (cancelled) {
+                    LOG_INFO("job %s cancelled", job->id.c_str());
+                }
             }
 
             purge_expired_jobs(manager);
+            manager.finished_cv.notify_all();
         }
     }
 }

@@ -37,6 +37,21 @@ static sd_profile::Resources resources(double model_gib, double ram_gib, double 
     return r;
 }
 
+static sd_device_info_t device(const char* name, sd_device_type_t type, double free_gib) {
+    sd_device_info_t info = {};
+    snprintf(info.name, sizeof(info.name), "%s", name);
+    info.type               = type;
+    info.free_memory_bytes  = static_cast<uint64_t>(free_gib * GiB);
+    info.total_memory_bytes = info.free_memory_bytes;
+    return info;
+}
+
+static bool gpu_memory_is(const std::vector<sd_device_info_t>& devices, bool pool, double gib, int expected_count) {
+    int count            = -1;
+    const int64_t memory = sd_profile::usable_gpu_memory(devices, pool, &count);
+    return memory == static_cast<int64_t>(gib * GiB) && count == expected_count;
+}
+
 static void check_choice(const char* label, const sd_profile::Resources& r, Level expected) {
     std::string reason;
     const Level got = sd_profile::choose(r, &reason);
@@ -93,6 +108,64 @@ int main() {
     check_choice("SDXL f16, 8 GiB RAM, 24 GiB VRAM", resources(6.9, 8, 24), Level::MAX);
     check_choice("fits the GPU but RAM is almost gone", resources(2, 0.5, 12), Level::BALANCED);
 
+    {
+        // 14 GiB of weights: too much for one 12 GiB GPU, enough for two of them together.
+        check_choice("14 GiB model, one 12 GiB GPU", resources(14, 8, 12), Level::LITE);
+        sd_profile::Resources two = resources(14, 8, 22);
+        two.gpu_count             = 2;
+        std::string reason;
+        CHECK(sd_profile::choose(two, &reason) == Level::BALANCED && reason.find("over 2 GPUs") != std::string::npos,
+              "two GPUs together can hold weights that one cannot, and the reason says how many were counted");
+        sd_profile::Resources roomy = resources(14, 8, 28);
+        roomy.gpu_count             = 2;
+        CHECK(sd_profile::choose(roomy, &reason) == Level::MAX, "and with room to spare the profile stays at max");
+        sd_profile::choose(resources(2, 8, 0), &reason);
+        CHECK(reason.find("no GPU memory reported") != std::string::npos, "the reason says when there is no GPU");
+    }
+    {
+        const std::vector<sd_device_info_t> none;
+        CHECK(gpu_memory_is(none, true, 0, 0), "no device: no GPU memory");
+        CHECK(gpu_memory_is({device("CPU", SD_DEVICE_TYPE_CPU, 8)}, true, 0, 0), "the CPU is not a GPU");
+        CHECK(gpu_memory_is({device("CUDA0", SD_DEVICE_TYPE_GPU, 6)}, true, 6, 1) && gpu_memory_is({device("CUDA0", SD_DEVICE_TYPE_GPU, 6)}, false, 6, 1),
+              "one GPU: its own free memory, pooled or not");
+        const std::vector<sd_device_info_t> two = {device("CUDA0", SD_DEVICE_TYPE_GPU, 12), device("CUDA1", SD_DEVICE_TYPE_GPU, 12)};
+        CHECK(gpu_memory_is(two, false, 12, 1), "two GPUs, not pooled: the one with the most");
+        CHECK(gpu_memory_is(two, true, 22, 2), "two GPUs, pooled: the sum less 2 GiB of working memory for the second one");
+        const std::vector<sd_device_info_t> three = {device("CUDA0", SD_DEVICE_TYPE_GPU, 8), device("CUDA1", SD_DEVICE_TYPE_GPU, 8), device("CUDA2", SD_DEVICE_TYPE_GPU, 8)};
+        CHECK(gpu_memory_is(three, true, 20, 3), "three GPUs: 2 GiB less for every GPU after the first");
+        CHECK(gpu_memory_is({device("CUDA0", SD_DEVICE_TYPE_GPU, 12), device("CUDA1", SD_DEVICE_TYPE_GPU, 1)}, true, 12, 1),
+              "a GPU too small to be worth its working memory adds nothing");
+        CHECK(gpu_memory_is({device("CUDA0", SD_DEVICE_TYPE_GPU, 8), device("Vulkan0", SD_DEVICE_TYPE_IGPU, 30)}, true, 8, 1),
+              "an integrated GPU draws on the RAM and does not count");
+        CHECK(gpu_memory_is({device("CUDA0", SD_DEVICE_TYPE_GPU, 12), device("Vulkan0", SD_DEVICE_TYPE_GPU, 12)}, true, 12, 1),
+              "GPUs of different backends are not added together");
+        CHECK(gpu_memory_is({device("ACC0", SD_DEVICE_TYPE_ACCEL, 16), device("CUDA0", SD_DEVICE_TYPE_GPU, 8), device("CUDA1", SD_DEVICE_TYPE_GPU, 8)}, true, 16, 1),
+              "an accelerator is counted alone");
+        CHECK(gpu_memory_is({device("CUDA0", SD_DEVICE_TYPE_GPU, 0)}, true, 0, 0), "a GPU that reports no memory counts as none");
+    }
+    {
+        Parsed p({});
+        CHECK(p.ok && sd_profile::may_use_several_gpus(p.ctx), "by default auto-fit may use several GPUs");
+        Parsed off({"--multi-gpu", "OFF"});
+        CHECK(off.ok && !sd_profile::may_use_several_gpus(off.ctx), "--multi-gpu off keeps one GPU");
+        Parsed on({"--multi-gpu", "on"});
+        CHECK(on.ok && on.ctx.multi_gpu == "on" && sd_profile::may_use_several_gpus(on.ctx), "--multi-gpu on is read");
+        Parsed manual({"--backend", "diffusion=cuda0"});
+        CHECK(manual.ok && !sd_profile::may_use_several_gpus(manual.ctx), "a module assigned by hand is left alone");
+        Parsed params({"--params-backend", "cpu"});
+        CHECK(params.ok && !sd_profile::may_use_several_gpus(params.ctx), "so is a placement of the parameters");
+        Parsed no_fit({"--auto-fit", "off"});
+        CHECK(no_fit.ok && !sd_profile::may_use_several_gpus(no_fit.ctx), "without auto-fit nothing is planned");
+    }
+    {
+        Parsed good({"--multi-gpu", "Auto"});
+        CHECK(good.ok && good.ctx.validate(IMG_GEN, false), "--multi-gpu accepts auto in any case");
+        Parsed bad({"--multi-gpu", "sideways"});
+        CHECK(bad.ok && !bad.ctx.validate(IMG_GEN, false), "--multi-gpu refuses anything but auto, on and off");
+        Parsed passed({"--multi-gpu", "on"});
+        const sd_ctx_params_t raw = passed.ctx.to_sd_ctx_params_t(false);
+        CHECK(raw.multi_gpu != nullptr && strcmp(raw.multi_gpu, "on") == 0, "the value reaches the library");
+    }
     {
         Parsed p({});
         sd_profile::apply(Level::LITE, p.ctx, p.gen, true);

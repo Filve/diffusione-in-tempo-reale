@@ -1,9 +1,12 @@
 #include "routes.h"
 
 #include <algorithm>
+#include <cctype>
+#include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <limits>
+#include <memory>
 #include <new>
 
 #include "async_jobs.h"
@@ -14,6 +17,18 @@
 namespace fs = std::filesystem;
 
 static constexpr uint32_t k_max_upscale_dimension = 8192;
+
+static constexpr int k_default_cancel_wait_seconds = 10;
+static constexpr int k_max_cancel_wait_seconds     = 60;
+
+// Reads ?wait=: how long a cancellation may wait for the job to end. Longer waits are shortened to the maximum.
+static bool parse_cancel_wait(const std::string& text, int& seconds) {
+    if (text.empty() || text.size() > 9 || !std::all_of(text.begin(), text.end(), [](unsigned char c) { return std::isdigit(c) != 0; })) {
+        return false;
+    }
+    seconds = std::min(std::stoi(text), k_max_cancel_wait_seconds);
+    return true;
+}
 
 static bool valid_upscale_dimensions(const sd_image_t& image, int factor, int repeats) {
     if (image.width == 0 || image.height == 0 || factor < 1 || repeats < 1 || repeats > 4) {
@@ -205,7 +220,7 @@ static json make_img_gen_features_json() {
         {"hires", true},
         {"cache", true},
         {"cancel_queued", true},
-        {"cancel_generating", false},
+        {"cancel_generating", true},
         {"preview", true},
     };
 }
@@ -220,7 +235,7 @@ static json make_vid_gen_features_json() {
         {"vae_tiling", true},
         {"cache", true},
         {"cancel_queued", true},
-        {"cancel_generating", false},
+        {"cancel_generating", true},
         {"preview", true},
     };
 }
@@ -363,7 +378,7 @@ static json make_capabilities_json(ServerRuntime& runtime) {
     json top_level_output_formats = json::array();
     json top_level_features       = {
               {"cancel_queued", true},
-              {"cancel_generating", false},
+              {"cancel_generating", true},
     };
     std::string current_mode = "";
     if (supports_img) {
@@ -841,9 +856,24 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
         res.set_content(make_async_job_json(manager, *it->second).dump(), "application/json");
     });
 
-    svr.Post(R"(/sdcpp/v1/jobs/([A-Za-z0-9_\-]+)/cancel)", [runtime](const httplib::Request& req, httplib::Response& res) {
+    // The route takes the body through a content reader because it has none: a plain handler is called only after the
+    // HTTP library has read the body, and for a POST without Content-Length (what `curl -X POST` sends) it waits for
+    // its read timeout of 5 seconds to be sure there is none.
+    svr.Post(R"(/sdcpp/v1/jobs/([A-Za-z0-9_\-]+)/cancel)", [runtime](const httplib::Request& req, httplib::Response& res, const httplib::ContentReader& body) {
+        if (req.has_header("Content-Length") || req.has_header("Transfer-Encoding")) {
+            body([](const char*, size_t) { return true; });
+        }
+
+        int wait_seconds = k_default_cancel_wait_seconds;
+        if (req.has_param("wait") && !parse_cancel_wait(req.get_param_value("wait"), wait_seconds)) {
+            res.status = 400;
+            res.set_content(R"({"error":"wait must be a whole number of seconds, 0 or more"})", "application/json");
+            return;
+        }
+
         AsyncJobManager& manager = *runtime->async_job_manager;
-        std::lock_guard<std::mutex> lock(manager.mutex);
+        std::shared_ptr<AsyncGenerationJob> generating;
+        std::unique_lock<std::mutex> lock(manager.mutex);
         purge_expired_jobs(manager);
 
         std::string job_id = req.matches[1];
@@ -871,13 +901,18 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             return;
         }
 
-        if (job.status == AsyncJobStatus::Generating) {
-            res.status = 409;
-            res.set_content(R"({"error":"job is currently generating and cannot be interrupted yet"})", "application/json");
+        if (job.status != AsyncJobStatus::Generating) {
+            res.status = 200;
+            res.set_content(make_async_job_json(manager, job).dump(), "application/json");
             return;
         }
 
-        res.status = 200;
-        res.set_content(make_async_job_json(manager, job).dump(), "application/json");
+        generating = it->second;
+        lock.unlock();
+
+        const bool ended = cancel_generating_job(*runtime, generating, std::chrono::seconds(wait_seconds));
+        lock.lock();
+        res.status = ended ? 200 : 202;
+        res.set_content(make_async_job_json(manager, *generating).dump(), "application/json");
     });
 }

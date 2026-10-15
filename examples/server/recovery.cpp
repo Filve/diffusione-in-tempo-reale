@@ -153,6 +153,9 @@ static ContextKeeper::Hooks with_defaults(ContextKeeper::Hooks hooks) {
     if (!hooks.now) {
         hooks.now = [] { return ContextKeeper::Clock::now(); };
     }
+    if (!hooks.cancel_context) {
+        hooks.cancel_context = [](sd_ctx_t* ctx) { sd_cancel_generation(ctx, SD_CANCEL_ALL); };
+    }
     return hooks;
 }
 
@@ -453,7 +456,17 @@ void ContextKeeper::promote_if_due() {
     next_promotion_ = hooks_.now() + std::chrono::seconds(cooldown_seconds_);
 }
 
-bool ContextKeeper::run(const Attempt& attempt, GenerationFailure& failure) {
+bool ContextKeeper::cancel(CancelToken& token) {
+    token.requested = true;
+    std::lock_guard<std::mutex> state(state_mutex_);
+    if (running_token_ != &token || running_ctx_ == nullptr) {
+        return false;
+    }
+    hooks_.cancel_context(running_ctx_);
+    return true;
+}
+
+bool ContextKeeper::run(const Attempt& attempt, GenerationFailure& failure, const CancelToken* token) {
     std::lock_guard<std::mutex> lock(mutex_);
     failure = GenerationFailure();
 
@@ -477,10 +490,43 @@ bool ContextKeeper::run(const Attempt& attempt, GenerationFailure& failure) {
         return false;
     };
 
+    auto wanted_stop = [&]() {
+        return token != nullptr && token->requested.load();
+    };
+    auto stop = [&]() {
+        failure         = GenerationFailure();
+        failure.code    = SD_ERROR_CANCELLED;
+        failure.message = "the generation was cancelled";
+        std::lock_guard<std::mutex> state(state_mutex_);
+        ++counters_.cancelled;
+        return false;
+    };
+
+    // The context only exists to the library while an attempt runs, so cancel() can reach it only then.
+    struct Running {
+        ContextKeeper& keeper;
+        Running(ContextKeeper& owner, const CancelToken* token, sd_ctx_t* ctx)
+            : keeper(owner) {
+            std::lock_guard<std::mutex> state(keeper.state_mutex_);
+            keeper.running_token_ = token;
+            keeper.running_ctx_   = ctx;
+        }
+        ~Running() {
+            std::lock_guard<std::mutex> state(keeper.state_mutex_);
+            keeper.running_token_ = nullptr;
+            keeper.running_ctx_   = nullptr;
+        }
+    };
+
     if (!model_loaded_) {
         failure.code    = SD_ERROR_INVALID_ARGUMENT;
         failure.message = "no model loaded";
         return fail();
+    }
+
+    // Before promote_if_due(): a job nobody wants any more must not cost a reload of the model.
+    if (wanted_stop()) {
+        return stop();
     }
 
     promote_if_due();
@@ -503,6 +549,10 @@ bool ContextKeeper::run(const Attempt& attempt, GenerationFailure& failure) {
     } rearm{*this, stepped_down};
 
     for (;;) {
+        if (wanted_stop()) {
+            return stop();
+        }
+
         ContextView view;
         view.ctx = ctx_.get();
         {
@@ -511,7 +561,12 @@ bool ContextKeeper::run(const Attempt& attempt, GenerationFailure& failure) {
         }
         view.force_vae_tiling = force_tiling_at(view.level);
 
-        if (attempt(view)) {
+        bool generated = false;
+        {
+            Running running(*this, token, view.ctx);
+            generated = attempt(view);
+        }
+        if (generated) {
             std::lock_guard<std::mutex> state(state_mutex_);
             ++counters_.succeeded;
             if (stepped_down) {
@@ -526,7 +581,14 @@ bool ContextKeeper::run(const Attempt& attempt, GenerationFailure& failure) {
         }
 
         failure = hooks_.read_failure();
+        if (failure.code == SD_ERROR_CANCELLED) {
+            return stop();
+        }
         record_error(failure);
+        // Reloading the model on a lighter profile to run a request nobody waits for any more would only delay the next one.
+        if (wanted_stop() && failure_is_recoverable(failure.code)) {
+            return stop();
+        }
         if (!settings_.degradation || !failure_is_recoverable(failure.code)) {
             return fail();
         }
@@ -592,6 +654,7 @@ nlohmann::json ContextKeeper::health_json() const {
         {"requests", counters_.requests},
         {"succeeded", counters_.succeeded},
         {"failed", counters_.failed},
+        {"cancelled", counters_.cancelled},
         {"recovered", counters_.recovered},
         {"step_downs", counters_.step_downs},
         {"promotions", counters_.promotions},

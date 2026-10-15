@@ -100,6 +100,7 @@ public:
     std::string backend_spec;
     std::string params_backend_spec;
     std::string split_mode_spec;
+    std::string multi_gpu_spec;
     bool auto_fit_enabled          = false;
     bool backend_fallback_disabled = false;
 
@@ -141,6 +142,7 @@ public:
                                 &sd_ctx_params_t::pulid_weights_path, &sd_ctx_params_t::tensor_type_rules,
                                 &sd_ctx_params_t::max_vram, &sd_ctx_params_t::backend,
                                 &sd_ctx_params_t::params_backend, &sd_ctx_params_t::split_mode,
+                                &sd_ctx_params_t::multi_gpu,
                                 &sd_ctx_params_t::rpc_servers, &sd_ctx_params_t::model_args}) {
                 strings.emplace_back(SAFE_STR(initial.*member));
                 params.*member = strings.back().c_str();
