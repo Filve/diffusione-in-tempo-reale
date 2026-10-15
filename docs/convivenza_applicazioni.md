@@ -143,7 +143,9 @@ Da sapere:
   GPU sola: `--multi-gpu off`. Un modulo assegnato con `--backend` non viene mai
   spostato.
 - **CUDA e Vulkan nella stessa cartella** (per esempio per avere anche la GPU
-  AMD): la stessa scheda NVIDIA compare due volte, come `CUDA0` e `Vulkan0`. Il
+  AMD; la release `master-*` ha già lo zip `...-bin-win-cuda12-vulkan-x64.zip`,
+  vedi [integrazione_progetti.md](integrazione_progetti.md), sezione 2.9): la
+  stessa scheda NVIDIA compare due volte, come `CUDA0` e `Vulkan0`. Il
   motore la riconosce dall'indirizzo PCI che entrambi i backend riportano, la
   conta una volta e usa CUDA; nel piano la riga di `Vulkan0` dice
   `same GPU as CUDA0, not used automatically`. La GPU integrata (`Vulkan1` su un
