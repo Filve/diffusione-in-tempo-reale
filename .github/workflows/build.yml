@@ -782,6 +782,9 @@ jobs:
           pattern: sd-*
           merge-multiple: true
 
+      - name: Combine the Windows CUDA and Vulkan packages
+        run: bash scripts/package_windows_cuda_vulkan.sh ./artifact
+
       - name: Get commit count
         id: commit_count
         run: |
@@ -804,9 +807,12 @@ jobs:
 
             | File | Quando sceglierlo |
             |---|---|
-            | `sd-<ramo>-<commit>-bin-win-cuda12-x64.zip` + `cudart-sd-bin-win-cu12-x64.zip` | schede **NVIDIA**. Scompatta **entrambi** nella stessa cartella: il secondo contiene le DLL di CUDA. Serve il driver NVIDIA aggiornato |
+            | `sd-<ramo>-<commit>-bin-win-cuda12-vulkan-x64.zip` | scheda **NVIDIA**, anche insieme a una GPU AMD o integrata: CUDA, le DLL di CUDA e Vulkan sono già nella stessa cartella, in un solo download. Serve il driver NVIDIA aggiornato |
+            | `sd-<ramo>-<commit>-bin-win-cuda12-x64.zip` + `cudart-sd-bin-win-cu12-x64.zip` | solo schede **NVIDIA**, senza Vulkan. Scompatta **entrambi** nella stessa cartella: il secondo contiene le DLL di CUDA. Serve il driver NVIDIA aggiornato |
             | `sd-<ramo>-<commit>-bin-win-vulkan-x64.zip` | schede NVIDIA, AMD e Intel con driver Vulkan |
             | `sd-<ramo>-<commit>-bin-win-cpu-x64.zip` | solo CPU |
+
+            Non scompattare lo zip Vulkan sopra quello CUDA: quasi tutti i file hanno lo stesso nome ma sono compilati in modo diverso, e ne esce una build mista. Lo zip `cuda12-vulkan` è assemblato da `scripts/package_windows_cuda_vulkan.sh` partendo dagli zip di questa stessa release, e da quello Vulkan prende solo `ggml-vulkan.dll`.
 
             **Requisito su Windows: [Microsoft Visual C++ Redistributable](https://aka.ms/vc14/vc_redist.x64.exe) 2015-2022 (x64), versione 14.44 o successiva.** Se manca o è più vecchio, il programma si chiude subito senza scrivere nulla (codice di uscita `0xC0000135`, cioè `3221225781` oppure `-1073741515` in PowerShell). Controlla la versione con `(Get-Item C:\Windows\System32\msvcp140.dll).VersionInfo.FileVersion`.
 
