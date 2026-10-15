@@ -977,6 +977,10 @@ bool StableDiffusionGGML::init(const sd_ctx_params_t* sd_ctx_params) {
     multi_gpu_spec            = SAFE_STR(sd_ctx_params->multi_gpu);
     auto_fit_enabled          = sd_ctx_params->auto_fit && params_backend_spec.empty();
     backend_fallback_disabled = sd_ctx_params->disable_backend_fallback;
+    if (sd_ctx_params->auto_fit && !auto_fit_enabled) {
+        LOG_INFO("auto-fit is off because --params-backend is set (\"%s\"; --offload-to-cpu also sets it): modules go where --backend (\"%s\") and --params-backend put them",
+                 params_backend_spec.c_str(), backend_spec.empty() ? "default" : backend_spec.c_str());
+    }
     max_vram_assignment.reset(0.f);
     {
         std::string error;
