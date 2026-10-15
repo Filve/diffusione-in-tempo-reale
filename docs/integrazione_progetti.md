@@ -444,6 +444,30 @@ così un pacchetto "con GPU" non può in silenzio funzionare solo sulla CPU.
 Verifica dopo lo scompattamento: `sd-cli --list-devices` deve elencare, oltre
 alla CPU, una riga di tipo `gpu` (o `igpu`).
 
+#### Release `master-*`: zip Windows con CUDA e Vulkan insieme
+
+Oltre ai pacchetti portabili, ogni release `master-<n>-<commit>` (workflow
+`build.yml`) allega gli zip Windows `sd-master-<commit>-bin-win-cuda12-x64.zip`,
+`...-bin-win-vulkan-x64.zip`, `...-bin-win-cpu-x64.zip` e
+`cudart-sd-bin-win-cu12-x64.zip` (le DLL di CUDA). Per usare insieme la scheda
+NVIDIA (CUDA) e le altre GPU del computer (Vulkan: AMD, anche la grafica
+integrata, e Intel) c'è anche `sd-master-<commit>-bin-win-cuda12-vulkan-x64.zip`:
+una cartella sola con i file dello zip CUDA, le DLL di CUDA, `ggml-vulkan.dll` e
+un `LEGGIMI.txt`. Si scompatta e si usa, senza altri passaggi.
+
+Non basta scompattare lo zip Vulkan sopra quello CUDA: quasi tutti i file hanno
+lo stesso nome, ma `stable-diffusion.dll` è compilata in modo diverso (solo
+quella dello zip CUDA contiene il codice per CUDA), e ne uscirebbe una build
+mista. Lo zip unico lo assembla `scripts/package_windows_cuda_vulkan.sh`, un
+passo del job `release`: dallo zip Vulkan prende solo `ggml-vulkan.dll`, e si
+ferma se manca un file, se i due zip non sono dello stesso commit, se due zip
+hanno un file con lo stesso nome o se il numero dei file non torna. Avvisa se
+`ggml-base.dll` o `ggml.dll` hanno una dimensione diversa nei due zip, segno di
+due build di ggml diverse. `test/package_windows_cuda_vulkan_test.sh` prova lo
+script con zip finti, senza GPU né modelli. Come leggere l'elenco dei
+dispositivi con i due backend (la stessa scheda come `CUDA0` e `Vulkan0`, la
+GPU integrata): [convivenza_applicazioni.md](convivenza_applicazioni.md).
+
 ## 3. Come collegarlo a un progetto
 
 ### 3.1 Libreria C/C++ con CMake
