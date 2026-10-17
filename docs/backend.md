@@ -285,7 +285,15 @@ What it does and does not do:
   installed side by side, an NVIDIA card is both `CUDA0` and `Vulkan0`. Listings that
   report the same PCI bus id are one GPU: the vendor's backend keeps it, and the Vulkan
   or OpenCL listing appears in the plan as `same GPU as CUDA0, not used automatically`.
-  It can still be named with `--backend`. A backend that reports no PCI bus id is not matched.
+  It can still be named with `--backend`, and then the run goes through that backend, usually
+  slower on the same card; the log says so with an `auto-fit:` warning, once per listing.
+  A backend that reports no PCI bus id is not matched.
+  See [cuda_e_vulkan_stessa_scheda.md](./cuda_e_vulkan_stessa_scheda.md) (Italian) for the log lines, measured times and what to do.
+- Weights that fit neither the compute device nor the RAM budget stay on disk (`params disk` in
+  the plan) and are read again every time their module runs, the diffusion model at every sampling
+  step. The log then warns with the size of those weights, the free RAM and the budget for weights,
+  and suggests closing programs, `--type` or a quantized model file. No warning when the free RAM is
+  unknown or with `--cpu-only`.
 - An integrated GPU is the main device only when no graphics card has memory left.
   Its memory is the system RAM, so it reports more than a card does, and it computes
   several times slower. Weights are never parked in it either, because that is the

@@ -151,8 +151,11 @@ Da sapere:
   `same GPU as CUDA0, not used automatically`. La GPU integrata (`Vulkan1` su un
   portatile AMD) non viene scelta finché una scheda ha memoria libera, perché la
   sua «memoria» è la RAM di sistema, e non ospita mai i pesi. Si possono
-  comunque nominare con `--backend`. Non aggiunge velocità: il motore non
-  divide un modulo fra backend diversi.
+  comunque nominare con `--backend`, ma sulla stessa scheda Vulkan può essere
+  molto più lento di CUDA: se lo nomini (o lo fa un programma al posto tuo) il
+  log lo dice con un avviso. Non aggiunge velocità: il motore non divide un
+  modulo fra backend diversi. Log, tempi misurati e cosa fare:
+  [cuda_e_vulkan_stessa_scheda.md](./cuda_e_vulkan_stessa_scheda.md).
 - **La GPU integrata** usa la RAM di sistema: per `--profile auto` non conta
   come memoria veloce (contano solo GPU discrete e acceleratori), e per una
   chat sulla GPU integrata la risorsa contesa è la RAM, non la memoria video.
@@ -392,9 +395,11 @@ Verificato, su Linux, **solo CPU**, con un modello sintetico:
 - La convivenza con una chat reale (llama.cpp, LM Studio, WebGPU).
 - Windows: condivisione della porta, chiusura del processo figlio.
 - L'ordine dei dispositivi Vulkan su un portatile con GPU integrata e discreta.
-- La corrispondenza degli indirizzi PCI fra CUDA e Vulkan su una macchina reale
-  (la riga `same GPU as` nel piano): la logica è provata solo con dispositivi
-  simulati.
+- La corrispondenza degli indirizzi PCI fra CUDA e Vulkan su altre macchine
+  reali: su un portatile con RTX 3060 e GPU integrata AMD il piano scrive
+  `same GPU as CUDA0` per `Vulkan0` e non per la GPU integrata (log di un
+  utente, vedi [cuda_e_vulkan_stessa_scheda.md](./cuda_e_vulkan_stessa_scheda.md));
+  per il resto la logica è provata con dispositivi simulati.
 - Il comportamento del motore con il ripiego sulla RAM dei driver NVIDIA.
 - Il costo del ricaricamento di un modello reale.
 - Quanto si scalda la macchina con il motore e l'altra applicazione accesi per

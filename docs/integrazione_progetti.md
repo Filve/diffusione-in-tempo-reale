@@ -466,7 +466,9 @@ hanno un file con lo stesso nome o se il numero dei file non torna. Avvisa se
 due build di ggml diverse. `test/package_windows_cuda_vulkan_test.sh` prova lo
 script con zip finti, senza GPU né modelli. Come leggere l'elenco dei
 dispositivi con i due backend (la stessa scheda come `CUDA0` e `Vulkan0`, la
-GPU integrata): [convivenza_applicazioni.md](convivenza_applicazioni.md).
+GPU integrata): [convivenza_applicazioni.md](convivenza_applicazioni.md); cosa
+dice il log se si fissa `--backend vulkan0` sulla scheda NVIDIA, i tempi e cosa
+fare: [cuda_e_vulkan_stessa_scheda.md](cuda_e_vulkan_stessa_scheda.md).
 
 ## 3. Come collegarlo a un progetto
 
