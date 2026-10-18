@@ -4,8 +4,11 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstdlib>
+#include <exception>
+#include <new>
 
 #include "core/ggml_extend.h"
+#include "core/last_error.h"
 #include "core/util.h"
 #include "pipeline/diffusion_engine.h"
 #include "pipeline/generation.h"
@@ -335,6 +338,7 @@ void sd_ctx_params_init(sd_ctx_params_t* sd_ctx_params) {
     sd_ctx_params->max_vram                  = nullptr;
     sd_ctx_params->disable_prefetch          = false;
     sd_ctx_params->disable_segmented_compute = false;
+    sd_ctx_params->batched_cfg               = true;
     sd_ctx_params->eager_load                = false;
     sd_ctx_params->enable_mmap               = false;
     sd_ctx_params->diffusion_flash_attn      = false;
@@ -351,6 +355,7 @@ void sd_ctx_params_init(sd_ctx_params_t* sd_ctx_params) {
     sd_ctx_params->pulid_weights_path        = nullptr;
     sd_ctx_params->memory_guard              = 0;
     sd_ctx_params->disable_backend_fallback  = false;
+    sd_ctx_params->multi_gpu                 = nullptr;
 }
 
 char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
@@ -394,6 +399,7 @@ char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
              "backend: %s\n"
              "params_backend: %s\n"
              "split_mode: %s\n"
+             "multi_gpu: %s\n"
              "model_args: %s\n"
              "auto_fit: %s\n"
              "disable_backend_fallback: %s\n"
@@ -437,6 +443,7 @@ char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
              SAFE_STR(sd_ctx_params->backend),
              SAFE_STR(sd_ctx_params->params_backend),
              SAFE_STR(sd_ctx_params->split_mode),
+             SAFE_STR(sd_ctx_params->multi_gpu),
              SAFE_STR(sd_ctx_params->model_args),
              BOOL_STR(sd_ctx_params->auto_fit),
              BOOL_STR(sd_ctx_params->disable_backend_fallback),
@@ -639,24 +646,46 @@ struct sd_ctx_t {
     StableDiffusionGGML* sd = nullptr;
 };
 
+// A C++ exception must not cross the C API: it is reported as the failure of the call.
+template <typename Body>
+static bool run_without_exceptions(Body&& body) {
+    try {
+        return body();
+    } catch (const std::bad_alloc&) {
+        LOG_ERROR_CODE(SD_ERROR_OUT_OF_MEMORY, "out of memory (std::bad_alloc)");
+    } catch (const std::exception& error) {
+        LOG_ERROR_CODE(SD_ERROR_UNKNOWN, "unexpected error: %s", error.what());
+    } catch (...) {
+        LOG_ERROR_CODE(SD_ERROR_UNKNOWN, "unexpected error");
+    }
+    return false;
+}
+
 sd_ctx_t* new_sd_ctx(const sd_ctx_params_t* sd_ctx_params) {
+    sd::last_error::clear();
+    if (sd_ctx_params == nullptr) {
+        sd::last_error::mark(SD_ERROR_INVALID_ARGUMENT, "new_sd_ctx needs context parameters");
+        return nullptr;
+    }
     sd_ctx_t* sd_ctx = (sd_ctx_t*)malloc(sizeof(sd_ctx_t));
     if (sd_ctx == nullptr) {
+        sd::last_error::mark(SD_ERROR_OUT_OF_MEMORY, "out of memory");
         return nullptr;
     }
+    sd_ctx->sd = nullptr;
 
-    sd_ctx->sd = new StableDiffusionGGML();
-    if (sd_ctx->sd == nullptr) {
-        free(sd_ctx);
-        return nullptr;
-    }
-
-    if (!sd_ctx->sd->init(sd_ctx_params)) {
+    const bool initialized = run_without_exceptions([&]() {
+        sd_ctx->sd = new StableDiffusionGGML();
+        return sd_ctx->sd->init(sd_ctx_params);
+    });
+    if (!initialized) {
+        sd::last_error::ensure(SD_ERROR_UNKNOWN);
         delete sd_ctx->sd;
         sd_ctx->sd = nullptr;
         free(sd_ctx);
         return nullptr;
     }
+    sd::last_error::clear();
     return sd_ctx;
 }
 
@@ -743,15 +772,42 @@ SD_API bool generate_image(sd_ctx_t* sd_ctx,
                            const sd_img_gen_params_t* params,
                            sd_image_t** images_out,
                            int* num_images_out) {
+    sd::last_error::clear();
     if (images_out != nullptr)
         *images_out = nullptr;
     if (num_images_out != nullptr)
         *num_images_out = 0;
     if (sd_ctx == nullptr || sd_ctx->sd == nullptr || params == nullptr) {
+        sd::last_error::mark(SD_ERROR_INVALID_ARGUMENT, "generate_image needs a context and parameters");
         return false;
     }
-    StableDiffusionGGML::ExecutionScope execution(*sd_ctx->sd);
-    return execution.ready && sd::pipeline::generate_image(sd_ctx->sd, params, images_out, num_images_out);
+    const bool generated = run_without_exceptions([&]() {
+        StableDiffusionGGML::ExecutionScope execution(*sd_ctx->sd);
+        if (!execution.operation.acquired) {
+            sd::last_error::mark(SD_ERROR_BUSY, "the context is busy with another operation");
+            return false;
+        }
+        if (!execution.ready) {
+            sd::last_error::mark(SD_ERROR_MODEL_FILE, "the model files could not be validated");
+            return false;
+        }
+        return sd::pipeline::generate_image(sd_ctx->sd, params, images_out, num_images_out);
+    });
+    if (generated) {
+        sd::last_error::clear();
+        return true;
+    }
+    if (images_out != nullptr && *images_out != nullptr) {
+        free_sd_images(*images_out, num_images_out != nullptr ? *num_images_out : 0);
+        *images_out = nullptr;
+        if (num_images_out != nullptr)
+            *num_images_out = 0;
+    }
+    if (sd_ctx->sd->get_cancel_flag() == SD_CANCEL_ALL) {
+        sd::last_error::mark(SD_ERROR_CANCELLED, "the generation was cancelled");
+    }
+    sd::last_error::ensure(SD_ERROR_UNKNOWN);
+    return false;
 }
 
 SD_API bool generate_video(sd_ctx_t* sd_ctx,
@@ -760,6 +816,7 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
                            int* num_frames_out,
                            sd_audio_t** audio_out,
                            int* fps_out) {
+    sd::last_error::clear();
     if (frames_out != nullptr)
         *frames_out = nullptr;
     if (audio_out != nullptr)
@@ -769,15 +826,41 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
     if (fps_out != nullptr)
         *fps_out = 0;
     if (sd_ctx == nullptr || sd_ctx->sd == nullptr || sd_vid_gen_params == nullptr) {
+        sd::last_error::mark(SD_ERROR_INVALID_ARGUMENT, "generate_video needs a context and parameters");
         return false;
     }
 
-    StableDiffusionGGML::ExecutionScope execution(*sd_ctx->sd);
-    if (!execution.ready) {
-        return false;
+    const bool generated = run_without_exceptions([&]() {
+        StableDiffusionGGML::ExecutionScope execution(*sd_ctx->sd);
+        if (!execution.operation.acquired) {
+            sd::last_error::mark(SD_ERROR_BUSY, "the context is busy with another operation");
+            return false;
+        }
+        if (!execution.ready) {
+            sd::last_error::mark(SD_ERROR_MODEL_FILE, "the model files could not be validated");
+            return false;
+        }
+        return sd::pipeline::generate_video(sd_ctx->sd, sd_vid_gen_params, frames_out, num_frames_out, audio_out, fps_out);
+    });
+    if (generated) {
+        sd::last_error::clear();
+        return true;
     }
-
-    return sd::pipeline::generate_video(sd_ctx->sd, sd_vid_gen_params, frames_out, num_frames_out, audio_out, fps_out);
+    if (frames_out != nullptr && *frames_out != nullptr) {
+        free_sd_images(*frames_out, num_frames_out != nullptr ? *num_frames_out : 0);
+        *frames_out = nullptr;
+        if (num_frames_out != nullptr)
+            *num_frames_out = 0;
+    }
+    if (audio_out != nullptr && *audio_out != nullptr) {
+        free_sd_audio(*audio_out);
+        *audio_out = nullptr;
+    }
+    if (sd_ctx->sd->get_cancel_flag() == SD_CANCEL_ALL) {
+        sd::last_error::mark(SD_ERROR_CANCELLED, "the generation was cancelled");
+    }
+    sd::last_error::ensure(SD_ERROR_UNKNOWN);
+    return false;
 }
 
 SD_API void free_sd_images(sd_image_t* result_images, int num_images) {

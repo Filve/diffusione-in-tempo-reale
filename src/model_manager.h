@@ -165,6 +165,8 @@ private:
 
     sd::MemoryWatchdog::Sample memory_guard_sample(const DeviceMemoryRequest& request) const;
     bool memory_guard_ok(const DeviceMemoryRequest& request) const;
+    DeviceMemoryRequest with_streamed_weights(DeviceMemoryRequest request,
+                                              const std::vector<TensorState*>& states) const;
 
     ggml_backend_buffer_type_t params_buffer_type_for(const TensorState& state) const;
     ggml_backend_buffer_type_t split_buffer_type_for(const TensorState& state) const;
@@ -281,6 +283,8 @@ public:
     bool fits_compute_backend_capacity(const DeviceMemoryRequest& request,
                                        const std::vector<ggml_tensor*>& required_params) const override;
     bool segmented_compute_enabled() const override { return !segmented_compute_disabled_; }
+    bool segmenting_can_save_memory(const std::vector<ggml_tensor*>& params,
+                                    ggml_backend_t compute_backend) const override;
     bool prefetch_enabled() const override {
         return !prefetch_disabled_ && !memory_watchdog_.prefetch_suspended();
     }

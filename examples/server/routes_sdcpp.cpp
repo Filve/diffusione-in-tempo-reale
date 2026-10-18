@@ -1,9 +1,13 @@
 #include "routes.h"
 
 #include <algorithm>
+#include <cctype>
+#include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <limits>
+#include <memory>
+#include <new>
 
 #include "async_jobs.h"
 #include "common/common.h"
@@ -13,6 +17,18 @@
 namespace fs = std::filesystem;
 
 static constexpr uint32_t k_max_upscale_dimension = 8192;
+
+static constexpr int k_default_cancel_wait_seconds = 10;
+static constexpr int k_max_cancel_wait_seconds     = 60;
+
+// Reads ?wait=: how long a cancellation may wait for the job to end. Longer waits are shortened to the maximum.
+static bool parse_cancel_wait(const std::string& text, int& seconds) {
+    if (text.empty() || text.size() > 9 || !std::all_of(text.begin(), text.end(), [](unsigned char c) { return std::isdigit(c) != 0; })) {
+        return false;
+    }
+    seconds = std::min(std::stoi(text), k_max_cancel_wait_seconds);
+    return true;
+}
 
 static bool valid_upscale_dimensions(const sd_image_t& image, int factor, int repeats) {
     if (image.width == 0 || image.height == 0 || factor < 1 || repeats < 1 || repeats > 4) {
@@ -204,7 +220,7 @@ static json make_img_gen_features_json() {
         {"hires", true},
         {"cache", true},
         {"cancel_queued", true},
-        {"cancel_generating", false},
+        {"cancel_generating", true},
         {"preview", true},
     };
 }
@@ -219,7 +235,7 @@ static json make_vid_gen_features_json() {
         {"vae_tiling", true},
         {"cache", true},
         {"cancel_queued", true},
-        {"cancel_generating", false},
+        {"cancel_generating", true},
         {"preview", true},
     };
 }
@@ -362,7 +378,7 @@ static json make_capabilities_json(ServerRuntime& runtime) {
     json top_level_output_formats = json::array();
     json top_level_features       = {
               {"cancel_queued", true},
-              {"cancel_generating", false},
+              {"cancel_generating", true},
     };
     std::string current_mode = "";
     if (supports_img) {
@@ -476,6 +492,53 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
         res.set_content(make_capabilities_json(*runtime).dump(), "application/json");
     });
 
+    svr.Get("/sdcpp/v1/health", [runtime](const httplib::Request&, httplib::Response& res) {
+        json body = runtime->keeper->health_json();
+        {
+            AsyncJobManager& manager = *runtime->async_job_manager;
+            std::lock_guard<std::mutex> lock(manager.mutex);
+            body["queue"] = {
+                {"pending", count_pending_jobs(manager)},
+                {"waiting", manager.queue.size()},
+                {"max", manager.max_pending_jobs},
+            };
+        }
+        res.status = body.value("status", std::string()) == "unavailable" ? 503 : 200;
+        res.set_content(safe_json_dump(body), "application/json");
+    });
+
+    svr.Get("/sdcpp/v1/resources", [runtime](const httplib::Request&, httplib::Response& res) {
+        json body;
+        sd_system_memory_t memory;
+        if (sd_get_system_memory(&memory)) {
+            body["system_memory"] = {
+                {"total_bytes", memory.total_bytes},
+                {"available_bytes", memory.available_bytes},
+                {"process_bytes", memory.process_bytes},
+            };
+        } else {
+            body["system_memory"] = nullptr;
+        }
+
+        json devices = json::array();
+        for (size_t i = 0; i < sd_get_device_count(); ++i) {
+            sd_device_info_t info;
+            if (!sd_get_device_info(i, &info)) {
+                continue;
+            }
+            devices.push_back({
+                {"name", info.name},
+                {"description", info.description},
+                {"type", sd_device_type_name(info.type)},
+                {"free_memory_bytes", info.free_memory_bytes},
+                {"total_memory_bytes", info.total_memory_bytes},
+            });
+        }
+        body["devices"] = std::move(devices);
+        res.status      = 200;
+        res.set_content(safe_json_dump(body), "application/json");
+    });
+
     svr.Post("/sdcpp/v1/upscale", [runtime](const httplib::Request& req, httplib::Response& res) {
         try {
             if (req.body.empty()) {
@@ -564,14 +627,16 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 return;
             }
 
-            // One GPU: an upscale must not run while a generation is using it.
-            std::lock_guard<std::mutex> ctx_lock(*runtime->sd_ctx_mutex);
+            // One GPU: an upscale must not run while a generation is using it. The upscaler follows the
+            // settings the server is running with, which are lighter after it stepped down.
+            std::lock_guard<std::mutex> ctx_lock(runtime->keeper->mutex());
+            const ContextKeeper::BackendChoice choice = runtime->keeper->backend_choice();
             UpscalerCtxPtr upscaler_ctx(new_upscaler_ctx(model_path.c_str(),
-                                                         runtime->ctx_params->diffusion_conv_direct,
-                                                         runtime->ctx_params->n_threads,
+                                                         choice.diffusion_conv_direct,
+                                                         choice.n_threads,
                                                          tile_size,
-                                                         runtime->ctx_params->backend.c_str(),
-                                                         runtime->ctx_params->params_backend.c_str()));
+                                                         choice.backend.c_str(),
+                                                         choice.params_backend.c_str()));
             if (upscaler_ctx == nullptr) {
                 res.status = 500;
                 res.set_content(R"({"error":"the upscaler model could not be loaded"})", "application/json");
@@ -635,9 +700,11 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
         } catch (const json::exception& e) {
             res.status = 400;
             res.set_content(json({{"error", "invalid request"}, {"message", e.what()}}).dump(), "application/json");
+        } catch (const std::bad_alloc&) {
+            send_generation_failure(res, out_of_memory_failure());
         } catch (const std::exception& e) {
             res.status = 500;
-            res.set_content(json({{"error", std::string("server_error: ") + e.what()}}).dump(), "application/json");
+            res.set_content(safe_json_dump(json({{"error", std::string("server_error: ") + e.what()}})), "application/json");
         }
     });
 
@@ -675,6 +742,7 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 purge_expired_jobs(manager);
                 if (count_pending_jobs(manager) >= manager.max_pending_jobs) {
                     res.status = 429;
+                    res.set_header("Retry-After", "10");
                     res.set_content(R"({"error":"job queue is full"})", "application/json");
                     return;
                 }
@@ -737,6 +805,7 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 purge_expired_jobs(manager);
                 if (count_pending_jobs(manager) >= manager.max_pending_jobs) {
                     res.status = 429;
+                    res.set_header("Retry-After", "10");
                     res.set_content(R"({"error":"job queue is full"})", "application/json");
                     return;
                 }
@@ -787,9 +856,24 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
         res.set_content(make_async_job_json(manager, *it->second).dump(), "application/json");
     });
 
-    svr.Post(R"(/sdcpp/v1/jobs/([A-Za-z0-9_\-]+)/cancel)", [runtime](const httplib::Request& req, httplib::Response& res) {
+    // The route takes the body through a content reader because it has none: a plain handler is called only after the
+    // HTTP library has read the body, and for a POST without Content-Length (what `curl -X POST` sends) it waits for
+    // its read timeout of 5 seconds to be sure there is none.
+    svr.Post(R"(/sdcpp/v1/jobs/([A-Za-z0-9_\-]+)/cancel)", [runtime](const httplib::Request& req, httplib::Response& res, const httplib::ContentReader& body) {
+        if (req.has_header("Content-Length") || req.has_header("Transfer-Encoding")) {
+            body([](const char*, size_t) { return true; });
+        }
+
+        int wait_seconds = k_default_cancel_wait_seconds;
+        if (req.has_param("wait") && !parse_cancel_wait(req.get_param_value("wait"), wait_seconds)) {
+            res.status = 400;
+            res.set_content(R"({"error":"wait must be a whole number of seconds, 0 or more"})", "application/json");
+            return;
+        }
+
         AsyncJobManager& manager = *runtime->async_job_manager;
-        std::lock_guard<std::mutex> lock(manager.mutex);
+        std::shared_ptr<AsyncGenerationJob> generating;
+        std::unique_lock<std::mutex> lock(manager.mutex);
         purge_expired_jobs(manager);
 
         std::string job_id = req.matches[1];
@@ -817,13 +901,18 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             return;
         }
 
-        if (job.status == AsyncJobStatus::Generating) {
-            res.status = 409;
-            res.set_content(R"({"error":"job is currently generating and cannot be interrupted yet"})", "application/json");
+        if (job.status != AsyncJobStatus::Generating) {
+            res.status = 200;
+            res.set_content(make_async_job_json(manager, job).dump(), "application/json");
             return;
         }
 
-        res.status = 200;
-        res.set_content(make_async_job_json(manager, job).dump(), "application/json");
+        generating = it->second;
+        lock.unlock();
+
+        const bool ended = cancel_generating_job(*runtime, generating, std::chrono::seconds(wait_seconds));
+        lock.lock();
+        res.status = ended ? 200 : 202;
+        res.set_content(make_async_job_json(manager, *generating).dump(), "application/json");
     });
 }

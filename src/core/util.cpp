@@ -15,7 +15,10 @@
 #include <thread>
 #include <unordered_set>
 #include <vector>
+#include "core/ggml_extend_backend.h"
 #include "core/ggml_tensor_utils.h"
+#include "core/last_error.h"
+#include "core/system_memory.h"
 #include "runtime/preprocessing.hpp"
 
 #if defined(__APPLE__) && defined(__MACH__)
@@ -677,6 +680,9 @@ void log_printf(sd_log_level_t level, const char* file, int line, const char* fo
     va_start(args, format);
     std::string message = sd_vformat(format, args);
     va_end(args);
+    if (level == SD_LOG_ERROR) {
+        sd::last_error::note_log(message);
+    }
     std::string origin = sd_format("%s:%d", sd_basename(file).c_str(), line);
     sd_log_dispatch(level, origin, message);
 }
@@ -699,6 +705,13 @@ void sd_ggml_log_callback(ggml_log_level level, const char* text, void*) {
         default:
             sd_level = SD_LOG_VERBOSE;
             break;
+    }
+    if (sd_level == SD_LOG_ERROR) {
+        std::string message = text;
+        while (!message.empty() && (message.back() == '\n' || message.back() == '\r')) {
+            message.pop_back();
+        }
+        sd::last_error::note_log("ggml: " + message);
     }
     sd_log_dispatch(sd_level, "ggml", text);
 }
@@ -1143,10 +1156,8 @@ std::vector<std::pair<std::string, float>> split_quotation_attention(
 }
 
 size_t sd_list_devices(char* buffer, size_t buffer_size) {
-    if (ggml_backend_dev_count() == 0) {
-        // dynamic-backend builds discover their backend modules at runtime
-        ggml_backend_load_all();
-    }
+    // dynamic-backend builds discover their backend modules at runtime
+    sd_backend_ensure_loaded();
 
     std::ostringstream oss;
     for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
@@ -1166,10 +1177,8 @@ size_t sd_list_devices(char* buffer, size_t buffer_size) {
 }
 
 size_t sd_get_device_count(void) {
-    if (ggml_backend_dev_count() == 0) {
-        // dynamic-backend builds discover their backend modules at runtime
-        ggml_backend_load_all();
-    }
+    // dynamic-backend builds discover their backend modules at runtime
+    sd_backend_ensure_loaded();
     return ggml_backend_dev_count();
 }
 
@@ -1202,6 +1211,13 @@ bool sd_get_device_info(size_t index, sd_device_info_t* info) {
     }
     size_t free_bytes = 0, total_bytes = 0;
     ggml_backend_dev_memory(dev, &free_bytes, &total_bytes);
+    if (info->type == SD_DEVICE_TYPE_CPU) {
+        // ggml reports all RAM as free on Linux and macOS; what a program can really use is what is available.
+        const int64_t available = sd::system_memory::query().available_bytes;
+        if (available >= 0) {
+            free_bytes = static_cast<size_t>(available);
+        }
+    }
     info->free_memory_bytes  = free_bytes;
     info->total_memory_bytes = total_bytes;
     return true;

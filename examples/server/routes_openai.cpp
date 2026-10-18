@@ -2,11 +2,13 @@
 
 #include <algorithm>
 #include <ctime>
+#include <new>
 #include <regex>
 
 #include "common/common.h"
 #include "common/media_io.h"
 #include "common/resource_owners.hpp"
+#include "recovery.h"
 
 static std::string extract_and_remove_sd_cpp_extra_args(std::string& text) {
     std::regex re("<sd_cpp_extra_args>(.*?)</sd_cpp_extra_args>");
@@ -226,22 +228,32 @@ static bool build_openai_edit_request(const httplib::Request& req,
 static bool execute_sync_img_gen_request(ServerRuntime& runtime,
                                          ImgGenJobRequest& request,
                                          SDImageVec& results,
-                                         std::string& error_message) {
-    sd_img_gen_params_t img_gen_params = request.to_sd_img_gen_params_t();
-    int num_results                    = 0;
+                                         GenerationFailure& failure) {
+    const sd_img_gen_params_t img_gen_params = request.to_sd_img_gen_params_t();
 
-    {
-        std::lock_guard<std::mutex> lock(*runtime.sd_ctx_mutex);
-        sd_image_t* raw_results = nullptr;
-        if (!generate_image(runtime.sd_ctx, &img_gen_params, &raw_results, &num_results)) {
-            raw_results = nullptr;
-            num_results = 0;
-        }
-        results.adopt(raw_results, num_results);
+    const bool generated = runtime.keeper->run(
+        [&](const ContextKeeper::ContextView& view) {
+            sd_img_gen_params_t params = img_gen_params;
+            if (view.force_vae_tiling) {
+                params.vae_tiling_params.enabled = true;
+            }
+            sd_image_t* raw_results = nullptr;
+            int num_results         = 0;
+            if (!generate_image(view.ctx, &params, &raw_results, &num_results)) {
+                return false;
+            }
+            results.adopt(raw_results, num_results);
+            return true;
+        },
+        failure);
+    if (!generated) {
+        return false;
     }
 
     if (results.empty()) {
-        error_message = "generate_image returned no results";
+        failure         = GenerationFailure();
+        failure.code    = SD_ERROR_UNKNOWN;
+        failure.message = "generate_image returned no results";
         return false;
     }
     return true;
@@ -276,9 +288,9 @@ void register_openai_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             LOG_VERBOSE("%s\n", request.gen_params.to_string().c_str());
 
             SDImageVec results;
-            if (!execute_sync_img_gen_request(*runtime, request, results, error_message)) {
-                res.status = 500;
-                res.set_content(json({{"error", error_message}}).dump(), "application/json");
+            GenerationFailure failure;
+            if (!execute_sync_img_gen_request(*runtime, request, results, failure)) {
+                send_generation_failure(res, failure);
                 return;
             }
 
@@ -322,12 +334,14 @@ void register_openai_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             res.set_content(out.dump(), "application/json");
             res.status = 200;
 
+        } catch (const std::bad_alloc&) {
+            send_generation_failure(res, out_of_memory_failure());
         } catch (const std::exception& e) {
             res.status = 500;
             json err;
             err["error"]   = "server_error";
             err["message"] = e.what();
-            res.set_content(err.dump(), "application/json");
+            res.set_content(safe_json_dump(err), "application/json");
         }
     });
 
@@ -350,9 +364,9 @@ void register_openai_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             LOG_VERBOSE("%s\n", request.gen_params.to_string().c_str());
 
             SDImageVec results;
-            if (!execute_sync_img_gen_request(*runtime, request, results, error_message)) {
-                res.status = 500;
-                res.set_content(json({{"error", error_message}}).dump(), "application/json");
+            GenerationFailure failure;
+            if (!execute_sync_img_gen_request(*runtime, request, results, failure)) {
+                send_generation_failure(res, failure);
                 return;
             }
 
@@ -387,12 +401,14 @@ void register_openai_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             res.set_content(out.dump(), "application/json");
             res.status = 200;
 
+        } catch (const std::bad_alloc&) {
+            send_generation_failure(res, out_of_memory_failure());
         } catch (const std::exception& e) {
             res.status = 500;
             json err;
             err["error"]   = "server_error";
             err["message"] = e.what();
-            res.set_content(err.dump(), "application/json");
+            res.set_content(safe_json_dump(err), "application/json");
         }
     });
 }

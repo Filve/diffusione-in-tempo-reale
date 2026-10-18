@@ -33,6 +33,24 @@ If you want to use a different host or port, pass:
 --listen-ip <ip> --listen-port <port>
 ```
 
+# When the memory runs short
+
+A request that makes the machine run out of memory does not stop the server. It frees the model, loads it again
+with a lighter configuration (profiles `max > balanced > lite > lite-disk > lite-cpu`, see `--profile`) and runs the
+same request again; from `lite` on, the VAE is decoded in tiles. The request is then served normally. When even the
+lightest profile does not fit, the request is answered with `503` and a `Retry-After` header, and the server stays up.
+After a quiet period the server climbs back one profile at a time.
+
+* `--degradation-cooldown <seconds>` sets how long the server waits before climbing back (default `300`; `0` = stay
+  on the lighter profile until the next restart)
+* `--disable-degradation` turns this off: a request that runs out of memory is answered with the error at once
+* `GET /sdcpp/v1/health` tells which profile is in use, how many times the server had to step down and the last
+  error; `GET /sdcpp/v1/resources` reports the free memory of the machine and of each device
+
+If the model does not fit at startup, the server starts on the first profile that loads it (the log says which). When
+the model cannot be loaded at all, or the address cannot be used, `sd-server` exits with a non-zero code and says why.
+See [Failures and recovery](api.md#failures-and-recovery) for the answers a client gets.
+
 # Frontend
 
 ## Build with Frontend

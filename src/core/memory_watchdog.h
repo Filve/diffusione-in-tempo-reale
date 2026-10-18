@@ -34,8 +34,10 @@ namespace sd {
 
         Pressure classify(const Sample& sample) const;
 
-        // Records the backend's pressure state and logs transitions.
-        Pressure observe(ggml_backend_t backend, const Sample& sample);
+        // Records the backend's pressure state and logs transitions. A backend
+        // observed with gates_prefetch = false (the CPU, whose pressure is system
+        // RAM) never suspends prefetch for other backends.
+        Pressure observe(ggml_backend_t backend, const Sample& sample, bool gates_prefetch = true);
 
         // True while any observed backend is at High pressure or above.
         bool prefetch_suspended() const;
@@ -48,6 +50,7 @@ namespace sd {
         int threshold_percent_ = 0;
         std::map<ggml_backend_t, Pressure> states_;
         std::set<ggml_backend_t> unreachable_logged_;
+        std::set<ggml_backend_t> prefetch_exempt_;
     };
 
 }  // namespace sd

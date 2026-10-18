@@ -21,6 +21,16 @@ CPU fallback. It excludes weights and cache buffers. Within a runner lifecycle,
 the summary is printed only on the first graph or when backend capacities or the
 segment count change.
 
+## Run conditional and unconditional CFG in one batched UNet forward.
+
+For UNet models, the conditional and unconditional guidance branches are
+concatenated into a single batch of two and run through one UNet forward per
+step instead of two separate forwards. This is enabled by default whenever the
+run qualifies for it.
+
+Use `--batched-cfg off` to force separate conditional and unconditional
+forwards.
+
 ## Use VAE tiling to reduce encode and decode memory usage.
 
 `--vae-tiling` enables spatial tiling for both VAE encoding and decoding. The
@@ -164,8 +174,93 @@ more pressed:
 The guard covers memory managed by the runners (weights, compute workspaces,
 caches). Driver contexts and allocations made outside the managed runners stay
 invisible to it, so it is not a hard physical cap. On backends that do not
-report device memory the guard only tracks the managed `--max-vram` budget,
-and it does not apply to CPU backends. `0` (the default) disables the guard.
+report device memory the guard only tracks the managed `--max-vram` budget.
+`0` (the default) disables the guard.
+
+On CPU backends the guard measures system RAM instead: used memory (total minus
+the memory available without swapping, plus the allocation a graph is about to
+make) against total physical memory. Under pressure it releases unpinned weights
+that can be re-read from disk (`--params-backend disk`); weights that live only
+in RAM cannot be released, so the guard logs a warning once and the run
+continues. RAM is shared with other programs, so the percentage covers the whole
+machine, not only this process. The guard never fails a graph on the CPU, and it
+does nothing on platforms that cannot report available memory.
+
+Weights that stream from disk are counted before they are loaded, so on the CPU
+the guard sees what a graph is about to need and not only what is resident. When
+that total would pass the threshold, a graph that has graph cuts runs in segments,
+as it does on a GPU: each segment reads its weights, computes, and lets them go
+before the next one starts, which keeps the peak well below the whole model. This
+only applies when some weights can be released (`--params-backend disk`); if
+every weight is resident in RAM, splitting the graph would not lower the peak and
+the graph runs in one piece. `--disable-segmented-compute` turns segmentation off.
+
+On a machine without a GPU, `--auto-fit` plans RAM against the CPU backend (see
+[backend.md](./backend.md#automatic-placement---auto-fit-onoff)) and, when it
+puts a component on disk, sets the guard to 90 unless `--memory-guard` is given.
+On Linux, available memory comes from `/proc/meminfo`, which does not reflect the
+limit of a container's memory cgroup; inside a container with such a limit, pass
+`--memory-guard` and `--params-backend disk` explicitly and leave headroom.
+
+## Pick a resource profile (`--profile`).
+
+`--profile` sets, in one option, the settings that trade speed for a smaller
+memory footprint:
+
+| Profile | What it sets |
+|---|---|
+| `max` | nothing; the defaults of the engine |
+| `balanced` | `--memory-guard 90` |
+| `lite` | `--memory-guard 85`, the text encoder on the CPU (`--backend te=cpu`), `--vae-tiling`, `--batched-cfg off` |
+| `auto` | one of the three above, chosen from the machine (below) |
+
+An option given on the command line always wins over the profile: with
+`--profile lite --memory-guard 70` the guard is 70, and `--memory-guard 0` keeps
+it off. A profile does not set `--params-backend` or `--backend`, so `--auto-fit`
+still decides where the weights live. It does not change the size, the steps or
+the sampler of an image; it only changes where the memory goes, and with it the
+speed (the text encoder on the CPU and the tiled VAE are slower, unbatched CFG
+needs two forwards per step).
+
+`auto` adds up the size of the model files and a working-memory reserve (1 GiB
+plus a fifth of the weights) and compares it with the memory where the compute
+happens: the free memory of the discrete GPU with the most, or the available RAM
+without one. With several discrete GPUs of the same backend it counts their free
+memory together (less 2 GiB of working memory for each GPU after the first), because
+`--auto-fit` can spread a model over them (see `--multi-gpu` in
+[backend.md](./backend.md#several-gpus---multi-gpu-autoonoff)); `--multi-gpu off`, an
+explicit `--backend` or `--params-backend`, or `--auto-fit off` keep the count to one
+GPU. `max` when it fits with a quarter to spare, `balanced` when it fits,
+`lite` when it does not and the weights will have to be streamed. The decision and
+the figures are logged, for example:
+
+```
+[INFO ] profile auto -> lite (model 6.9 GiB + 2.4 GiB working memory, RAM available 5.0 GiB, GPU free 5.5 GiB: does not fit, weights will be streamed)
+[INFO ] profile auto -> balanced (model 14.0 GiB + 3.8 GiB working memory, RAM available 8.0 GiB, GPU free 22.0 GiB over 2 GPUs: fits with little margin)
+```
+
+With no GPU the line says `no GPU memory reported` and the available RAM decides.
+
+The estimate comes from the file sizes (it does not read the models) and does not
+account for `--type` conversions at load time. When the sizes or the memory are
+unknown, `auto` leaves the defaults alone. The thresholds are heuristics.
+
+### Two more levels for the server
+
+`sd-server` can go beyond `lite` on its own. When a request runs out of memory, it
+loads the model again with the next lighter profile and runs the request again:
+
+| Level | What it sets |
+|---|---|
+| `lite-disk` | `--params-backend disk` (weights are streamed from the file instead of kept in memory); `--eager-load` is switched off |
+| `lite-cpu` | everything on the CPU (`--backend cpu`); only when the machine has another device |
+
+These two are not values of `--profile`. The server climbs back one level at a time
+after `--degradation-cooldown` seconds; every climb loads the model once, which takes
+long on a large model. If that cost is not worth it, start the server on the lighter
+profile with `--profile lite` and `--degradation-cooldown 0`, or use
+`--disable-degradation` to get the error at once. See [Failures and
+recovery](../examples/server/api.md#failures-and-recovery).
 
 ## Use quantization to reduce memory usage.
 

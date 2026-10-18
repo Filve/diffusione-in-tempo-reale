@@ -3,14 +3,14 @@
 ## Get the Code
 
 ```
-git clone --recursive https://github.com/leejet/stable-diffusion.cpp
-cd stable-diffusion.cpp
+git clone --recursive https://github.com/Filve/diffusione-in-tempo-reale
+cd diffusione-in-tempo-reale
 ```
 
 - If you have already cloned the repository, you can use the following command to update the repository to the latest code.
 
 ```
-cd stable-diffusion.cpp
+cd diffusione-in-tempo-reale
 git pull origin master
 git submodule init
 git submodule update
@@ -102,7 +102,40 @@ at runtime, which keeps the same package working on very old CPUs.
 
 `scripts/package_portable.sh <build_dir>` collects the executables, backend
 modules, and license files from a portable build into a relocatable zip under
-`dist/`.
+`dist/`. Two environment variables describe a GPU package:
+`PORTABLE_VARIANT=cuda12|vulkan|metal` (zip name suffix and README wording) and
+`PORTABLE_REQUIRE_BACKENDS=cuda|vulkan|metal`, which makes the script fail when
+that backend module is not in the build (on Windows, also when the CUDA runtime
+DLLs `cudart64_*`, `cublas64_*` and `cublasLt64_*` are missing) instead of
+shipping a package that silently runs on the CPU.
+
+The GitHub Actions workflow `.github/workflows/release-portable.yml` builds
+these packages, each with the CPU backend plus one GPU module:
+
+| Package | GPU backend | Notes |
+|---|---|---|
+| `linux-x86_64` | Vulkan | needs the Vulkan loader (`libvulkan.so.1`) at runtime |
+| `darwin-arm64` | Metal | Apple Silicon |
+| `windows-x86_64` | Vulkan | NVIDIA, AMD and Intel GPUs; `vulkan-1.dll` comes with the GPU driver |
+| `windows-x86_64-cuda12` | CUDA 12 | NVIDIA only; the CUDA runtime DLLs are bundled, only the NVIDIA driver is needed (without it the package still starts, on the CPU) |
+
+On Windows every package also needs the Microsoft Visual C++ Redistributable
+2015-2022 (x64), **version 14.44 or newer**. The executables are built with MSVC
+14.44, and Microsoft requires an installed redistributable at least as recent as
+the build tools that produced the binaries
+([details](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist)).
+If it is missing or older, Windows cannot load the DLLs and ends the program at
+once without printing anything: the exit code is `0xC0000135` (`3221225781`,
+shown as `-1073741515` by PowerShell). Check the installed version with
+`(Get-Item C:\Windows\System32\msvcp140.dll).VersionInfo.FileVersion` and install
+the latest from <https://aka.ms/vc14/vc_redist.x64.exe>. If you rebuild with a
+newer Visual Studio, the version of that compiler applies instead.
+
+Start it from the Actions tab ("Run workflow", any branch) or push a tag
+`portable-v*`, which also attaches the zips to a release. The manual run takes
+two inputs: `targets` (`all` or a comma-separated list of the package names
+above) and `cuda_architectures` (default `61;70;75;80;86;89;90;100;120`; a single
+architecture, e.g. `86` for GeForce RTX 30 series, shortens the CUDA build a lot).
 
 ## Build with OpenBLAS
 

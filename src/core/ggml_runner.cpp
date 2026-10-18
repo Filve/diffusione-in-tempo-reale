@@ -7,6 +7,7 @@
 #include "core/ggml_extend_backend.h"
 #include "core/ggml_runner.h"
 #include "core/ggml_tensor_utils.h"
+#include "core/last_error.h"
 #include "core/layer_split_partition.h"
 #include "core/segment_graph_bindings.h"
 #include "core/segment_weight_pipeline.h"
@@ -652,7 +653,7 @@ std::optional<sd::Tensor<float>> GGMLRunner::compute(get_graph_cb_t get_graph,
         output = execute_graph(graph, n_threads, no_return, read_outputs);
     } catch (const std::bad_alloc&) {
         last_compute_status_ = GGML_STATUS_ALLOC_FAILED;
-        LOG_ERROR("%s graph allocation failed", get_desc().c_str());
+        LOG_ERROR_CODE(SD_ERROR_OUT_OF_MEMORY, "%s graph allocation failed", get_desc().c_str());
         return std::nullopt;
     } catch (const std::exception& error) {
         last_compute_status_ = GGML_STATUS_FAILED;
@@ -664,6 +665,8 @@ std::optional<sd::Tensor<float>> GGMLRunner::compute(get_graph_cb_t get_graph,
     if (success) {
         cache_.graph_end(true);
         last_compute_status_ = GGML_STATUS_SUCCESS;
+    } else if (last_compute_status_ == GGML_STATUS_ALLOC_FAILED) {
+        sd::last_error::mark(SD_ERROR_OUT_OF_MEMORY, get_desc() + " ran out of memory");
     }
     return output;
 }
@@ -782,7 +785,8 @@ bool GGMLRunner::execute_segment(ggml_cgraph* graph, int n_threads) {
     workspace_.synchronize();
     if (status != GGML_STATUS_SUCCESS) {
         last_compute_status_ = status;
-        LOG_ERROR("%s compute failed: %s", get_desc().c_str(), ggml_status_to_string(status));
+        LOG_ERROR_CODE(status == GGML_STATUS_ALLOC_FAILED ? SD_ERROR_OUT_OF_MEMORY : SD_ERROR_BACKEND,
+                       "%s compute failed: %s", get_desc().c_str(), ggml_status_to_string(status));
         return false;
     }
     const std::string description = get_desc();
@@ -847,8 +851,9 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
         return fits(requests, params);
     };
     auto manager         = residency_manager.lock();
-    const bool segmented = !is_multi_device() && !sd_backend_is_cpu(runtime_backend) &&
+    const bool segmented = !is_multi_device() &&
                            manager != nullptr && manager->segmented_compute_enabled() &&
+                           (!sd_backend_is_cpu(runtime_backend) || manager->segmenting_can_save_memory(params, runtime_backend)) &&
                            cached_plan.valid && cached_plan.has_cuts && cached_plan.segments.size() > 1 &&
                            !fits_monolithic();
     ggml_graph_cut::Plan monolithic_plan;

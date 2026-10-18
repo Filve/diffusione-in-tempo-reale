@@ -1223,7 +1223,7 @@ namespace sd::pipeline {
             return nullptr;
         }
         if (sd->get_cancel_flag() == SD_CANCEL_ALL) {
-            LOG_ERROR("cancelling video decode");
+            LOG_INFO("cancelling video decode");
             return nullptr;
         }
         sd::Tensor<float> video_latent = final_latent;
@@ -1625,7 +1625,7 @@ namespace sd::pipeline {
 
         if (plan.high_noise_sample_steps > 0) {
             if (sd->get_cancel_flag() == SD_CANCEL_ALL) {
-                LOG_ERROR("cancelling generation before high-noise sampling");
+                LOG_INFO("cancelling generation before high-noise sampling");
                 return false;
             }
             LOG_VERBOSE("sample(high noise) %dx%dx%d", W, H, T);
@@ -1662,7 +1662,11 @@ namespace sd::pipeline {
                                                        latents.video_positions);
             int64_t sampling_end          = ggml_time_ms();
             if (x_t_sampled.empty()) {
-                LOG_ERROR("sampling(high noise) failed after %.2fs", (sampling_end - sampling_start) * 1.0f / 1000);
+                if (sd->get_cancel_flag() == SD_CANCEL_ALL) {
+                    LOG_INFO("sampling(high noise) cancelled after %.2fs", (sampling_end - sampling_start) * 1.0f / 1000);
+                } else {
+                    LOG_ERROR("sampling(high noise) failed after %.2fs", (sampling_end - sampling_start) * 1.0f / 1000);
+                }
                 return false;
             }
 
@@ -1672,7 +1676,7 @@ namespace sd::pipeline {
         }
 
         if (sd->get_cancel_flag() == SD_CANCEL_ALL) {
-            LOG_ERROR("cancelling generation before sampling");
+            LOG_INFO("cancelling generation before sampling");
             return false;
         }
         LOG_VERBOSE("sample %dx%dx%d", W, H, T);
@@ -1706,14 +1710,18 @@ namespace sd::pipeline {
 
         int64_t sampling_end = ggml_time_ms();
         if (final_latent.empty()) {
-            LOG_ERROR("sampling failed after %.2fs", (sampling_end - sampling_start) * 1.0f / 1000);
+            if (sd->get_cancel_flag() == SD_CANCEL_ALL) {
+                LOG_INFO("sampling cancelled after %.2fs", (sampling_end - sampling_start) * 1.0f / 1000);
+            } else {
+                LOG_ERROR("sampling failed after %.2fs", (sampling_end - sampling_start) * 1.0f / 1000);
+            }
             return false;
         }
         LOG_INFO("sampling completed, taking %.2fs", (sampling_end - sampling_start) * 1.0f / 1000);
 
         if (latent_upscale_enabled) {
             if (sd->get_cancel_flag() == SD_CANCEL_ALL) {
-                LOG_ERROR("cancelling generation before latent upscale");
+                LOG_INFO("cancelling generation before latent upscale");
                 return false;
             }
             int64_t upscale_start             = ggml_time_ms();
@@ -1776,7 +1784,7 @@ namespace sd::pipeline {
             sd::Tensor<float> hires_denoise_mask;
             sd::Tensor<float> hires_video_positions;
             if (sd->get_cancel_flag() == SD_CANCEL_ALL) {
-                LOG_ERROR("cancelling generation before latent upscale refine");
+                LOG_INFO("cancelling generation before latent upscale refine");
                 return false;
             }
             if (!apply_ltxv_refine_image_conditioning(sd,
@@ -1844,8 +1852,13 @@ namespace sd::pipeline {
                                         hires_video_positions);
             sampling_end   = ggml_time_ms();
             if (final_latent.empty()) {
-                LOG_ERROR("sampling(latent upscale) failed after %.2fs",
-                          (sampling_end - sampling_start) * 1.0f / 1000);
+                if (sd->get_cancel_flag() == SD_CANCEL_ALL) {
+                    LOG_INFO("sampling(latent upscale) cancelled after %.2fs",
+                             (sampling_end - sampling_start) * 1.0f / 1000);
+                } else {
+                    LOG_ERROR("sampling(latent upscale) failed after %.2fs",
+                              (sampling_end - sampling_start) * 1.0f / 1000);
+                }
                 return false;
             }
             LOG_INFO("sampling(latent upscale) completed, taking %.2fs",
@@ -1887,7 +1900,7 @@ namespace sd::pipeline {
             latents.audio_length > 0 &&
             sd->audio_vae_model != nullptr) {
             if (sd->get_cancel_flag() == SD_CANCEL_ALL) {
-                LOG_ERROR("cancelling generation before audio decode");
+                LOG_INFO("cancelling generation before audio decode");
                 return false;
             }
             int64_t audio_latent_decode_start = ggml_time_ms();
@@ -1927,7 +1940,7 @@ namespace sd::pipeline {
         }
 
         if (sd->get_cancel_flag() == SD_CANCEL_ALL) {
-            LOG_ERROR("cancelling generation before video decode");
+            LOG_INFO("cancelling generation before video decode");
             free_sd_audio(generated_audio);
             return false;
         }

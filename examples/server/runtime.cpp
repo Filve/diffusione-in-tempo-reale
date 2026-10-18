@@ -11,6 +11,7 @@
 
 #include "common/common.h"
 #include "common/log.h"
+#include "recovery.h"
 
 namespace fs = std::filesystem;
 
@@ -168,16 +169,16 @@ std::string video_mime_type(const std::string& output_format) {
 
 bool runtime_supports_generation_mode(const ServerRuntime& runtime, SDMode mode) {
     if (mode == VID_GEN) {
-        return sd_ctx_supports_video_generation(runtime.sd_ctx);
+        return runtime.keeper->supports_video_generation();
     }
     if (mode == IMG_GEN) {
-        return sd_ctx_supports_image_generation(runtime.sd_ctx);
+        return runtime.keeper->supports_image_generation();
     }
     return true;
 }
 
 std::string unsupported_generation_mode_error(const ServerRuntime& runtime, SDMode mode) {
-    if (runtime.sd_ctx == nullptr) {
+    if (!runtime.keeper->has_model()) {
         return "no model loaded; restart the server with -m/--diffusion-model";
     }
     if (mode == VID_GEN) {
@@ -201,10 +202,12 @@ ArgOptions SDSvrParams::get_options() {
 
     options.int_options = {
         {"", "--listen-port", "server listen port (default: 1234)", &listen_port},
+        {"", "--degradation-cooldown", "seconds the server waits, after stepping down to a lighter profile, before it tries the next heavier one again; a failed attempt doubles the wait up to one hour (default: 300, 0 = never go back up)", &degradation_cooldown},
     };
 
     options.bool_options = {
         {"", "--color", "colors the logging tags according to level", true, &color},
+        {"", "--disable-degradation", "answer a request that runs out of memory with an error (503) instead of loading the model again with a lighter profile and repeating the request", true, &disable_degradation},
     };
 
     auto on_help_arg = [&](int, const char**, int, bool& valid) {
@@ -231,6 +234,11 @@ bool SDSvrParams::validate() {
         return false;
     }
 
+    if (degradation_cooldown < 0) {
+        LOG_ERROR("error: --degradation-cooldown must be 0 or more seconds");
+        return false;
+    }
+
     if (!serve_html_path.empty() && !fs::exists(serve_html_path)) {
         LOG_ERROR("error: serve_html_path file does not exist: %s", serve_html_path.c_str());
         return false;
@@ -254,6 +262,8 @@ std::string SDSvrParams::to_string() const {
         << "  serve_html_path: \"" << serve_html_path << "\",\n"
         << "  api_key: " << (api_key.empty() ? "(not set)" : "(set)") << ",\n"
         << "  cors_origins: \"" << cors_origins << "\",\n"
+        << "  disable_degradation: " << (disable_degradation ? "true" : "false") << ",\n"
+        << "  degradation_cooldown: " << degradation_cooldown << ",\n"
         << "}";
     return oss.str();
 }

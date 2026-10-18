@@ -193,8 +193,9 @@ jobs:
       artifact-metadata: write
 
     strategy:
+      fail-fast: false
       matrix:
-        variant: [musa, sycl, vulkan, cuda]
+        variant: [cpu, musa, sycl, vulkan, cuda]
         platform: [linux/amd64]
         runner: [ubuntu-latest]
         build-args: [""]
@@ -236,6 +237,9 @@ jobs:
         if: ${{ ( github.event_name == 'push' && github.ref == 'refs/heads/master' ) || github.event.inputs.create_release == 'true' }}
         uses: prompt/actions-commit-hash@v2
 
+      - name: Normalize image name to lowercase
+        run: echo "IMAGE_NAME=${IMAGE_NAME,,}" >> "$GITHUB_ENV"
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -266,7 +270,7 @@ jobs:
           context: .
           platforms: ${{ matrix.platform }}
           push: ${{ ( github.event_name == 'push' && github.ref == 'refs/heads/master' ) || github.event.inputs.create_release == 'true' }}
-          file: docker/Dockerfile.${{ matrix.variant }}
+          file: ${{ matrix.variant == 'cpu' && 'docker/Dockerfile' || format('docker/Dockerfile.{0}', matrix.variant) }}
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.BRANCH_NAME }}-${{ matrix.variant }}${{ matrix.tag-suffix }}
           labels: ${{ steps.meta.outputs.labels }}
           annotations: ${{ steps.meta.outputs.annotations }}
@@ -451,8 +455,8 @@ jobs:
     runs-on: windows-2022
 
     env:
-      ROCM_VERSION: "7.14.0"
-      GPU_TARGETS: "gfx1010;gfx1011;gfx1012;gfx1030;gfx1031;gfx1032;gfx1033;gfx1034;gfx1035;gfx1036;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1153;gfx1200;gfx1201"
+      ROCM_VERSION: "10.1.0"
+      gpu_targets: "gfx1010;gfx1011;gfx1012;gfx1030;gfx1031;gfx1032;gfx1033;gfx1034;gfx1035;gfx1036;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1153;gfx1200;gfx1201"
 
     steps:
       - uses: actions/checkout@v3
@@ -498,7 +502,7 @@ jobs:
 
           write-host "Installing ROCm wheels for multi-arch support"
           # Install ROCm wheels for multi-arch support (this may take several minutes)
-          python -m pip install --index-url https://repo.amd.com/rocm/whl-multi-arch/ "rocm[libraries,devel]==${{env.ROCM_VERSION}}"
+          python -m pip install --index-url https://stable.repo.amd.com/rocm/whl-next/ "rocm[libraries,devel]==${{env.ROCM_VERSION}}"
 
           # Pre-expand the devel tree so it is included in the cache
           write-host "Initializing ROCm devel tree"
@@ -594,9 +598,9 @@ jobs:
     strategy:
       matrix:
         include:
-          - ROCM_VERSION: "7.14.0"
+          - ROCM_VERSION: "10.1.0"
             gpu_targets: "gfx900;gfx906;gfx908;gfx90a;gfx90c;gfx942;gfx950;gfx1010;gfx1011;gfx1012;gfx1030;gfx1031;gfx1032;gfx1033;gfx1034;gfx1035;gfx1036;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1153;gfx1200;gfx1201"
-            build: x64
+            build: 'x64'
 
     steps:
       - name: Clone
@@ -610,6 +614,16 @@ jobs:
         with:
           key: ubuntu-rocm-cmake-${{ matrix.ROCM_VERSION }}-${{ matrix.build }}
           evict-old-files: 1d
+          max-size: "2G"
+
+      - name: Tune ccache for reinstalled ROCm toolchain
+        run: |
+          # ROCm is pip-installed fresh each run, so the clang binary's mtime
+          # changes every time. With the default compiler_check=mtime that
+          # invalidates the cache; hash compiler contents instead so warm
+          # builds hit.
+          ccache --set-config=compiler_check=content
+          ccache --set-config=sloppiness=time_macros,include_file_mtime,include_file_ctime
 
       - name: Dependencies
         id: depends
@@ -646,7 +660,7 @@ jobs:
           # libraries = HIP runtime and CMake configs needed for linking
           # devel = compilers, headers, static libs
           python -m pip install --upgrade pip
-          python -m pip install --index-url https://repo.amd.com/rocm/whl-multi-arch/ "rocm[libraries,devel]==${{matrix.ROCM_VERSION}}"
+          python -m pip install --index-url https://stable.repo.amd.com/rocm/whl-next/ "rocm[libraries,devel]==${{matrix.ROCM_VERSION}}"
 
           # Get ROCm installation paths using the rocm-sdk CLI tool
           ROCM_PATH=$(rocm-sdk path --root)
@@ -742,6 +756,9 @@ jobs:
 
     runs-on: ubuntu-latest
 
+    permissions:
+      contents: write
+
     needs:
       - ubuntu-latest-cmake
       - ubuntu-latest-cmake-vulkan
@@ -765,6 +782,9 @@ jobs:
           pattern: sd-*
           merge-multiple: true
 
+      - name: Combine the Windows CUDA and Vulkan packages
+        run: bash scripts/package_windows_cuda_vulkan.sh ./artifact
+
       - name: Get commit count
         id: commit_count
         run: |
@@ -782,6 +802,21 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: ${{ format('{0}-{1}-{2}', env.BRANCH_NAME, steps.commit_count.outputs.count, steps.commit.outputs.short) }}
+          body: |
+            **Windows: quale file scaricare**
+
+            | File | Quando sceglierlo |
+            |---|---|
+            | `sd-<ramo>-<commit>-bin-win-cuda12-vulkan-x64.zip` | scheda **NVIDIA**, anche insieme a una GPU AMD o integrata: CUDA, le DLL di CUDA e Vulkan sono già nella stessa cartella, in un solo download. Serve il driver NVIDIA aggiornato |
+            | `sd-<ramo>-<commit>-bin-win-cuda12-x64.zip` + `cudart-sd-bin-win-cu12-x64.zip` | solo schede **NVIDIA**, senza Vulkan. Scompatta **entrambi** nella stessa cartella: il secondo contiene le DLL di CUDA. Serve il driver NVIDIA aggiornato |
+            | `sd-<ramo>-<commit>-bin-win-vulkan-x64.zip` | schede NVIDIA, AMD e Intel con driver Vulkan |
+            | `sd-<ramo>-<commit>-bin-win-cpu-x64.zip` | solo CPU |
+
+            Non scompattare lo zip Vulkan sopra quello CUDA: quasi tutti i file hanno lo stesso nome ma sono compilati in modo diverso, e ne esce una build mista. Lo zip `cuda12-vulkan` è assemblato da `scripts/package_windows_cuda_vulkan.sh` partendo dagli zip di questa stessa release, e da quello Vulkan prende solo `ggml-vulkan.dll`.
+
+            **Requisito su Windows: [Microsoft Visual C++ Redistributable](https://aka.ms/vc14/vc_redist.x64.exe) 2015-2022 (x64), versione 14.44 o successiva.** Se manca o è più vecchio, il programma si chiude subito senza scrivere nulla (codice di uscita `0xC0000135`, cioè `3221225781` oppure `-1073741515` in PowerShell). Controlla la versione con `(Get-Item C:\Windows\System32\msvcp140.dll).VersionInfo.FileVersion`.
+
+            Dopo lo scompattamento `.\sd-cli.exe --list-devices` deve elencare una riga `gpu`, non soltanto `CPU`. Guida completa: https://github.com/${{ github.repository }}/blob/master/docs/integrazione_progetti.md#28-problemi-comuni-e-come-leggerli
 
       - name: Upload release
         id: upload_release

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./assets/logo.png" width="360x">
+  <img src="./assets/logo-1.png" width="360x">
 </p>
 
 # diffusione-in-tempo-reale
@@ -17,9 +17,19 @@ progetto originale. Modifiche del fork di **Francesco Simeoni**
 
 - **Rilevamento hardware**: API C `sd_get_device_count()` / `sd_get_device_info()` e `--list-devices` con tipo e memoria di ogni device
 - **Fallback CPU automatico**: se il backend richiesto manca o non si inizializza, il contesto degrada alla CPU invece di fallire
-- **Memory guard** (`--memory-guard 90`): sopra la soglia riduce la pressione di memoria (eviction dei pesi, prefetch sospeso) prima dell'out-of-memory
+- **Memory guard** (`--memory-guard 90`): sopra la soglia riduce la pressione di memoria (eviction dei pesi, prefetch sospeso) prima dell'out-of-memory; sulla CPU misura la RAM di sistema
+- **Profili di risorse** (`--profile lite|balanced|max|auto`): un'unica opzione imposta guardiano di memoria, encoder di testo su CPU e VAE a tasselli per le macchine piccole; `auto` sceglie in base al modello e alla memoria libera
+- **Nessuna, una o più GPU** (`--multi-gpu auto|on|off`): con più GPU dello stesso backend l'auto-fit sposta l'encoder di testo o il VAE su un'altra GPU, o divide per blocchi un modello che non sta in una sola; `--profile auto` ne somma la memoria. Una singola immagine non diventa più veloce: per la produttività, un `sd-server` per GPU
+- **Strumento per assistenti AI** (chat, agenti che controllano il browser): schemi degli strumenti, preset, ricette per nessuna, una o più GPU e regole di sicurezza nella sezione 3.6 della guida
+- **Convivenza con altre applicazioni** (una chat locale, un altro generatore sulla stessa macchina): cosa il motore condivide con loro e cosa fa da solo, ricette (dispositivi separati, a turni, insieme con un budget), contratto per chi lo avvia da un altro programma e prova da fare sul proprio PC, in [docs/convivenza_applicazioni.md](./docs/convivenza_applicazioni.md)
+- **Una scheda vista da due backend** (CUDA e Vulkan nella stessa cartella: la stessa scheda NVIDIA è `CUDA0` e `Vulkan0`): il motore la conta una volta e usa CUDA; se un `--backend vulkan0` la fissa su Vulkan, o se i pesi restano su disco e vengono riletti a ogni passo, il log lo dice con un avviso. Come si legge, tempi misurati e cosa fare in [docs/cuda_e_vulkan_stessa_scheda.md](./docs/cuda_e_vulkan_stessa_scheda.md)
+- **Diagnostica termica** (`scripts/diagnostica_termica/`): `termico.py` registra temperatura, potenza, frequenza e motivi di throttling di una GPU NVIDIA mentre il motore e, se vuoi, un'altra applicazione lavorano, affianca lo stato di `sd-server` (`--motore`), dà un giudizio **indicativo** per ogni fase, scrive un riepilogo JSON leggibile da altri programmi e confronta più prove. `carico_motore.py` dà al motore sempre lo stesso lavoro. Guida in italiano: [scripts/diagnostica_termica/README.md](./scripts/diagnostica_termica/README.md)
+- **Agenti indipendenti accanto al motore** (un'IA, un agente o un nodo principale che usa il motore e i dati termici): tre livelli (macchina, guardiano, agente), fedeltà flessibile ai comandi, indipendenza che non esclude lo stop, giustizia verso persone e programmi, regole contro il sovraccarico e un guardiano d'esempio collaudato contro un vero `sd-server` (su CPU, con una GPU simulata). Il motore non è il cervello né un controllo in tempo reale: la guida dice come dovrebbe comportarsi chi lo è, in [docs/agenti_indipendenti.md](./docs/agenti_indipendenti.md)
+- **Errori leggibili dalle app**: `sd_get_last_error()` distingue memoria esaurita, file del modello e backend; `sd_get_system_memory()` riporta la RAM di sistema
 - **Server robusto**: parte anche senza modello, autenticazione opzionale (`--api-key`) e allowlist CORS (`--cors-origins`)
-- **Pacchetto portabile**: backend ggml come librerie dinamiche caricate a runtime — un solo zip per macchine vecchie e nuove (`scripts/package_portable.sh`)
+- **Server che non cade per la memoria**: una richiesta che esaurisce la RAM/VRAM non ferma `sd-server`; il modello viene ricaricato con un profilo più leggero e la richiesta ripetuta, altrimenti risposta `503` con `Retry-After`; `GET /sdcpp/v1/health` e `/resources` mostrano lo stato (`--disable-degradation` per spegnerlo)
+- **Fermare un job che sta generando**: `POST /sdcpp/v1/jobs/{id}/cancel` ferma anche un job già partito (`200` con il job annullato, `202` se sta ancora finendo; `?wait=` da 0 a 60 secondi). Non è un errore: il modello resta caricato, il server non scende di profilo e `/health` conta `cancelled`. Esempi `curl` e limiti in [docs/integrazione_progetti.md](./docs/integrazione_progetti.md), sezione 3.5
+- **Pacchetto portabile**: backend ggml come librerie dinamiche caricate a runtime — un solo zip per macchine vecchie e nuove (`scripts/package_portable.sh`); pacchetti con GPU pronti: Windows CUDA 12 (NVIDIA, DLL incluse), Windows/Linux Vulkan, macOS Metal
 - **Suite di test di sicurezza** in [test/](./test/): file modello ostili, fuzzing, sanitizer
 
 Tutti i dettagli, passo per passo: **[guida completa in italiano](./docs/integrazione_progetti.md)**
@@ -53,6 +63,12 @@ e installazione con backup: `scripts/build-engine.ps1` su Windows,
 Toolkit) vanno installati a parte, una tantum: nessuno script li scarica.
 Tutti i dettagli nella [guida in italiano](./docs/integrazione_progetti.md),
 sezioni 2.6-2.8.
+
+Pacchetti già pronti per Windows: serve il
+[Microsoft Visual C++ Redistributable](https://aka.ms/vc14/vc_redist.x64.exe)
+2015-2022 (x64), **versione 14.44 o successiva**. Se manca o è più vecchio il
+programma si chiude subito senza scrivere nulla (codice di uscita
+`0xC0000135`, cioè `3221225781`): vedi la sezione 2.8 della guida.
 
 Guide principali: [build](./docs/build.md) · [prestazioni e memoria](./docs/performance.md) · [selezione backend](./docs/backend.md) · [risoluzione problemi](./docs/troubleshooting.md)
 
@@ -117,6 +133,7 @@ API and command-line option may change frequently.***
     - [LLaDA-Image](./docs/llada_image.md)
     - [Ming-Image Design](./docs/ming_image.md)
     - [PixArt](./docs/pixart.md)
+    - [Iris-3B](./docs/iris.md)
   - [Image Edit Models](./docs/edit.md)
     - [FLUX.1-Kontext-dev](./docs/kontext.md)
     - [Qwen Image Edit series](./docs/qwen_image_edit.md)
@@ -178,7 +195,7 @@ API and command-line option may change frequently.***
 
 ### Get the sd executable
 
-- Download pre-built binaries from the [releases page](https://github.com/leejet/stable-diffusion.cpp/releases)
+- Download pre-built binaries from the [releases page](https://github.com/Filve/diffusione-in-tempo-reale/releases)
 - Or build from source by following the [build guide](./docs/build.md)
 
 ### Download model weights
@@ -232,7 +249,6 @@ These projects wrap `stable-diffusion.cpp` for easier use in other languages/fra
 These projects use `stable-diffusion.cpp` as a backend for their image generation.
 
 - [GIMP Plugins](https://github.com/themanyone/gimp-plugins)
-- [Jellybox](https://jellybox.com)
 - [Stable Diffusion GUI](https://github.com/fszontagh/sd.cpp.gui.wx)
 - [Stable Diffusion CLI-GUI](https://github.com/piallai/stable-diffusion.cpp)
 - [Local Diffusion](https://github.com/rmatif/Local-Diffusion)

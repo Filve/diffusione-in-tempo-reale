@@ -9,7 +9,9 @@
 
 #include "async_jobs.h"
 #include "common/common.h"
+#include "common/profile.h"
 #include "common/resource_owners.hpp"
+#include "recovery.h"
 #include "routes.h"
 #include "runtime.h"
 
@@ -28,11 +30,11 @@ static void print_usage(const char* argv0, const std::vector<ArgOptions>& option
     options_list[2].print();
 }
 
-static void parse_args(int argc,
-                       const char** argv,
-                       SDSvrParams& svr_params,
-                       SDContextParams& ctx_params,
-                       SDGenerationParams& default_gen_params) {
+static sd_profile::Level parse_args(int argc,
+                                    const char** argv,
+                                    SDSvrParams& svr_params,
+                                    SDContextParams& ctx_params,
+                                    SDGenerationParams& default_gen_params) {
     std::vector<ArgOptions> options_vec = {
         svr_params.get_options(),
         ctx_params.get_options(),
@@ -49,11 +51,13 @@ static void parse_args(int argc,
 
     const bool random_seed_requested = default_gen_params.seed < 0;
 
+    sd_profile::Level profile_level = sd_profile::Level::MAX;
     if (!svr_params.resolve_and_validate() ||
         !ctx_params.resolve_and_validate(IMG_GEN, /*require_model=*/false) ||
         !default_gen_params.resolve_and_validate(IMG_GEN,
                                                  ctx_params.lora_model_dir,
-                                                 ctx_params.hires_upscalers_dir)) {
+                                                 ctx_params.hires_upscalers_dir) ||
+        !sd_profile::apply_from_options(ctx_params, default_gen_params, profile_level)) {
         print_usage(argv[0], options_vec);
         exit(1);
     }
@@ -61,6 +65,7 @@ static void parse_args(int argc,
     if (random_seed_requested) {
         default_gen_params.seed = -1;
     }
+    return profile_level;
 }
 
 void sd_log_cb(enum sd_log_level_t level, const char* log, void* data) {
@@ -121,7 +126,7 @@ int main(int argc, const char** argv) {
     SDGenerationParams default_gen_params;
 
     sd_set_log_callback(sd_log_cb, (void*)&svr_params);
-    parse_args(argc, argv, svr_params, ctx_params, default_gen_params);
+    const sd_profile::Level profile_level = parse_args(argc, argv, svr_params, ctx_params, default_gen_params);
 
     LOG_VERBOSE("version: %s", version_string().c_str());
     LOG_VERBOSE("%s", sd_get_system_info());
@@ -129,23 +134,36 @@ int main(int argc, const char** argv) {
     LOG_VERBOSE("%s", ctx_params.to_string().c_str());
     LOG_VERBOSE("%s", default_gen_params.to_string().c_str());
 
-    sd_ctx_params_t sd_ctx_params = ctx_params.to_sd_ctx_params_t(false);
-    const bool model_requested    = !ctx_params.model_path.empty() || !ctx_params.diffusion_model_path.empty();
-    SDCtxPtr sd_ctx(model_requested ? new_sd_ctx(&sd_ctx_params) : nullptr);
+    const bool model_requested = !ctx_params.model_path.empty() || !ctx_params.diffusion_model_path.empty();
 
-    if (model_requested && sd_ctx == nullptr) {
-        LOG_ERROR("the model could not be loaded: '%s'; check the model file and the logs above, then restart the server",
-                  !ctx_params.model_path.empty() ? ctx_params.model_path.c_str()
-                                                 : ctx_params.diffusion_model_path.c_str());
-        return 1;
-    }
-    if (!model_requested) {
+    ContextKeeper::Settings keeper_settings;
+    keeper_settings.degradation      = !svr_params.disable_degradation;
+    keeper_settings.cooldown_seconds = svr_params.degradation_cooldown;
+    ContextKeeper keeper(ctx_params, profile_level, keeper_settings);
+
+    if (model_requested) {
+        GenerationFailure failure;
+        if (!keeper.start(failure)) {
+            LOG_ERROR("the model could not be loaded: '%s' (%s: %s); check the model file and the logs above, then restart the server",
+                      !ctx_params.model_path.empty() ? ctx_params.model_path.c_str()
+                                                     : ctx_params.diffusion_model_path.c_str(),
+                      sd_error_code_name(failure.code),
+                      failure.message.c_str());
+            return 1;
+        }
+        if (svr_params.disable_degradation) {
+            LOG_INFO("a request that runs out of memory is answered with an error (--disable-degradation)");
+        } else if (!keeper.can_step_down()) {
+            LOG_INFO("a request that runs out of memory is answered with an error: no profile is lighter than %s",
+                     keeper.describe_ladder().c_str());
+        } else {
+            LOG_INFO("a request that runs out of memory makes the server step down: %s", keeper.describe_ladder().c_str());
+        }
+    } else {
         LOG_WARN("starting without a model: device and upscale endpoints work, "
                  "generation endpoints will report that no model is loaded "
                  "(restart with -m/--diffusion-model to enable generation)");
     }
-
-    std::mutex sd_ctx_mutex;
 
     std::vector<LoraEntry> lora_cache;
     std::mutex lora_mutex;
@@ -153,8 +171,7 @@ int main(int argc, const char** argv) {
     std::mutex upscaler_mutex;
     AsyncJobManager async_job_manager;
     ServerRuntime runtime = {
-        sd_ctx.get(),
-        &sd_ctx_mutex,
+        &keeper,
         &svr_params,
         &ctx_params,
         &default_gen_params,
@@ -205,7 +222,19 @@ int main(int argc, const char** argv) {
     register_sdcpp_api_endpoints(svr, runtime);
 
     LOG_INFO("listening on: http://%s:%d\n", svr_params.listen_ip.c_str(), svr_params.listen_port);
-    svr.listen(svr_params.listen_ip, svr_params.listen_port);
+    int exit_code = 0;
+    try {
+        if (!svr.listen(svr_params.listen_ip, svr_params.listen_port)) {
+            LOG_ERROR("the server could not listen on %s:%d; check that the port is free and the address is valid",
+                      svr_params.listen_ip.c_str(),
+                      svr_params.listen_port);
+            exit_code = 1;
+        }
+    } catch (const std::exception& error) {
+        // The worker threads of the HTTP server could not be created, typically for lack of memory.
+        LOG_ERROR("the HTTP server could not run: %s", error.what());
+        exit_code = 1;
+    }
 
     {
         std::lock_guard<std::mutex> lock(async_job_manager.mutex);
@@ -213,5 +242,5 @@ int main(int argc, const char** argv) {
     }
     async_job_manager.cv.notify_all();
     async_worker.join();
-    return 0;
+    return exit_code;
 }
