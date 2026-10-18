@@ -8,7 +8,7 @@ CPU), termico.py con la GPU finta di test/termico_test.py e il guardiano che fer
   python3 test/agenti_guardiano_test.py
   python3 test/agenti_guardiano_test.py --server build/bin/sd-server --model /percorso/modello.safetensors
 
-Opzioni per il server (un backend, --diffusion-fa...) vanno dopo --extra, una per volta: --extra=--diffusion-fa.
+Opzioni per il server (un backend, --flash-attn...) vanno dopo --extra, una per volta: --extra=--flash-attn --extra=on.
 Codice di uscita 0 = tutti i controlli superati. Serve Python 3.8 o più recente, senza pacchetti.
 """
 import argparse

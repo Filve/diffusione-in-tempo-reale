@@ -142,7 +142,9 @@ libera.
 Opzioni utili
   --profile auto         sceglie tra max, balanced e lite in base a dimensione
                          del modello, RAM libera e memoria della GPU
-  --diffusion-fa         flash attention per il modello di diffusione
+  --flash-attn auto|on|off
+                         flash attention: di norma 'auto' (predefinito), il motore
+                         sceglie da solo per ogni modulo; on o off per forzarla
   --type q8_0            quantizza i pesi al caricamento: occupano poco piu' della
                          meta' di f16
   --memory-guard 90      libera pesi dalla memoria prima che finisca
