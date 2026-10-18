@@ -481,6 +481,60 @@ namespace sd::backend_fit {
         }
     }
 
+    // A listing that a preferred backend already provides is left out of the automatic choice, and print_plan marks it
+    // on its device line. When the user names it anyway (--backend vulkan0 for a card that CUDA lists as CUDA0), the
+    // run goes through the slower of the two backends and nothing else in the log says so.
+    static std::vector<std::string> shadowed_runtime_warnings(const Plan& plan, const std::vector<Device>& devices) {
+        std::vector<std::string> warnings;
+        std::vector<size_t> seen;
+        for (const Runtime& runtime : plan.runtimes) {
+            for (size_t di : runtime.devices) {
+                if (di >= devices.size() || devices[di].shadowed_by.empty() || std::find(seen.begin(), seen.end(), di) != seen.end()) {
+                    continue;
+                }
+                seen.push_back(di);
+                const Device& device = devices[di];
+                std::string text     = "auto-fit: " + device.name + " is the same GPU as " + device.shadowed_by + "; the automatic choice uses " + device.shadowed_by + " for this card.";
+                for (const Device& owner : devices) {
+                    if (owner.name == device.shadowed_by && registry_rank(owner.registry) < registry_rank(device.registry)) {
+                        text += " Backends on a generic graphics API (Vulkan, OpenCL) are usually slower than the one the GPU vendor provides: name " + owner.name +
+                                " in --backend, or leave --backend out, unless " + device.name + " is wanted.";
+                        break;
+                    }
+                }
+                warnings.push_back(std::move(text));
+            }
+        }
+        return warnings;
+    }
+
+    // Weights that fit neither the compute device nor the RAM budget stay in the model file and are read again every
+    // time their module runs, the diffusion model at every sampling step. print_plan lists "params disk" per module;
+    // this says what it costs and what helps. Empty when nothing streams, or when the RAM is unknown (print_plan says so).
+    static std::string disk_streaming_warning(const Plan& plan, const std::vector<Component>& components, int64_t free_ram, int64_t ram_budget) {
+        std::string names;
+        int64_t bytes  = 0;
+        bool diffusion = false;
+        for (size_t ci = 0; ci < components.size() && ci < plan.decisions.size(); ++ci) {
+            if (components[ci].params_bytes <= 0 || plan.decisions[ci].params_location != ParamsLocation::DISK) {
+                continue;
+            }
+            names += (names.empty() ? "" : ", ") + std::string(components[ci].name);
+            bytes += components[ci].params_bytes;
+            diffusion = diffusion || components[ci].kind == ComponentKind::DIT;
+        }
+        if (bytes == 0 || free_ram < 0) {
+            return "";
+        }
+        char text[640];
+        snprintf(text, sizeof(text),
+                 "auto-fit: the weights of %s (%lld MiB) stay on disk and are read again every time they run%s: free RAM is %lld MiB and the budget for weights %lld MiB. "
+                 "Close other programs to free RAM, or shrink the weights with --type (for example q8_0) or a quantized model file, to keep them in memory.",
+                 names.c_str(), (long long)(bytes / MiB), diffusion ? ", the diffusion model at every sampling step" : "",
+                 (long long)(free_ram / MiB), (long long)(ram_budget / MiB));
+        return text;
+    }
+
     static void append_assignment(std::string& spec, const char* key, const std::string& value) {
         if (!spec.empty()) {
             spec += ",";
@@ -872,6 +926,15 @@ namespace sd::backend_fit {
         print_plan(plan, components, devices, free_ram, ram_budget);
         for (const std::string& note : multi_gpu_notes) {
             LOG_INFO("auto-fit: %s", note.c_str());
+        }
+        for (const std::string& warning : shadowed_runtime_warnings(plan, devices)) {
+            LOG_WARN("%s", warning.c_str());
+        }
+        if (!cpu_only) {
+            const std::string streaming = disk_streaming_warning(plan, components, free_ram, ram_budget);
+            if (!streaming.empty()) {
+                LOG_WARN("%s", streaming.c_str());
+            }
         }
         if (cpu_only) {
             const bool streams_from_disk = std::any_of(plan.decisions.begin(), plan.decisions.end(), [](const Decision& decision) {

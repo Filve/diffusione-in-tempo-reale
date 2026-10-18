@@ -386,6 +386,92 @@ static void check_mixed_backends() {
     }
 }
 
+static bool has(const std::string& text, const char* part) {
+    return text.find(part) != std::string::npos;
+}
+
+// The two warnings derive_backend_specs logs after the plan: a module run on a listing of a GPU that another backend
+// already provides, and weights that stream from disk.
+static void check_plan_warnings() {
+    const char* const card_id = "0000:01:00.0";
+    const Runtime on_cuda{"CUDA0", {0}};
+    const Runtime on_vulkan{"Vulkan0", {1}};
+
+    {
+        std::vector<Device> card = {with_id(make_gpu("CUDA0", "CUDA", 8), card_id), with_id(make_gpu("Vulkan0", "Vulkan", 8), card_id)};
+        mark_shadowed_devices(card);
+        const std::vector<Component> components = make_components(4.8, 1.5, 0.15);
+
+        const Plan forced                       = compute_plan(components, card, 16 * GiB, std::vector<Runtime>(3, on_vulkan));
+        const std::vector<std::string> warnings = shadowed_runtime_warnings(forced, card);
+        CHECK(warnings.size() == 1 && has(warnings[0], "Vulkan0 is the same GPU as CUDA0") && has(warnings[0], "name CUDA0 in --backend"),
+              "--backend vulkan0 on a card that CUDA lists as CUDA0: one warning that names both and says what to pass instead");
+
+        const std::vector<Runtime> mixed = {on_cuda, on_vulkan, on_vulkan};
+        CHECK(shadowed_runtime_warnings(compute_plan(components, card, 16 * GiB, mixed), card).size() == 1,
+              "and still one warning when several modules run on that listing");
+        CHECK(shadowed_runtime_warnings(compute_plan(components, card, 16 * GiB, std::vector<Runtime>(3, on_cuda)), card).empty(),
+              "nothing is said when the modules run on the listing the automatic choice makes");
+
+        std::vector<Device> unknown = {make_gpu("CUDA0", "CUDA", 8), make_gpu("Vulkan0", "Vulkan", 8)};
+        mark_shadowed_devices(unknown);
+        CHECK(shadowed_runtime_warnings(compute_plan(components, unknown, 16 * GiB, std::vector<Runtime>(3, on_vulkan)), unknown).empty(),
+              "listings that report no PCI id cannot be told apart from two cards, so nothing is claimed about them");
+    }
+
+    {
+        std::vector<Device> rig = {with_id(make_gpu("CUDA0", "CUDA", 12), "0000:01:00.0"), with_id(make_gpu("CUDA1", "CUDA", 12), "0000:02:00.0"),
+                                   with_id(make_gpu("Vulkan0", "Vulkan", 12), "0000:01:00.0"), with_id(make_gpu("Vulkan1", "Vulkan", 12), "0000:02:00.0")};
+        mark_shadowed_devices(rig);
+        const std::vector<Component> components = make_components(16, 2, 0.3);
+
+        const std::vector<Runtime> on_cuda_pair(3, Runtime{"CUDA0&CUDA1", {0, 1}});
+        CHECK(shadowed_runtime_warnings(compute_plan(components, rig, 0, on_cuda_pair), rig).empty(), "two cards each listed twice: the CUDA pair is not warned about");
+
+        const std::vector<Runtime> on_vulkan_pair(3, Runtime{"Vulkan0&Vulkan1", {2, 3}});
+        const std::vector<std::string> warnings = shadowed_runtime_warnings(compute_plan(components, rig, 0, on_vulkan_pair), rig);
+        CHECK(warnings.size() == 2 && has(warnings[0], "Vulkan0 is the same GPU as CUDA0") && has(warnings[1], "Vulkan1 is the same GPU as CUDA1"),
+              "and the Vulkan pair gets one warning per card");
+    }
+
+    {
+        std::vector<Device> twice = {with_id(make_gpu("Vulkan0", "Vulkan", 8), card_id), with_id(make_gpu("Vulkan1", "Vulkan", 8), card_id)};
+        mark_shadowed_devices(twice);
+        const std::vector<std::string> warnings =
+            shadowed_runtime_warnings(compute_plan(make_components(4.8, 1.5, 0.15), twice, 0, std::vector<Runtime>(3, Runtime{"Vulkan1", {1}})), twice);
+        CHECK(warnings.size() == 1 && has(warnings[0], "Vulkan1 is the same GPU as Vulkan0") && !has(warnings[0], "generic graphics API"),
+              "two listings of the same backend: the warning names the owner but does not claim the other backend is slower");
+    }
+
+    {
+        // Pony-sized weights on a 5 GiB card with 3 GiB of RAM budget: the diffusion model fits neither.
+        const std::vector<Device> card          = {make_gpu("CUDA0", "CUDA", 5)};
+        const std::vector<Component> components = make_components(4.8, 1.5, 0.15);
+        const std::vector<Runtime> start        = {on_cuda, Runtime{"CPU", {}}, on_cuda};
+        const Plan plan                         = compute_plan(components, card, 3 * GiB, start);
+        CHECK(plan.decisions[0].params_location == ParamsLocation::DISK, "setup: the diffusion weights are left on disk");
+
+        const std::string warning = disk_streaming_warning(plan, components, 4 * GiB, 3 * GiB);
+        CHECK(has(warning, "weights of DiT (") && !has(warning, "Conditioner") && !has(warning, "VAE") &&
+                  has(warning, (std::to_string(components[0].params_bytes / MiB) + " MiB").c_str()),
+              "weights on disk: the warning names the module that streams and how much it is");
+        CHECK(has(warning, "the diffusion model at every sampling step") && has(warning, "free RAM is 4096 MiB") && has(warning, "budget for weights 3072 MiB") &&
+                  has(warning, "--type"),
+              "it says that the diffusion model is read at every step, how much RAM there is, and what helps");
+        CHECK(disk_streaming_warning(plan, components, -1, 0).empty(), "an unknown amount of RAM gives no warning, since print_plan already says it is unknown");
+
+        const Plan resident_plan = compute_plan(components, card, 64 * GiB, start);
+        CHECK(resident_plan.decisions[0].params_location == ParamsLocation::CPU && disk_streaming_warning(resident_plan, components, 64 * GiB, 60 * GiB).empty(),
+              "nothing is said when the weights wait in RAM");
+
+        Plan vae_only;
+        vae_only.decisions.assign(3, Decision{ParamsLocation::CPU});
+        vae_only.decisions[2].params_location = ParamsLocation::DISK;
+        const std::string vae_warning         = disk_streaming_warning(vae_only, components, 4 * GiB, 1 * GiB);
+        CHECK(has(vae_warning, "weights of VAE (") && !has(vae_warning, "sampling step"), "a module other than the diffusion model is not said to be read at every sampling step");
+    }
+}
+
 // Random machines with a card listed by one or two backends and sometimes an integrated GPU, in a random order:
 // whatever the plan, nothing is placed on a listing that is not the GPU's own.
 static void check_random_mixed_backends() {
@@ -659,6 +745,7 @@ int main() {
     }
 
     check_mixed_backends();
+    check_plan_warnings();
     check_random_machines();
     check_random_mixed_backends();
 
