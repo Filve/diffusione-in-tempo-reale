@@ -225,6 +225,8 @@ file(GLOB SD_LIB_SOURCES CONFIGURE_DEPENDS
     "src/core/*.h"
     "src/core/*.cpp"
     "src/core/*.hpp"
+    "src/core/probe/*.h"
+    "src/core/probe/*.cpp"
     "src/extensions/*.h"
     "src/extensions/*.cpp"
     "src/extensions/*.hpp"
@@ -342,6 +344,14 @@ if (SD_CUDA)
     # also starts on a machine without an NVIDIA driver.
     target_link_libraries(${SD_LIB} PRIVATE CUDA::toolkit)
     set_property(SOURCE src/core/ggml_extend_backend.cpp src/core/cuda_driver.cpp APPEND PROPERTY COMPILE_DEFINITIONS SD_USE_CUDA)
+endif()
+if (SD_HIPBLAS)
+    find_package(hip REQUIRED CONFIG HINTS "$ENV{ROCM_PATH}" /opt/rocm)
+    target_link_libraries(${SD_LIB} PRIVATE hip::host)
+    set_property(SOURCE src/core/ggml_extend_backend.cpp APPEND PROPERTY COMPILE_DEFINITIONS SD_USE_HIP)
+    if (GGML_HIP_MMQ_MFMA)
+        set_property(SOURCE src/core/ggml_extend_backend.cpp APPEND PROPERTY COMPILE_DEFINITIONS SD_HIP_MFMA)
+    endif()
 endif()
 target_include_directories(${SD_LIB} PUBLIC . src include)
 target_include_directories(${SD_LIB} PRIVATE src/core)

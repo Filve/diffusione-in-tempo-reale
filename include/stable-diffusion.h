@@ -250,7 +250,9 @@ typedef struct {
     float attn_scale;                // Override flash-attention K/V scaling; 0 keeps the model default
     const char* tokenizer;           // tokenizer.json path or main=FILE,clip-l=FILE,clip-g=FILE assignments; required for PiD and Lens
     bool sage_attn;
-    int conditioning_cache_size;    // Maximum cached conditioning entries per context; 0 disables caching (default: 4)
+    int conditioning_cache_size;  // Maximum cached conditioning entries per context; 0 disables caching (default: 4)
+    const char* flash_attn_mode;  // on/off/auto or module assignments (e.g. "auto,te=off"); NULL/empty honors legacy flags.
+    const char* conv_direct_mode;  // on/off/auto or diffusion/vae/controlnet assignments; NULL/empty honors legacy flags.
     int memory_guard;               // Memory usage percent (device memory, or system RAM on CPU backends) that triggers pressure reduction (weight eviction, prefetch pause, segmented CPU graphs for weights read from disk); 0 disables (default). Auto-fit uses 90 for a CPU-only plan that reads weights from disk
     bool disable_backend_fallback;  // Fail context creation instead of falling back to the CPU backend when the requested backend is unavailable
     const char* multi_gpu;          // How auto-fit uses several discrete GPUs of one backend: "auto" (default; extra GPUs only when the weights do not fit on the best one), "on" (also move the text encoder and the VAE away from the diffusion GPU) or "off"
