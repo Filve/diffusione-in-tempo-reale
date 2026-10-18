@@ -7,8 +7,8 @@ standard library is enough.
 
   python3 test/server_cancel_e2e.py --server build/bin/sd-server --model /path/to/model.safetensors
 
-Extra options for the server (a backend, --diffusion-fa, ...) go after --extra, one each, for example
---extra=--diffusion-fa. To use a server that is already running: --url http://127.0.0.1:1234 (add
+Extra options for the server (a backend, --flash-attn, ...) go after --extra, one each, for example
+--extra=--flash-attn --extra=on. To use a server that is already running: --url http://127.0.0.1:1234 (add
 --api-key if it asks for one); the check of the server log is then skipped. Exit code 0 = all checks passed.
 
 The first generation can take minutes when the weights are read from a slow disk, so the test starts with

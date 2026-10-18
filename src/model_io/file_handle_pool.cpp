@@ -116,7 +116,7 @@ namespace sd {
             auto opened   = std::make_unique<std::ifstream>();
             const bool ok = open_with_retry(path, [&]() {
                 opened->clear();
-                opened->open(path, std::ios::binary);
+                opened->open(std::filesystem::u8path(path), std::ios::binary);
                 return opened->is_open();
             });
             if (!ok) {
