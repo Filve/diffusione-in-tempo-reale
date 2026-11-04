@@ -131,8 +131,8 @@ int main(int argc, const char** argv) {
     LOG_VERBOSE("version: %s", version_string().c_str());
     LOG_VERBOSE("%s", sd_get_system_info());
     LOG_VERBOSE("%s", svr_params.to_string().c_str());
-    LOG_VERBOSE("%s", ctx_params.to_string().c_str());
-    LOG_VERBOSE("%s", default_gen_params.to_string().c_str());
+    LOG_DEBUG("%s", ctx_params.to_string().c_str());
+    LOG_DEBUG("%s", default_gen_params.to_string().c_str());
 
     const bool model_requested = !ctx_params.model_path.empty() || !ctx_params.diffusion_model_path.empty();
 

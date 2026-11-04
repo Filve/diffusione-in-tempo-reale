@@ -73,6 +73,8 @@ namespace sd {
         // Returns an open stream for path, reusing an idle one when the file has not changed
         // since it was opened. With fresh set, idle streams of that path are closed and the
         // file is opened again. The lease is empty when the file cannot be opened.
+        // The path is UTF-8, as everywhere in the loader; on Windows it must go through
+        // std::filesystem::u8path, a plain narrow string would be read in the ANSI code page.
         Lease acquire(const std::string& path, bool fresh = false);
 
         // At most this many idle streams are kept per file.
