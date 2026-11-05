@@ -225,6 +225,8 @@ file(GLOB SD_LIB_SOURCES CONFIGURE_DEPENDS
     "src/core/*.h"
     "src/core/*.cpp"
     "src/core/*.hpp"
+    "src/core/cpu/*.h"
+    "src/core/cpu/*.cpp"
     "src/core/probe/*.h"
     "src/core/probe/*.cpp"
     "src/extensions/*.h"
@@ -344,6 +346,46 @@ if (SD_CUDA)
     # also starts on a machine without an NVIDIA driver.
     target_link_libraries(${SD_LIB} PRIVATE CUDA::toolkit)
     set_property(SOURCE src/core/ggml_extend_backend.cpp src/core/cuda_driver.cpp APPEND PROPERTY COMPILE_DEFINITIONS SD_USE_CUDA)
+    if (NOT SD_USE_UPSTREAM_GGML)
+        include(cmake/cutlass.cmake)
+        enable_language(CUDA)
+        set_target_properties(${SD_LIB} PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        if (SD_CUDA_CUTLASS_PATH)
+            target_sources(${SD_LIB} PRIVATE src/core/cuda/cute_attention.cu src/core/cuda/i8_projection.cu src/core/cuda/i8_gated_residual.cu src/core/cuda/i8_gemm.cu src/core/cuda/bf16_gemm.cu)
+            set_source_files_properties(src/core/cuda/cute_attention.cu src/core/cuda/i8_projection.cu src/core/cuda/i8_gated_residual.cu src/core/cuda/i8_gemm.cu src/core/cuda/bf16_gemm.cu PROPERTIES
+                INCLUDE_DIRECTORIES "${SD_CUDA_CUTLASS_PATH}/include"
+                COMPILE_OPTIONS "--use_fast_math;--extended-lambda;--expt-relaxed-constexpr")
+            if (MSVC)
+                set_property(SOURCE src/core/cuda/cute_attention.cu src/core/cuda/i8_projection.cu src/core/cuda/i8_gated_residual.cu src/core/cuda/i8_gemm.cu src/core/cuda/bf16_gemm.cu APPEND PROPERTY COMPILE_OPTIONS -Xcompiler=/Zc:preprocessor,/Zc:__cplusplus)
+            endif()
+            if (GGML_CUDA_FORCE_CUBLAS)
+                set_property(SOURCE src/core/cuda/i8_projection.cu src/core/cuda/i8_gated_residual.cu src/core/cuda/i8_gemm.cu src/core/cuda/bf16_gemm.cu APPEND PROPERTY COMPILE_DEFINITIONS SD_CUDA_FORCE_CUBLAS)
+            endif()
+        endif()
+    endif()
+endif()
+set(SD_BACKEND_REGISTRATIONS)
+if (NOT SD_USE_UPSTREAM_GGML AND (SD_CUDA OR SD_HIPBLAS OR SD_MUSA))
+    if(SD_HIPBLAS)
+        include(cmake/hip.cmake)
+    endif()
+    add_subdirectory(src/core/cuda)
+    foreach(VENDOR CUDA HIP MUSA)
+        if(SD_${VENDOR} OR (VENDOR STREQUAL "HIP" AND SD_HIPBLAS))
+            string(TOLOWER "${VENDOR}" NAMESPACE)
+            list(APPEND SD_BACKEND_REGISTRATIONS "sd_${NAMESPACE}::register_extensions")
+        endif()
+    endforeach()
+endif()
+if (SD_VULKAN AND NOT SD_USE_UPSTREAM_GGML)
+    add_subdirectory(src/core/vulkan)
+    list(APPEND SD_BACKEND_REGISTRATIONS sd_ggml_register_vulkan_rope sd_ggml_register_vulkan_i8 sd_ggml_register_vulkan_modulate sd_ggml_register_vulkan_rms_affine)
+endif()
+if(SD_BACKEND_REGISTRATIONS)
+    string(REPLACE ";" ",\n    " SD_BACKEND_REGISTRATIONS "${SD_BACKEND_REGISTRATIONS}")
+    configure_file(cmake/backend_extensions.h.in generated/sd_backend_extensions.h @ONLY)
+    set_property(SOURCE src/core/ggml_extensions.cpp APPEND PROPERTY INCLUDE_DIRECTORIES "${CMAKE_CURRENT_BINARY_DIR}/generated")
+    set_property(SOURCE src/core/ggml_extensions.cpp APPEND PROPERTY COMPILE_DEFINITIONS SD_BACKEND_EXTENSIONS)
 endif()
 if (SD_HIPBLAS)
     find_package(hip REQUIRED CONFIG HINTS "$ENV{ROCM_PATH}" /opt/rocm)
@@ -353,9 +395,9 @@ if (SD_HIPBLAS)
         set_property(SOURCE src/core/ggml_extend_backend.cpp APPEND PROPERTY COMPILE_DEFINITIONS SD_HIP_MFMA)
     endif()
 endif()
-target_include_directories(${SD_LIB} PUBLIC . src include)
-target_include_directories(${SD_LIB} PRIVATE src/core)
-target_include_directories(${SD_LIB} PUBLIC . thirdparty)
+target_include_directories(${SD_LIB} PUBLIC include)
+target_include_directories(${SD_LIB} PRIVATE src src/core)
+target_include_directories(${SD_LIB} PUBLIC thirdparty)
 target_compile_features(${SD_LIB} PUBLIC c_std_11 cxx_std_17)
 
 

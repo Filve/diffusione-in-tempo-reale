@@ -173,16 +173,22 @@ ContextKeeper::ContextKeeper(const SDContextParams& base_params,
     backend_choice_.params_backend        = base_params.params_backend;
     backend_choice_.diffusion_conv_direct = base_params.diffusion_conv_direct;
     backend_choice_.n_threads             = base_params.n_threads;
-    build_ladder();
+    ladder_                               = make_ladder();
 }
 
 std::string ContextKeeper::describe_ladder() const {
+    std::lock_guard<std::mutex> state(state_mutex_);
     std::string text;
     for (sd_profile::Level level : ladder_) {
         text += text.empty() ? "" : " > ";
         text += sd_profile::level_name(level);
     }
     return text;
+}
+
+bool ContextKeeper::can_step_down() const {
+    std::lock_guard<std::mutex> state(state_mutex_);
+    return settings_.degradation && ladder_.size() > 1;
 }
 
 std::unique_ptr<SDContextParams> ContextKeeper::params_for(sd_profile::Level level) const {
@@ -202,8 +208,9 @@ std::string ContextKeeper::fingerprint(sd_profile::Level level) const {
     return describe(*params_for(level)) + (force_tiling_at(level) ? "|tiled" : "");
 }
 
-void ContextKeeper::build_ladder() {
-    ladder_.push_back(base_level_);
+std::vector<sd_profile::Level> ContextKeeper::make_ladder() const {
+    std::vector<sd_profile::Level> ladder;
+    ladder.push_back(base_level_);
     std::string previous    = fingerprint(base_level_);
     const bool accelerator  = hooks_.has_accelerator();
     sd_profile::Level level = base_level_;
@@ -216,13 +223,18 @@ void ContextKeeper::build_ladder() {
         if (current == previous) {
             continue;
         }
-        ladder_.push_back(level);
+        ladder.push_back(level);
         previous = current;
     }
+    return ladder;
 }
 
 bool ContextKeeper::start(GenerationFailure& failure) {
     std::lock_guard<std::mutex> lock(mutex_);
+    return load_locked(failure);
+}
+
+bool ContextKeeper::load_locked(GenerationFailure& failure) {
     failure = GenerationFailure();
     if (!build_from(0, failure)) {
         return false;
@@ -235,6 +247,51 @@ bool ContextKeeper::start(GenerationFailure& failure) {
     }
     model_loaded_ = true;
     return true;
+}
+
+bool ContextKeeper::load(const SDContextParams& params, GenerationFailure& failure) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    // The old context goes first: both would not fit.
+    release_context();
+    model_loaded_   = false;
+    supports_image_ = false;
+    supports_video_ = false;
+
+    {
+        std::lock_guard<std::mutex> state(state_mutex_);
+        base_params_ = params;
+    }
+    std::vector<sd_profile::Level> ladder = make_ladder();
+    {
+        std::lock_guard<std::mutex> state(state_mutex_);
+        ladder_                               = std::move(ladder);
+        index_                                = 0;
+        probation_                            = false;
+        cooldown_seconds_                     = std::max(settings_.cooldown_seconds, 0);
+        restore_not_before_                   = Clock::time_point();
+        restore_failure_                      = GenerationFailure();
+        backend_choice_.backend               = params.backend;
+        backend_choice_.params_backend        = params.params_backend;
+        backend_choice_.diffusion_conv_direct = params.diffusion_conv_direct;
+        backend_choice_.n_threads             = params.n_threads;
+    }
+    return load_locked(failure);
+}
+
+void ContextKeeper::unload() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    release_context();
+    model_loaded_   = false;
+    supports_image_ = false;
+    supports_video_ = false;
+
+    std::lock_guard<std::mutex> state(state_mutex_);
+    index_              = 0;
+    probation_          = false;
+    cooldown_seconds_   = std::max(settings_.cooldown_seconds, 0);
+    restore_not_before_ = Clock::time_point();
+    restore_failure_    = GenerationFailure();
 }
 
 void ContextKeeper::release_context() {
@@ -264,7 +321,7 @@ bool ContextKeeper::try_build(size_t index, GenerationFailure& failure) {
     const sd_profile::Level level           = ladder_[index];
     std::unique_ptr<SDContextParams> params = params_for(level);
     // The context may keep pointing into these strings, so they stay where they are for as long as it lives.
-    sd_ctx_params_t raw = params->to_sd_ctx_params_t(false);
+    sd_ctx_params_t raw = params->to_sd_ctx_params_t();
 
     LOG_INFO("loading the model with profile %s", sd_profile::level_name(level));
     SDCtxPtr ctx = hooks_.create_context(raw, failure);
@@ -560,6 +617,7 @@ bool ContextKeeper::run(const Attempt& attempt, GenerationFailure& failure, cons
             view.level = ladder_[index_];
         }
         view.force_vae_tiling = force_tiling_at(view.level);
+        view.params           = ctx_params_.get();
 
         bool generated = false;
         {

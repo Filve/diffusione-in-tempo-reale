@@ -11,6 +11,7 @@
 #include "common/common.h"
 #include "common/profile.h"
 #include "common/resource_owners.hpp"
+#include "model_catalog.h"
 #include "recovery.h"
 #include "routes.h"
 #include "runtime.h"
@@ -48,6 +49,10 @@ static sd_profile::Level parse_args(int argc,
 
     log_level = svr_params.log_level;
     log_color = svr_params.color;
+
+    if (ctx_params.list_devices) {
+        exit(ctx_params.print_devices() ? 0 : 1);
+    }
 
     const bool random_seed_requested = default_gen_params.seed < 0;
 
@@ -130,11 +135,12 @@ int main(int argc, const char** argv) {
 
     LOG_VERBOSE("version: %s", version_string().c_str());
     LOG_VERBOSE("%s", sd_get_system_info());
-    LOG_VERBOSE("%s", svr_params.to_string().c_str());
+    LOG_DEBUG("%s", svr_params.to_string().c_str());
     LOG_DEBUG("%s", ctx_params.to_string().c_str());
     LOG_DEBUG("%s", default_gen_params.to_string().c_str());
 
     const bool model_requested = !ctx_params.model_path.empty() || !ctx_params.diffusion_model_path.empty();
+    ServerModels models;
 
     ContextKeeper::Settings keeper_settings;
     keeper_settings.degradation      = !svr_params.disable_degradation;
@@ -142,6 +148,7 @@ int main(int argc, const char** argv) {
     ContextKeeper keeper(ctx_params, profile_level, keeper_settings);
 
     if (model_requested) {
+        const auto load_started = std::chrono::steady_clock::now();
         GenerationFailure failure;
         if (!keeper.start(failure)) {
             LOG_ERROR("the model could not be loaded: '%s' (%s: %s); check the model file and the logs above, then restart the server",
@@ -151,6 +158,7 @@ int main(int argc, const char** argv) {
                       failure.message.c_str());
             return 1;
         }
+        models.status["load_elapsed_seconds"] = std::chrono::duration<double>(std::chrono::steady_clock::now() - load_started).count();
         if (svr_params.disable_degradation) {
             LOG_INFO("a request that runs out of memory is answered with an error (--disable-degradation)");
         } else if (!keeper.can_step_down()) {
@@ -160,9 +168,10 @@ int main(int argc, const char** argv) {
             LOG_INFO("a request that runs out of memory makes the server step down: %s", keeper.describe_ladder().c_str());
         }
     } else {
-        LOG_WARN("starting without a model: device and upscale endpoints work, "
-                 "generation endpoints will report that no model is loaded "
-                 "(restart with -m/--diffusion-model to enable generation)");
+        LOG_WARN(
+            "starting without a model: device and upscale endpoints work, "
+            "generation endpoints will report that no model is loaded "
+            "(load one from the model catalog, or restart with -m/--diffusion-model)");
     }
 
     std::vector<LoraEntry> lora_cache;
@@ -180,7 +189,15 @@ int main(int argc, const char** argv) {
         &upscaler_cache,
         &upscaler_mutex,
         &async_job_manager,
+        &models,
     };
+
+    try {
+        initialize_server_models(runtime);
+    } catch (const std::exception& e) {
+        LOG_ERROR("model catalog initialization failed: %s", e.what());
+        return 1;
+    }
 
     std::thread async_worker(async_job_worker, std::ref(runtime));
 
@@ -220,6 +237,7 @@ int main(int argc, const char** argv) {
     register_openai_api_endpoints(svr, runtime);
     register_sdapi_endpoints(svr, runtime);
     register_sdcpp_api_endpoints(svr, runtime);
+    register_model_endpoints(svr, runtime);
 
     LOG_INFO("listening on: http://%s:%d\n", svr_params.listen_ip.c_str(), svr_params.listen_port);
     int exit_code = 0;

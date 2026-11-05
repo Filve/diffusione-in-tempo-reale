@@ -3,12 +3,45 @@
 #include "async_jobs.h"
 
 #include <algorithm>
+#include <chrono>
 #include <iomanip>
 #include <sstream>
+#include <thread>
 
 #include "common/log.h"
 #include "common/media_io.h"
 #include "common/resource_owners.hpp"
+
+class JobCancellationMonitor {
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool done_ = false;
+    std::thread thread_;
+
+public:
+    // The keeper reaches a context only while this job's attempt is generating on it, so the stop cannot get to
+    // another request, nor to a context that has been released. The monitor must not outlive keeper or job.
+    JobCancellationMonitor(ContextKeeper& keeper, AsyncGenerationJob& job)
+        : thread_([this, &keeper, &job]() {
+              std::unique_lock<std::mutex> lock(mutex_);
+              while (!done_) {
+                  if (job.cancel.requested.load()) {
+                      // Each generation pass resets the library flag, including ADetailer.
+                      keeper.cancel(job.cancel);
+                  }
+                  cv_.wait_for(lock, std::chrono::milliseconds(10), [this]() { return done_; });
+              }
+          }) {}
+
+    ~JobCancellationMonitor() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            done_ = true;
+        }
+        cv_.notify_one();
+        thread_.join();
+    }
+};
 
 static void preview_callback(int step, int frame_count, sd_image_t* frames, bool is_noisy, void* data) {
     (void)is_noisy;
@@ -88,7 +121,7 @@ const char* async_job_status_name(AsyncJobStatus status) {
 }
 
 void purge_expired_jobs(AsyncJobManager& manager) {
-    const int64_t now = unix_timestamp_now();
+    const int64_t now = unix_timestamp_now_ms();
 
     for (auto it = manager.expired_jobs.begin(); it != manager.expired_jobs.end();) {
         if (it->second <= now) {
@@ -108,8 +141,8 @@ void purge_expired_jobs(AsyncJobManager& manager) {
         int64_t ttl_seconds = job->status == AsyncJobStatus::Completed
                                   ? manager.completed_ttl_seconds
                                   : manager.failed_ttl_seconds;
-        if (now - job->completed_at >= ttl_seconds) {
-            manager.expired_jobs[job->id] = now + std::max<int64_t>(ttl_seconds, 60);
+        if (now - job->completed_at >= ttl_seconds * 1000) {
+            manager.expired_jobs[job->id] = now + std::max<int64_t>(ttl_seconds, 60) * 1000;
             it                            = manager.jobs.erase(it);
         } else {
             ++it;
@@ -130,7 +163,7 @@ size_t count_pending_jobs(const AsyncJobManager& manager) {
 
 std::string make_async_job_id(AsyncJobManager& manager) {
     std::ostringstream oss;
-    oss << "job_" << std::hex << unix_timestamp_now() << "_" << std::setw(8)
+    oss << "job_" << std::hex << unix_timestamp_now_ms() << "_" << std::setw(8)
         << std::setfill('0') << manager.next_id++;
     return oss.str();
 }
@@ -142,9 +175,11 @@ bool cancel_queued_job(AsyncJobManager& manager, AsyncGenerationJob& job) {
     }
 
     manager.queue.erase(new_end, manager.queue.end());
+    job.cancel.requested.store(true);
     job.status       = AsyncJobStatus::Cancelled;
-    job.completed_at = unix_timestamp_now();
+    job.completed_at = unix_timestamp_now_ms();
     job.result_images_b64.clear();
+    job.result_generation_info = nullptr;
     job.result_media_b64.clear();
     job.result_media_mime_type.clear();
     job.result_frame_count = 0;
@@ -177,13 +212,14 @@ bool cancel_generating_job(ServerRuntime& runtime,
 
 json make_async_job_json(const AsyncJobManager& manager, const AsyncGenerationJob& job) {
     json result;
-    result["id"]             = job.id;
-    result["kind"]           = async_job_kind_name(job.kind);
-    result["status"]         = async_job_status_name(job.status);
-    result["created"]        = job.created_at;
-    result["started"]        = job.started_at == 0 ? json(nullptr) : json(job.started_at);
-    result["completed"]      = job.completed_at == 0 ? json(nullptr) : json(job.completed_at);
-    result["queue_position"] = 0;
+    result["id"]               = job.id;
+    result["kind"]             = async_job_kind_name(job.kind);
+    result["status"]           = async_job_status_name(job.status);
+    result["cancel_requested"] = job.cancel.requested.load();
+    result["created"]          = job.created_at;
+    result["started"]          = job.started_at == 0 ? json(nullptr) : json(job.started_at);
+    result["completed"]        = job.completed_at == 0 ? json(nullptr) : json(job.completed_at);
+    result["queue_position"]   = 0;
 
     if (job.status == AsyncJobStatus::Queued) {
         size_t position = 1;
@@ -204,11 +240,12 @@ json make_async_job_json(const AsyncJobManager& manager, const AsyncGenerationJo
                 {"fps", job.result_fps},
                 {"frame_count", job.result_frame_count},
                 {"b64_json", job.result_media_b64},
+                {"generation_info", job.result_generation_info},
             };
         } else {
             json images = json::array();
             for (size_t i = 0; i < job.result_images_b64.size(); ++i) {
-                images.push_back({{"index", i}, {"b64_json", job.result_images_b64[i]}});
+                images.push_back({{"index", i}, {"b64_json", job.result_images_b64[i]}, {"generation_info", job.result_generation_info.at(i)}});
             }
             result["result"] = {
                 {"output_format", job.img_gen.output_format},
@@ -220,11 +257,11 @@ json make_async_job_json(const AsyncJobManager& manager, const AsyncGenerationJo
                job.status == AsyncJobStatus::Cancelled) {
         result["result"] = nullptr;
         result["error"]  = {
-             {"code",
+            {"code",
              job.error_code.empty()
-                  ? (job.status == AsyncJobStatus::Cancelled ? "cancelled" : "generation_failed")
-                  : job.error_code},
-             {"message", job.error_message},
+                 ? (job.status == AsyncJobStatus::Cancelled ? "cancelled" : "generation_failed")
+                 : job.error_code},
+            {"message", job.error_message},
         };
     } else {
         result["result"] = nullptr;
@@ -232,9 +269,6 @@ json make_async_job_json(const AsyncJobManager& manager, const AsyncGenerationJo
     }
 
     if (job.status == AsyncJobStatus::Generating) {
-        if (job.cancel.requested) {
-            result["cancel_requested"] = true;
-        }
         std::lock_guard<std::mutex> lock(job.preview_mutex);
         if (!job.preview_b64.empty()) {
             result["preview"] = {
@@ -256,34 +290,68 @@ static bool fail_with(GenerationFailure& failure, const char* message) {
     return false;
 }
 
+static bool fail_cancelled(GenerationFailure& failure) {
+    failure         = GenerationFailure();
+    failure.code    = SD_ERROR_CANCELLED;
+    failure.message = "the generation was cancelled";
+    return false;
+}
+
+// Runs the attempt on the keeper's context. While it runs, a stop the client asks for reaches the library however
+// many generation passes the attempt makes.
+static bool run_job(ServerRuntime& runtime,
+                    AsyncGenerationJob& job,
+                    const ContextKeeper::Attempt& attempt,
+                    GenerationFailure& failure) {
+    JobCancellationMonitor cancellation(*runtime.keeper, job);
+    return runtime.keeper->run(attempt, failure, &job.cancel);
+}
+
 bool execute_img_gen_job(ServerRuntime& runtime,
                          AsyncGenerationJob& job,
                          std::vector<std::string>& output_images,
+                         json& output_info,
                          GenerationFailure& failure) {
+    output_info                      = json::array();
     const sd_img_gen_params_t params = job.img_gen.to_sd_img_gen_params_t();
 
     SDImageVec results;
-    const bool generated = runtime.keeper->run(
+    bool adetailer_failed = false;
+    const bool generated  = run_job(
+        runtime,
+        job,
         [&](const ContextKeeper::ContextView& view) {
             sd_img_gen_params_t attempt_params = params;
             if (view.force_vae_tiling) {
                 attempt_params.vae_tiling_params.enabled = true;
             }
+            adetailer_failed = false;
             set_preview_callback(job);
-            sd_image_t* raw_results = nullptr;
-            int num_results         = 0;
-            const bool ok           = generate_image(view.ctx, &attempt_params, &raw_results, &num_results);
+            sd_image_generation_result_t* produced = nullptr;
+            const bool ok                          = generate_image(view.ctx, &attempt_params, &produced);
             clear_preview_callback();
             if (!ok) {
                 return false;
             }
-            results.adopt(raw_results, num_results);
+            results.adopt(produced, view.params->lora_model_dir);
+            if (job.cancel.requested.load()) {
+                return true;
+            }
+            if (!results.empty() && !apply_server_adetailer(runtime, view.ctx, *view.params, job.img_gen, attempt_params, results)) {
+                adetailer_failed = true;
+                return false;
+            }
             return true;
         },
-        failure,
-        &job.cancel);
+        failure);
     if (!generated) {
+        if (adetailer_failed && failure.code != SD_ERROR_CANCELLED) {
+            failure.message = failure.message.empty() ? "ADetailer failed" : "ADetailer failed: " + failure.message;
+        }
         return false;
+    }
+    if (job.cancel.requested.load()) {
+        return fail_cancelled(failure);
     }
 
     const int num_results = results.count();
@@ -298,17 +366,13 @@ bool execute_img_gen_job(ServerRuntime& runtime,
         encoded_format = EncodedImageFormat::WEBP;
     }
 
-    int batch_count      = job.img_gen.gen_params.batch_count;
-    int images_per_batch = batch_count > 0 ? std::max(1, num_results / batch_count) : 1;
     for (int i = 0; i < num_results; ++i) {
         if (results[i].data == nullptr) {
             continue;
         }
 
         const std::string metadata = job.img_gen.gen_params.embed_image_metadata
-                                         ? get_image_params(*runtime.ctx_params,
-                                                            job.img_gen.gen_params,
-                                                            job.img_gen.gen_params.seed + i / images_per_batch)
+                                         ? results.generation_info(i)
                                          : "";
         auto image_bytes           = encode_image_to_vector(encoded_format,
                                                             results[i].data,
@@ -321,6 +385,7 @@ bool execute_img_gen_job(ServerRuntime& runtime,
             continue;
         }
         output_images.push_back(base64_encode(image_bytes));
+        output_info.push_back(json::parse(results.generation_info(i)));
     }
 
     if (output_images.empty()) {
@@ -336,47 +401,54 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
                          std::string& output_media_mime_type,
                          int& output_frame_count,
                          int& output_fps,
+                         json& output_info,
                          GenerationFailure& failure) {
     const sd_vid_gen_params_t params = job.vid_gen.to_sd_vid_gen_params_t();
-    std::string str_params           = job.vid_gen.gen_params.embed_image_metadata
-                                           ? get_image_params(*runtime.ctx_params, job.vid_gen.gen_params, job.vid_gen.gen_params.seed, VID_GEN)
-                                           : "";
+    std::string str_params;
 
     SDImageVec results;
     int num_results             = 0;
     sd_audio_t* generated_audio = nullptr;
 
-    const bool generated = runtime.keeper->run(
+    const bool generated = run_job(
+        runtime,
+        job,
         [&](const ContextKeeper::ContextView& view) {
             sd_vid_gen_params_t attempt_params = params;
             if (view.force_vae_tiling) {
                 attempt_params.vae_tiling_params.enabled = true;
             }
             set_preview_callback(job);
-            sd_image_t* raw_results = nullptr;
-            int frame_count         = 0;
-            sd_audio_t* audio       = nullptr;
-            int fps                 = 0;
-            const bool ok           = generate_video(view.ctx, &attempt_params, &raw_results, &frame_count, &audio, &fps);
+            sd_video_generation_result_t* produced = nullptr;
+            const bool ok                          = generate_video(view.ctx, &attempt_params, &produced);
             clear_preview_callback();
             if (!ok) {
                 return false;
             }
-            results.adopt(raw_results, frame_count);
-            generated_audio = audio;
-            output_fps      = fps;
+            output_fps      = produced->fps;
+            generated_audio = produced->audio;
+            produced->audio = nullptr;
+            results.adopt_video(produced, view.params->lora_model_dir);
             return true;
         },
-        failure,
-        &job.cancel);
+        failure);
     if (!generated) {
         return false;
     }
 
     num_results = results.count();
+    if (job.cancel.requested.load()) {
+        free_sd_audio(generated_audio);
+        return fail_cancelled(failure);
+    }
     if (num_results <= 0) {
         free_sd_audio(generated_audio);
         return fail_with(failure, "generate_video returned no results");
+    }
+    json info   = json::parse(results.generation_info(0), nullptr, false);
+    output_info = info.is_discarded() ? json::object() : std::move(info);
+    if (job.vid_gen.gen_params.embed_image_metadata) {
+        str_params = results.generation_info(0);
     }
 
     std::vector<uint8_t> video_bytes = create_video_from_sd_images_to_vector(job.vid_gen.output_format,
@@ -425,10 +497,11 @@ void async_job_worker(ServerRuntime& runtime) {
 
             job             = it->second;
             job->status     = AsyncJobStatus::Generating;
-            job->started_at = unix_timestamp_now();
+            job->started_at = unix_timestamp_now_ms();
         }
 
         std::vector<std::string> output_images;
+        json output_info;
         std::string output_media_b64;
         std::string output_media_mime_type;
         int output_frame_count = 0;
@@ -438,7 +511,7 @@ void async_job_worker(ServerRuntime& runtime) {
 
         try {
             if (job->kind == AsyncJobKind::ImgGen) {
-                ok = execute_img_gen_job(runtime, *job, output_images, failure);
+                ok = execute_img_gen_job(runtime, *job, output_images, output_info, failure);
             } else if (job->kind == AsyncJobKind::VidGen) {
                 ok = execute_vid_gen_job(runtime,
                                          *job,
@@ -446,6 +519,7 @@ void async_job_worker(ServerRuntime& runtime) {
                                          output_media_mime_type,
                                          output_frame_count,
                                          output_fps,
+                                         output_info,
                                          failure);
             } else {
                 fail_with(failure, "unsupported job kind");
@@ -467,10 +541,16 @@ void async_job_worker(ServerRuntime& runtime) {
                 continue;
             }
 
-            job->completed_at = unix_timestamp_now();
-            if (ok) {
+            job->completed_at = unix_timestamp_now_ms();
+            if (job->cancel.requested.load()) {
+                job->status        = AsyncJobStatus::Cancelled;
+                job->error_code    = "cancelled";
+                job->error_message = "job cancelled by client";
+                LOG_INFO("job %s cancelled", job->id.c_str());
+            } else if (ok) {
                 job->status                 = AsyncJobStatus::Completed;
                 job->result_images_b64      = std::move(output_images);
+                job->result_generation_info = std::move(output_info);
                 job->result_media_b64       = std::move(output_media_b64);
                 job->result_media_mime_type = std::move(output_media_mime_type);
                 job->result_frame_count     = output_frame_count;
@@ -484,6 +564,7 @@ void async_job_worker(ServerRuntime& runtime) {
                 job->error_message   = cancelled ? "job cancelled by client"
                                                  : (failure.message.empty() ? "unknown generation error" : failure.message);
                 job->result_images_b64.clear();
+                job->result_generation_info = nullptr;
                 job->result_media_b64.clear();
                 job->result_media_mime_type.clear();
                 job->result_frame_count = 0;
