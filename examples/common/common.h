@@ -1,6 +1,8 @@
 #ifndef __EXAMPLES_COMMON_COMMON_H__
 #define __EXAMPLES_COMMON_COMMON_H__
 
+#include "generation_metadata.h"
+
 #include <cmath>
 #include <cstdint>
 #include <functional>
@@ -175,6 +177,7 @@ struct SDContextParams {
     std::string model_args;
     bool auto_fit = true;
     std::string rpc_servers;
+    bool list_devices = false;
     std::string effective_backend;
     std::string effective_params_backend;
     bool enable_mmap            = false;
@@ -186,6 +189,7 @@ struct SDContextParams {
     bool sage_attn             = false;
     bool diffusion_conv_direct = false;
     bool vae_conv_direct       = false;
+    bool taesd_preview_only    = false;
 
     prediction_t prediction           = PREDICTION_COUNT;
     lora_apply_mode_t lora_apply_mode = LORA_APPLY_AUTO;
@@ -196,13 +200,14 @@ struct SDContextParams {
 
     float flow_shift = INFINITY;
     ArgOptions get_options();
+    bool print_devices() const;
     void build_embedding_map();
     void prepare_backend_assignments();
     bool resolve(SDMode mode);
     bool validate(SDMode mode, bool require_model = true);
     bool resolve_and_validate(SDMode mode, bool require_model = true);
     std::string to_string() const;
-    sd_ctx_params_t to_sd_ctx_params_t(bool taesd_preview);
+    sd_ctx_params_t to_sd_ctx_params_t();
 };
 
 struct SDGenerationParams {
@@ -344,13 +349,5 @@ struct SDGenerationParams {
 std::string version_string();
 // "<code name>: <message>" for the latest failed library call of this thread; empty when it did not fail.
 std::string last_error_text();
-std::string build_sdcpp_image_metadata_json(const SDContextParams& ctx_params,
-                                            const SDGenerationParams& gen_params,
-                                            int64_t seed,
-                                            SDMode mode = IMG_GEN);
-std::string get_image_params(const SDContextParams& ctx_params,
-                             const SDGenerationParams& gen_params,
-                             int64_t seed,
-                             SDMode mode = IMG_GEN);
 
 #endif  // __EXAMPLES_COMMON_COMMON_H__

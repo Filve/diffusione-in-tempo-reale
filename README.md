@@ -28,7 +28,7 @@ progetto originale. Modifiche del fork di **Francesco Simeoni**
 - **Errori leggibili dalle app**: `sd_get_last_error()` distingue memoria esaurita, file del modello e backend; `sd_get_system_memory()` riporta la RAM di sistema
 - **Server robusto**: parte anche senza modello, autenticazione opzionale (`--api-key`) e allowlist CORS (`--cors-origins`)
 - **Server che non cade per la memoria**: una richiesta che esaurisce la RAM/VRAM non ferma `sd-server`; il modello viene ricaricato con un profilo più leggero e la richiesta ripetuta, altrimenti risposta `503` con `Retry-After`; `GET /sdcpp/v1/health` e `/resources` mostrano lo stato (`--disable-degradation` per spegnerlo)
-- **Fermare un job che sta generando**: `POST /sdcpp/v1/jobs/{id}/cancel` ferma anche un job già partito (`200` con il job annullato, `202` se sta ancora finendo; `?wait=` da 0 a 60 secondi). Non è un errore: il modello resta caricato, il server non scende di profilo e `/health` conta `cancelled`. Esempi `curl` e limiti in [docs/integrazione_progetti.md](./docs/integrazione_progetti.md), sezione 3.5
+- **Fermare un job che sta generando**: `POST /sdcpp/v1/jobs/{id}/cancel` ferma anche un job già partito (senza `?wait=` risponde subito `200`, con il job che può risultare ancora `generating`; con `?wait=` da 0 a 60 secondi aspetta e risponde `200` con il job annullato, o `202` se sta ancora finendo). Non è un errore: il modello resta caricato, il server non scende di profilo e `/health` conta `cancelled`. Esempi `curl` e limiti in [docs/integrazione_progetti.md](./docs/integrazione_progetti.md), sezione 3.5
 - **Pacchetto portabile**: backend ggml come librerie dinamiche caricate a runtime — un solo zip per macchine vecchie e nuove (`scripts/package_portable.sh`); pacchetti con GPU pronti: Windows CUDA 12 (NVIDIA, DLL incluse), Windows/Linux Vulkan, macOS Metal
 - **Suite di test di sicurezza** in [test/](./test/): file modello ostili, fuzzing, sanitizer
 
@@ -114,6 +114,7 @@ API and command-line option may change frequently.***
     - [FLUX.2-dev/FLUX.2-klein](./docs/flux2.md)
     - [FLUX.3 Image Klein / Klein Base](./docs/flux3.md)
     - [MOSS-Image-Base / MOSS-Image-SFT](./docs/moss_image.md)
+    - [Fibo 2.0 Dev](./docs/fibo2.md)
     - [Lens](./docs/lens.md)
     - [Chroma](./docs/chroma.md)
     - [Chroma1-Radiance](./docs/chroma_radiance.md)
@@ -124,6 +125,7 @@ API and command-line option may change frequently.***
     - [Z-Image](./docs/z_image.md)
     - [Z-Image L2P](./docs/z_image_l2p.md)
     - [MiniT2I](./docs/minit2i.md)
+    - [P-H3-Image](./docs/p_h3_image.md)
     - [SenseNova U1.5](./docs/sensenova_u1.md)
     - [Ovis-Image](./docs/ovis_image.md)
     - [Anima](./docs/anima.md)
@@ -145,6 +147,7 @@ API and command-line option may change frequently.***
     - [Boogu Image Edit](./docs/boogu_image.md)
     - [Mage-Flow-Edit](./docs/mage_flow.md#image-editing)
     - [LLaDA-Image Edit](./docs/llada_image.md#image-editing)
+    - [Fibo 2.0 Dev / Edit Turbo](./docs/fibo2.md#editing-and-turbo)
   - Video Models
     - [Wan2.1/Wan2.2](./docs/wan.md)
     - [MiniMax-H3](./docs/minimax_h3.md)

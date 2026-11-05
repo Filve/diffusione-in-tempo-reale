@@ -18,11 +18,16 @@ test/*
 !test/agenti_guardiano_test.py
 !test/fuzz_model_loader.py
 tests/
+logs/
 .vscode/
 .idea/
 .cache/
 *.swp
 *.bat
+!/start-server.bat
+/start-server.local.sh
+/start-server.local.bat
+/start-server.local.ps1
 *.bin
 *.exe
 *.gguf

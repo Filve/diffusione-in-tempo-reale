@@ -519,17 +519,25 @@ Il ciclo di vita completo, nell'ordine tecnico corretto:
 6. **Parametri di generazione**: `sd_img_gen_params_init(&gp)`; poi prompt e
    dimensioni. Default reali: 512×512, `strength` 0.75, `seed` -1 (= casuale),
    `batch_count` 1, 20 passi.
-7. **Generazione**: `generate_image(ctx, &gp, &images, &count)` — bloccante;
-   chiamarla da un worker thread se l'app ha una UI.
+7. **Generazione**: `generate_image(ctx, &gp, &result)` con
+   `sd_image_generation_result_t* result = NULL` — bloccante; chiamarla da un
+   worker thread se l'app ha una UI. `result_out` è obbligatorio e in caso di
+   fallimento la libreria lo azzera.
 8. **Annullamento** (facoltativo, da un altro thread):
    `sd_cancel_generation(ctx, SD_CANCEL_ALL)` interrompe appena possibile;
    `SD_CANCEL_NEW_LATENTS` finisce l'immagine in corso e salta le successive.
-9. **Lettura del risultato**: ogni `sd_image_t` ha `width`, `height`,
-   `channel` (3 = RGB) e `data` — buffer di `width*height*channel` byte, righe
-   contigue senza padding, ordine RGB. Copiarlo o convertirlo subito.
-10. **Rilascio**: `free_sd_images(images, count)` e poi `free_sd_ctx(ctx)` —
-    sempre le funzioni della libreria, mai `free()` del chiamante (su Windows
-    CRT diversi causerebbero corruzione).
+9. **Lettura del risultato**: `result->count` elementi in `result->items[i]`;
+   ognuno ha `image` (un `sd_image_t` con `width`, `height`, `channel` (3 = RGB)
+   e `data` — buffer di `width*height*channel` byte, righe contigue senza
+   padding, ordine RGB) e `generation_info` (JSON `sdcpp.generation/v1` con i
+   parametri per riprodurre l'immagine, vedi
+   [generation_metadata.md](generation_metadata.md)). Copiarli o convertirli
+   subito.
+10. **Rilascio**: `free_sd_image_generation_result(result)` e poi
+    `free_sd_ctx(ctx)` — sempre le funzioni della libreria, mai `free()` del
+    chiamante (su Windows CRT diversi causerebbero corruzione). Il risultato
+    possiede pixel e JSON, resta valido anche dopo `free_sd_ctx()` e il suo
+    distruttore accetta `NULL`.
 
 Campi principali di `sd_ctx_params_t` (tutti gli altri possono restare ai
 default):
@@ -586,14 +594,13 @@ int main(int argc, char** argv) {
     gp.height = 512;
     gp.seed   = 42;
 
-    sd_image_t* images = NULL;
-    int count          = 0;
-    int rc             = 1;
-    if (generate_image(ctx, &gp, &images, &count) && count > 0) {
-        rc = 0;                       // images[i].data / width / height / channel
+    sd_image_generation_result_t* result = NULL;
+    int rc                               = 1;
+    if (generate_image(ctx, &gp, &result) && result->count > 0) {
+        rc = 0;                       // result->items[i].image: data / width / height / channel
     }
 
-    free_sd_images(images, count);    // sempre dalla libreria (evita problemi di CRT su Windows)
+    free_sd_image_generation_result(result);  // sempre dalla libreria (evita problemi di CRT su Windows)
     free_sd_ctx(ctx);
     return rc;
 }
@@ -677,7 +684,13 @@ Il server **parte anche senza modello** (niente loop né uscita silenziosa):
 
 - senza `-m`/`--diffusion-model` si avvia con un avviso in console; gli
   endpoint dei device e di upscale funzionano, quelli di generazione
-  rispondono con `{"error": "no model loaded; restart the server with -m/--diffusion-model"}`;
+  rispondono `503` con `{"code": "model_not_loaded", "error": "No model is loaded"}`
+  e `/sdcpp/v1/health` dice `"status": "no_model"` (il catalogo dei modelli è quello
+  di leejet: `--model-dir` e le rotte `/sdcpp/v1/model-files`, `/sdcpp/v1/recipes` e
+  `/sdcpp/v1/models/{status,load,unload,refresh}`, vedi
+  [examples/server/api.md](../examples/server/api.md)); un modello caricato dal
+  catalogo è gestito dallo stesso custode del contesto, quindi vale anche per lui il
+  recupero dalla memoria esaurita descritto sotto;
 - se il modello è indicato ma non è caricabile, il server **non** parte e
   scrive in console il percorso del modello e il motivo del fallimento
   (exit code 1).
@@ -724,29 +737,39 @@ curl -s -X POST http://127.0.0.1:1234/sdcpp/v1/img_gen \
      -H "Content-Type: application/json" \
      -d '{"prompt": "a red apple", "width": 512, "height": 512, "sample_params": {"sample_steps": 30}}'
 
-# fermalo: aspetta fino a 10 secondi che il job finisca davvero
+# fermalo: la richiesta torna subito e il job può risultare ancora "generating"
 curl -s -X POST http://127.0.0.1:1234/sdcpp/v1/jobs/job_6acf9114_00000000/cancel
 
-# oppure chiedi lo stop e torna subito, poi controlla con calma
-curl -s -X POST "http://127.0.0.1:1234/sdcpp/v1/jobs/job_6acf9114_00000000/cancel?wait=0"
+# oppure aspetta fino a 10 secondi che il job finisca davvero
+curl -s -X POST "http://127.0.0.1:1234/sdcpp/v1/jobs/job_6acf9114_00000000/cancel?wait=10"
+
+# in ogni caso, controlla con calma lo stato del job
 curl -s http://127.0.0.1:1234/sdcpp/v1/jobs/job_6acf9114_00000000
 ```
 
 - Cosa dice la risposta. `200` = il job è in uno stato finale e la risposta lo
-  contiene (`"status": "cancelled"`, `error.code` `cancelled`). `202` = lo stop è
-  stato chiesto ma il job sta ancora finendo (`"status": "generating"` e
-  `"cancel_requested": true`): richiedi lo stesso `cancel` o interroga
-  `GET /sdcpp/v1/jobs/{id}` finché diventa `cancelled`. Ripetere la richiesta non
-  fa danni. Un job in coda esce subito dalla coda (`200`) e non parte mai; un job
-  già finito resta com'è (`200`); un id sconosciuto è `404`.
-- `?wait=` sono i secondi che la richiesta può aspettare: da `0` (risponde subito)
-  a `60`, predefinito `10`. Un valore che non è un numero intero di secondi dà
-  `400`. La richiesta tiene aperta la connessione per tutto il tempo che aspetta.
+  contiene (`"status": "cancelled"`, `error.code` `cancelled`); senza `?wait=` è
+  anche la risposta immediata a «stop chiesto», con il job ancora
+  `"status": "generating"` e `"cancel_requested": true`: interroga
+  `GET /sdcpp/v1/jobs/{id}` finché diventa `cancelled`. `202` = con `?wait=`, lo
+  stop è stato chiesto ma dopo l'attesa il job sta ancora finendo
+  (`"status": "generating"` e `"cancel_requested": true`): richiedi lo stesso
+  `cancel` o interroga il job. Ripetere la richiesta non fa danni. Un job in coda
+  esce subito dalla coda (`200`) e non parte mai; un job già finito resta com'è
+  (`200`); un id sconosciuto è `404`.
+- `?wait=` (facoltativo) sono i secondi che la richiesta può aspettare che il job
+  finisca davvero: da `0` a `60`. Senza `?wait=` la richiesta risponde subito,
+  come il server di leejet. `?wait=0` risponde subito anch'esso, ma con `202` se
+  il job non era già finito. Un valore che non è un numero intero di secondi (0 o
+  più) dà `400`. Con `?wait=` la richiesta tiene aperta la connessione per tutto
+  il tempo che aspetta e ripete lo stop ogni 100 ms, perché la libreria dimentica
+  uno stop che arriva prima dell'inizio della generazione; senza `?wait=` lo stop
+  parte una sola volta, quindi se il job non si ferma basta ripetere la richiesta.
 - Quanto ci mette. Il motore controlla lo stop alla fine di ogni passo di
   campionamento e fra le fasi (testo, decodifica, secondo passaggio): su una macchina
   lenta un passo dura secondi, e la prima generazione dopo l'avvio può passare
-  molto tempo a leggere i pesi dal disco prima del primo controllo. Se lo stop non
-  basta nel tempo di `wait` la risposta è `202`, non un errore.
+  molto tempo a leggere i pesi dal disco prima del primo controllo. Con `?wait=`,
+  se lo stop non basta nel tempo di `wait` la risposta è `202`, non un errore.
 - Se il job finisce prima che lo stop faccia effetto, la risposta è il job
   completato (`200`, `"status": "completed"`): non c'è niente da fermare.
 - Fermare non è un errore. Il modello non si ricarica, il server non scende a un
@@ -1604,10 +1627,13 @@ sincronizzazioni future.
     stop di un job non può raggiungere un'altra richiesta, un job annullato prima
     di partire non genera niente e un contesto liberato o ricostruito non viene
     mai toccato. La libreria dimentica una richiesta di stop quando una
-    generazione comincia, quindi la rotta la ripete ogni 100 ms finché il job è
-    finito. Risposta `200` con il job annullato, o `202` con
-    `"cancel_requested": true` se dopo `?wait=` secondi (0-60, predefinito 10)
-    sta ancora finendo. Un job fermato non è un errore: nessuna ricarica del
+    generazione comincia, quindi con `?wait=` la rotta la ripete ogni 100 ms
+    finché il job è finito o l'attesa scade. Senza `?wait=` la risposta torna
+    subito (`200`, il job può risultare ancora `generating` con
+    `"cancel_requested": true`, come nel server di leejet); con `?wait=` secondi
+    (0-60) la rotta aspetta e risponde `200` con il job annullato, o `202` con
+    `"cancel_requested": true` se dopo l'attesa sta ancora finendo. Un job
+    fermato non è un errore: nessuna ricarica del
     modello, nessuna discesa di profilo, nessun `last_error`, contatore
     `counters.cancelled` in `/health`; `cancel_generating` è `true` in
     `/capabilities`. I messaggi della libreria per uno stop voluto passano da
@@ -1615,9 +1641,11 @@ sincronizzazioni future.
     contenuti della libreria HTTP: un gestore normale parte solo dopo che il corpo
     è stato letto, e per un POST senza `Content-Length` (quello di
     `curl -X POST`) la libreria aspetta 5 secondi di timeout prima di accorgersi
-    che non c'è; così `curl -X POST …/cancel` risponde subito. Test: `test/server_recovery_test.cpp` (149 controlli, con
-    ASan/UBSan e TSan; sette guasti inseriti di proposito nel custode sono tutti
-    rilevati) e `test/server_cancel_e2e.py` (32 controlli su un vero
+    che non c'è; così `curl -X POST …/cancel` risponde subito. Test:
+    `test/server_recovery_test.cpp` (173 controlli, con ASan/UBSan e TSan, tra
+    cui quelli di caricamento e scaricamento del modello dal catalogo; sette
+    guasti inseriti di proposito nell'annullamento sono tutti rilevati) e
+    `test/server_cancel_e2e.py` (35 controlli su un vero
     `sd-server`). Provato su CPU con il modello sintetico: lo stop arriva in circa
     un passo di campionamento, il contesto resta riutilizzabile e una richiesta
     sincrona in attesa dietro il job annullato finisce normalmente. **Non

@@ -176,8 +176,9 @@ Da sapere:
   né il contrario: serve qualcuno che coordini (l'utente o il programma
   ospite).
 - `POST /sdcpp/v1/jobs/{id}/cancel` ferma un job **in coda** (subito) e uno **in
-  esecuzione** (al passo di campionamento successivo): risposta `200` con il job
-  annullato, oppure `202` se sta ancora finendo (vedi
+  esecuzione** (al passo di campionamento successivo): senza `?wait=` risposta
+  subito `200` (il job può risultare ancora `generating`), con `?wait=` risposta
+  `200` con il job annullato, oppure `202` se sta ancora finendo (vedi
   [integrazione_progetti.md](./integrazione_progetti.md), sezione 3.5). Il modello
   resta in memoria e il server non scende di profilo, quindi è il modo giusto per
   fare posto all'altra applicazione senza spegnere il server. Le richieste
@@ -300,7 +301,7 @@ momento.
 | `503` `unavailable` | il server sta ricaricando il modello dopo un errore (`cause` dice quale) | riprova dopo `Retry-After` |
 | `503` `busy` | il modello era in uso | riprova dopo `Retry-After` |
 | `429` | coda piena (`queue.max` in `/health`, 64) | riprova dopo `Retry-After` (10 secondi) |
-| `202` su `cancel` | lo stop è stato chiesto e il job sta ancora finendo (`cancel_requested: true`) | ripeti `cancel` o interroga il job finché diventa `cancelled` |
+| `202` su `cancel?wait=…` | lo stop è stato chiesto e dopo l'attesa il job sta ancora finendo (`cancel_requested: true`); senza `?wait=` la risposta è invece subito `200`, con il job ancora `generating` | ripeti `cancel` o interroga il job finché diventa `cancelled` |
 | `409` su `cancel` | server più vecchio: il job sta generando e non si può fermare | aspetta o termina il processo |
 | `401` | manca la chiave API | `Authorization: Bearer <chiave>` oppure `X-API-Key` |
 | `400` `invalid_argument` | la richiesta non è generabile così | non ripeterla uguale |

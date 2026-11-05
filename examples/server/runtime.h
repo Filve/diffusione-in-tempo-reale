@@ -18,6 +18,7 @@ struct ArgOptions;
 struct SDContextParams;
 struct AsyncJobManager;
 class ContextKeeper;
+struct ServerModels;
 
 struct SDSvrParams {
     std::string listen_ip = "127.0.0.1";
@@ -27,9 +28,10 @@ struct SDSvrParams {
     std::string cors_origins;  // comma-separated allowlist; empty = reflect any origin
     bool disable_degradation = false;
     int degradation_cooldown = 300;  // seconds before the server tries a heavier profile again; 0 = never
-    bool normal_exit = false;
+    std::vector<std::string> model_dirs;
+    bool normal_exit         = false;
     sd_log_level_t log_level = SD_LOG_INFO;
-    bool color       = false;
+    bool color               = false;
 
     ArgOptions get_options();
     bool validate();
@@ -41,6 +43,8 @@ struct LoraEntry {
     std::string name;
     std::string path;
     std::string fullpath;
+    std::string display_path;
+    std::filesystem::path root;
 };
 
 struct UpscalerEntry {
@@ -48,7 +52,7 @@ struct UpscalerEntry {
     std::string path;
     std::string fullpath;
     std::string model_name;
-    int scale = 4;
+    int scale                = 4;
     int image_upscale_factor = 0;
     uintmax_t file_size      = 0;
     std::filesystem::file_time_type last_modified;
@@ -57,13 +61,25 @@ struct UpscalerEntry {
 struct ServerRuntime {
     ContextKeeper* keeper;
     const SDSvrParams* svr_params;
-    const SDContextParams* ctx_params;
-    const SDGenerationParams* default_gen_params;
+    SDContextParams* ctx_params;
+    SDGenerationParams* default_gen_params;
     std::vector<LoraEntry>* lora_cache;
     std::mutex* lora_mutex;
     std::vector<UpscalerEntry>* upscaler_cache;
     std::mutex* upscaler_mutex;
     AsyncJobManager* async_job_manager;
+    ServerModels* models;
+};
+
+struct ServerADetailerPass {
+    std::string prompt;
+    std::string negative_prompt;
+    std::string extra_args;
+    int width                = 512;
+    int height               = 512;
+    float strength           = 0.4f;
+    int clip_skip            = -1;
+    bool automatic_scheduler = false;
 };
 
 struct ImgGenJobRequest {
@@ -72,11 +88,20 @@ struct ImgGenJobRequest {
     int output_compression    = 100;
     std::string preview_mode  = "none";
     int preview_interval      = 1;
+    bool adetailer_enabled    = true;
+    std::vector<ServerADetailerPass> adetailer_passes;
 
     sd_img_gen_params_t to_sd_img_gen_params_t() {
         return gen_params.to_sd_img_gen_params_t();
     }
 };
+
+constexpr int k_max_generation_dimension = 4096;
+constexpr int k_max_adetailer_steps      = 100;
+
+bool validate_server_img_gen_request(const ServerRuntime& runtime,
+                                     const ImgGenJobRequest& request,
+                                     std::string& error_message);
 
 struct VidGenJobRequest {
     SDGenerationParams gen_params;
@@ -109,4 +134,12 @@ std::string unsupported_generation_mode_error(const ServerRuntime& runtime, SDMo
 void refresh_lora_cache(ServerRuntime& rt);
 std::string get_lora_full_path(ServerRuntime& rt, const std::string& path);
 void refresh_upscaler_cache(ServerRuntime& rt);
-int64_t unix_timestamp_now();
+int64_t unix_timestamp_now_ms();
+// Runs ADetailer on the results, with the context that made them and the settings it was created with: after
+// the server stepped down to a lighter profile, those differ from the ones it started with.
+bool apply_server_adetailer(ServerRuntime& runtime,
+                            sd_ctx_t* ctx,
+                            const SDContextParams& ctx_params,
+                            const ImgGenJobRequest& request,
+                            const sd_img_gen_params_t& params,
+                            SDImageVec& results);

@@ -88,6 +88,9 @@ public:
         sd_profile::Level level = sd_profile::Level::MAX;
         // The server stepped down to a lite profile: decode the VAE in tiles whatever the request asked.
         bool force_vae_tiling = false;
+        // What the context was created with, the profile of the ladder included. For a stage that loads its own
+        // model next to the context (ADetailer), so that it follows the placement the server is running with.
+        const SDContextParams* params = nullptr;
     };
 
     // Runs one generation. Must return false only when the generation itself failed, and must not call
@@ -104,6 +107,16 @@ public:
     // Loads the model, stepping down the ladder when the memory is not enough. Returns false when no
     // profile could load it; failure holds the reason of the last attempt.
     bool start(GenerationFailure& failure);
+
+    // Replaces the model with the one params describes, e.g. when a client picks another from the catalog. The
+    // context in use goes first (both would not fit), then the ladder is built again from the profile the
+    // server started with, so the new model is protected like the first. Returns false when no profile could
+    // load it: no model is loaded then, failure holds the reason of the last attempt, and load() can be called
+    // again. Counters and uptime are kept. The caller makes sure no run() is waiting or running.
+    bool load(const SDContextParams& params, GenerationFailure& failure);
+
+    // Frees the context. Generation requests fail with "no model loaded" until load() succeeds.
+    void unload();
 
     std::mutex& mutex() {
         return mutex_;
@@ -145,9 +158,7 @@ public:
 
     // The profiles the server can step down through, e.g. "max > lite > lite-cpu".
     std::string describe_ladder() const;
-    bool can_step_down() const {
-        return settings_.degradation && ladder_.size() > 1;
-    }
+    bool can_step_down() const;
 
     nlohmann::json health_json() const;
     // "ok", "degraded", "recovering", "unavailable" or "no_model"
@@ -181,8 +192,9 @@ private:
     std::unique_ptr<SDContextParams> params_for(sd_profile::Level level) const;
     std::string fingerprint(sd_profile::Level level) const;
     bool force_tiling_at(sd_profile::Level level) const;
-    void build_ladder();
+    std::vector<sd_profile::Level> make_ladder() const;
 
+    bool load_locked(GenerationFailure& failure);
     bool build_from(size_t index, GenerationFailure& failure);
     bool try_build(size_t index, GenerationFailure& failure);
     bool restore(GenerationFailure& failure);
@@ -194,10 +206,12 @@ private:
     Status status_locked() const;
     static const char* status_text(Status status);
 
-    // Settings and the ladder do not change after construction.
+    // The settings, the hooks and the profile the server started with do not change after construction. The
+    // base parameters and the ladder change only in load(), with mutex_ and state_mutex_ both held, so reading
+    // them under either one is enough.
     const Settings settings_;
     const Hooks hooks_;
-    const SDContextParams base_params_;
+    SDContextParams base_params_;
     const sd_profile::Level base_level_;
     std::vector<sd_profile::Level> ladder_;
 
