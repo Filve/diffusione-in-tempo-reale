@@ -3,7 +3,8 @@
 // Build (from the repository root, after building the library into build/):
 //   cc -c thirdparty/zip.c -o zip.o
 //   c++ -std=c++17 -Iexamples -Iinclude -Ithirdparty -Isrc test/profile_test.cpp examples/common/common.cpp \
-//       examples/common/log.cpp examples/common/media_io.cpp examples/common/profile.cpp zip.o \
+//       examples/common/log.cpp examples/common/media_io.cpp examples/common/media_metadata.cpp \
+//       examples/common/generation_metadata.cpp examples/common/profile.cpp zip.o \
 //       -Lbuild/bin -lstable-diffusion -Wl,-rpath,build/bin -pthread -o profile_test
 // Run: ./profile_test ; exit code 0 = all checks passed.
 #include <cstdio>
@@ -163,7 +164,7 @@ int main() {
         Parsed bad({"--multi-gpu", "sideways"});
         CHECK(bad.ok && !bad.ctx.validate(IMG_GEN, false), "--multi-gpu refuses anything but auto, on and off");
         Parsed passed({"--multi-gpu", "on"});
-        const sd_ctx_params_t raw = passed.ctx.to_sd_ctx_params_t(false);
+        const sd_ctx_params_t raw = passed.ctx.to_sd_ctx_params_t();
         CHECK(raw.multi_gpu != nullptr && strcmp(raw.multi_gpu, "on") == 0, "the value reaches the library");
     }
     {

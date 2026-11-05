@@ -177,7 +177,7 @@ namespace sd::backend_fit {
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
             const auto type        = ggml_backend_dev_type(dev);
-            if (type != GGML_BACKEND_DEVICE_TYPE_GPU &&
+            if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU &&
                 (!include_other_devices || type == GGML_BACKEND_DEVICE_TYPE_CPU)) {
                 continue;
             }
@@ -237,7 +237,7 @@ namespace sd::backend_fit {
         vm_statistics64_data_t stats{};
         mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
         const bool ok                = host_page_size(host, &page_size) == KERN_SUCCESS &&
-                        host_statistics64(host, HOST_VM_INFO64, (host_info64_t)&stats, &count) == KERN_SUCCESS;
+                                       host_statistics64(host, HOST_VM_INFO64, (host_info64_t)&stats, &count) == KERN_SUCCESS;
         mach_port_deallocate(mach_task_self(), host);
         if (ok) {
             return ((int64_t)stats.free_count + stats.inactive_count) * page_size;

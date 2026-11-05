@@ -13,6 +13,11 @@ Extra options for the server (a backend, --flash-attn, ...) go after --extra, on
 
 The first generation can take minutes when the weights are read from a slow disk, so the test starts with
 a warm-up job (--warmup-timeout) and only then looks at how a stop behaves.
+
+Without ?wait= the cancel route answers at once, with the job still generating, and sends the stop once: the
+library forgets a stop that arrives before the generation has begun, so the test asks again when the job does
+not end, as a client of the route does. With ?wait=N the server repeats the stop itself and answers 200 when
+the job has ended or 202 when it has not.
 """
 import argparse
 import json
@@ -93,6 +98,25 @@ class Client:
                 raise Abort("job %s ended as %s, expected %s: %s" % (job_id, job["status"], wanted, job.get("error")))
             time.sleep(0.1)
         raise Abort("job %s did not become %s within %d s" % (job_id, wanted, timeout))
+
+    def stop_until_ended(self, job_id, timeout, patience=10.0):
+        """What a client of the cancel route without ?wait= does after its first request: the stop is sent
+        once and the library forgets it when it arrives before the generation has begun, so the request is
+        repeated every `patience` seconds until the job has ended. Returns the job and how many times the
+        request had to be repeated."""
+        started = time.time()
+        last_stop = started
+        repeated = 0
+        while time.time() - started < timeout:
+            job = self.job(job_id)
+            if job["status"] in ("completed", "failed", "cancelled"):
+                return job, repeated
+            if time.time() - last_stop >= patience:
+                self.call("POST", "/sdcpp/v1/jobs/%s/cancel" % job_id)
+                last_stop = time.time()
+                repeated += 1
+            time.sleep(0.1)
+        raise Abort("job %s did not end within %d s of the stop" % (job_id, timeout))
 
     def health(self):
         return self.call("GET", "/sdcpp/v1/health")[1]
@@ -176,21 +200,22 @@ def run_scenarios(client, args, mark_log):
     before = start["counters"]
     mark_log()
 
-    # 1. A job that is generating is stopped.
+    # 1. A job that is generating is stopped. Without ?wait= the answer comes at once, with the job still
+    # generating and the stop pending, and the client polls the job until it ends.
     job_id = client.submit(steps, 2, size)
     client.wait_for(job_id, ("generating",), 60)
     time.sleep(1.5)
     status, body, seconds = client.call("POST", "/sdcpp/v1/jobs/%s/cancel" % job_id)
     if status == 200 and body["status"] == "completed":
         raise Abort("the job finished before it could be cancelled: raise --steps or --size")
-    check(status in (200, 202), "cancelling a generating job answers 200 or 202 (got %s)" % status)
-    if status == 202:
-        check(body.get("cancel_requested") is True and body["status"] == "generating",
-              "a 202 carries the job with cancel_requested")
-        body = client.wait_for(job_id, ("cancelled",), 120)
+    check(status == 200 and body["status"] == "generating" and body.get("cancel_requested") is True,
+          "without ?wait= the answer is 200 with the job still generating and the stop pending (got %s)" % status)
+    check(seconds < 2.0, "and it comes at once (%.2f s)" % seconds)
+    body, repeated = client.stop_until_ended(job_id, 120)
     check(body["status"] == "cancelled" and body["error"]["code"] == "cancelled",
           "the job ends as cancelled with the code cancelled")
-    print("      the request returned after %.1f s" % seconds, flush=True)
+    if repeated:
+        print("      the stop had to be repeated %d time(s): it came before the generation began" % repeated, flush=True)
     check(body["started"] is not None and body["completed"] is not None, "it records when it started and ended")
 
     # 2. Asking again is harmless.
@@ -231,6 +256,21 @@ def run_scenarios(client, args, mark_log):
     check(final["status"] == "cancelled", "the job ends as cancelled")
     check(client.job(queued)["status"] == "cancelled", "the queued job stayed cancelled and never ran")
 
+    # 4b. With ?wait=N the server repeats the stop itself and answers 200 as soon as the job has ended.
+    wait_seconds = 30
+    waiting = client.submit(steps, 8, size)
+    client.wait_for(waiting, ("generating",), 60)
+    time.sleep(1.0)
+    status, body, seconds = client.call("POST", "/sdcpp/v1/jobs/%s/cancel?wait=%d" % (waiting, wait_seconds))
+    check(status == 200 and body["status"] == "cancelled" and body["error"]["code"] == "cancelled",
+          "?wait=%d answers 200 with the job already cancelled (got %s after %.1f s)" % (wait_seconds, status, seconds))
+    if status == 200:
+        check(seconds < wait_seconds - 1, "as soon as the job ended, not when the wait ran out")
+    else:
+        check(status == 202 and body.get("cancel_requested") is True,
+              "a wait that runs out answers 202 with the stop pending")
+        client.stop_until_ended(waiting, 120)
+
     # 5. A request that waits behind a job being cancelled still completes.
     long_job = client.submit(steps, 6, size)
     client.wait_for(long_job, ("generating",), 60)
@@ -244,9 +284,8 @@ def run_scenarios(client, args, mark_log):
     thread = threading.Thread(target=synchronous_request)
     thread.start()
     time.sleep(1.5)
-    status, body, _ = client.call("POST", "/sdcpp/v1/jobs/%s/cancel" % long_job)
-    if status == 202:
-        body = client.wait_for(long_job, ("cancelled",), 120)
+    client.call("POST", "/sdcpp/v1/jobs/%s/cancel" % long_job)
+    body, _ = client.stop_until_ended(long_job, 120)
     check(body["status"] == "cancelled", "the long job is cancelled while a synchronous request waits for the model")
     thread.join(args.warmup_timeout)
     sync_status, sync_body, _ = outcome.get("result", (None, None, 0))
@@ -272,8 +311,8 @@ def run_scenarios(client, args, mark_log):
     health = client.health()
     now = health["counters"]
     check(health["status"] == start["status"] and health["busy"] is False, "the server is idle and as healthy as before")
-    check(now["cancelled"] - before["cancelled"] == 3 and now["failed"] == before["failed"],
-          "three jobs were stopped while generating (the queued one never reached the model), none failed")
+    check(now["cancelled"] - before["cancelled"] == 4 and now["failed"] == before["failed"],
+          "four jobs were stopped while generating (the queued one never reached the model), none failed")
     check(now["step_downs"] == before["step_downs"], "no step down happened")
 
 

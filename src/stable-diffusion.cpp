@@ -1,4 +1,5 @@
 #include "stable-diffusion.h"
+#include "generation_info.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -174,10 +175,13 @@ const char* prediction_to_str[] = {
     "sefi_flow",
     "minit2i_flow",
     "sensenova_u1_flow",
+    "flux3_flow",
+    "h3_av_flow",
+    "ming_image_flow",
 };
 
 const char* sd_prediction_name(enum prediction_t prediction) {
-    if (prediction < PREDICTION_COUNT) {
+    if (prediction >= EPS_PRED && prediction < PREDICTION_COUNT) {
         return prediction_to_str[prediction];
     }
     return NONE_STR;
@@ -645,6 +649,7 @@ void sd_vid_gen_params_init(sd_vid_gen_params_t* sd_vid_gen_params) {
     sd_vid_gen_params->hires.custom_sigmas_count             = 0;
     sd_vid_gen_params->circular_x                            = false;
     sd_vid_gen_params->circular_y                            = false;
+    sd_vid_gen_params->ref_image_args                        = "";
     sd_cache_params_init(&sd_vid_gen_params->cache);
 }
 
@@ -756,14 +761,20 @@ SD_API bool sd_ctx_has_control_net(const sd_ctx_t* sd_ctx) {
     if (sd_ctx == nullptr || sd_ctx->sd == nullptr) {
         return false;
     }
-    return sd_ctx->sd->control_net != nullptr;
+    if (sd_ctx->sd->control_net != nullptr) {
+        return true;
+    }
+    // z-image keeps control net weights inside the diffusion runner, registered
+    // under ModelComponent::ControlNet instead of a separate control_net runner.
+    return sd_ctx->sd->model_manager != nullptr &&
+           sd_ctx->sd->model_manager->registered_params_size({ModelComponent::ControlNet}) > 0;
 }
 
 const char* sd_get_model_version_name(const sd_ctx_t* sd_ctx) {
     if (sd_ctx == nullptr || sd_ctx->sd == nullptr || sd_ctx->sd->version >= VERSION_COUNT) {
         return "Unknown";
     }
-    return model_version_to_str[sd_ctx->sd->version];
+    return sd_version_name(sd_ctx->sd->version);
 }
 
 enum sample_method_t sd_get_default_sample_method(const sd_ctx_t* sd_ctx) {
@@ -776,17 +787,17 @@ enum scheduler_t sd_get_default_scheduler(const sd_ctx_t* sd_ctx, enum sample_me
 
 SD_API bool generate_image(sd_ctx_t* sd_ctx,
                            const sd_img_gen_params_t* params,
-                           sd_image_t** images_out,
-                           int* num_images_out) {
+                           sd_image_generation_result_t** result_out) {
     sd::last_error::clear();
-    if (images_out != nullptr)
-        *images_out = nullptr;
-    if (num_images_out != nullptr)
-        *num_images_out = 0;
-    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || params == nullptr) {
-        sd::last_error::mark(SD_ERROR_INVALID_ARGUMENT, "generate_image needs a context and parameters");
+    if (result_out != nullptr)
+        *result_out = nullptr;
+    if (result_out == nullptr || sd_ctx == nullptr || sd_ctx->sd == nullptr || params == nullptr) {
+        sd::last_error::mark(SD_ERROR_INVALID_ARGUMENT, "generate_image needs a context, parameters and a place for the result");
         return false;
     }
+    sd_image_t* images = nullptr;
+    int count          = 0;
+    std::vector<nlohmann::json> infos;
     const bool generated = run_without_exceptions([&]() {
         StableDiffusionGGML::ExecutionScope execution(*sd_ctx->sd);
         if (!execution.operation.acquired) {
@@ -797,18 +808,18 @@ SD_API bool generate_image(sd_ctx_t* sd_ctx,
             sd::last_error::mark(SD_ERROR_MODEL_FILE, "the model files could not be validated");
             return false;
         }
-        return sd::pipeline::generate_image(sd_ctx->sd, params, images_out, num_images_out);
+        return sd::pipeline::generate_image(sd_ctx->sd, params, &images, &count, &infos);
     });
     if (generated) {
-        sd::last_error::clear();
-        return true;
+        // The result takes the images and frees them itself when it cannot be built.
+        if (sd::make_image_generation_result(images, count, infos, result_out)) {
+            sd::last_error::clear();
+            return true;
+        }
+        sd::last_error::mark(SD_ERROR_UNKNOWN, "the generated images could not be packed into a result");
+        return false;
     }
-    if (images_out != nullptr && *images_out != nullptr) {
-        free_sd_images(*images_out, num_images_out != nullptr ? *num_images_out : 0);
-        *images_out = nullptr;
-        if (num_images_out != nullptr)
-            *num_images_out = 0;
-    }
+    free_sd_images(images, count);
     if (sd_ctx->sd->get_cancel_flag() == SD_CANCEL_ALL) {
         sd::last_error::mark(SD_ERROR_CANCELLED, "the generation was cancelled");
     }
@@ -817,22 +828,18 @@ SD_API bool generate_image(sd_ctx_t* sd_ctx,
 }
 
 SD_API bool generate_video(sd_ctx_t* sd_ctx,
-                           const sd_vid_gen_params_t* sd_vid_gen_params,
-                           sd_image_t** frames_out,
-                           int* num_frames_out,
-                           sd_audio_t** audio_out,
-                           int* fps_out) {
+                           const sd_vid_gen_params_t* params,
+                           sd_video_generation_result_t** result_out) {
     sd::last_error::clear();
-    if (frames_out != nullptr)
-        *frames_out = nullptr;
-    if (audio_out != nullptr)
-        *audio_out = nullptr;
-    if (num_frames_out != nullptr)
-        *num_frames_out = 0;
-    if (fps_out != nullptr)
-        *fps_out = 0;
-    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || sd_vid_gen_params == nullptr) {
-        sd::last_error::mark(SD_ERROR_INVALID_ARGUMENT, "generate_video needs a context and parameters");
+    if (result_out != nullptr)
+        *result_out = nullptr;
+    if (result_out == nullptr || sd_ctx == nullptr || sd_ctx->sd == nullptr || params == nullptr) {
+        sd::last_error::mark(SD_ERROR_INVALID_ARGUMENT, "generate_video needs a context, parameters and a place for the result");
+        return false;
+    }
+    auto* result = static_cast<sd_video_generation_result_t*>(calloc(1, sizeof(sd_video_generation_result_t)));
+    if (result == nullptr) {
+        sd::last_error::mark(SD_ERROR_OUT_OF_MEMORY, "out of memory");
         return false;
     }
 
@@ -846,22 +853,24 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
             sd::last_error::mark(SD_ERROR_MODEL_FILE, "the model files could not be validated");
             return false;
         }
-        return sd::pipeline::generate_video(sd_ctx->sd, sd_vid_gen_params, frames_out, num_frames_out, audio_out, fps_out);
+        nlohmann::json info;
+        if (!sd::pipeline::generate_video(sd_ctx->sd, params, &result->frames, &result->frame_count,
+                                          &result->audio, &result->fps, &info)) {
+            return false;
+        }
+        result->generation_info = sd::copy_generation_info(info);
+        if (result->generation_info == nullptr) {
+            sd::last_error::mark(SD_ERROR_OUT_OF_MEMORY, "out of memory");
+            return false;
+        }
+        return true;
     });
     if (generated) {
+        *result_out = result;
         sd::last_error::clear();
         return true;
     }
-    if (frames_out != nullptr && *frames_out != nullptr) {
-        free_sd_images(*frames_out, num_frames_out != nullptr ? *num_frames_out : 0);
-        *frames_out = nullptr;
-        if (num_frames_out != nullptr)
-            *num_frames_out = 0;
-    }
-    if (audio_out != nullptr && *audio_out != nullptr) {
-        free_sd_audio(*audio_out);
-        *audio_out = nullptr;
-    }
+    free_sd_video_generation_result(result);
     if (sd_ctx->sd->get_cancel_flag() == SD_CANCEL_ALL) {
         sd::last_error::mark(SD_ERROR_CANCELLED, "the generation was cancelled");
     }
