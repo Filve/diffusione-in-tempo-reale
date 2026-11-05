@@ -1287,6 +1287,7 @@ curl -s -X POST "http://127.0.0.1:1234/sdcpp/v1/jobs/job_6acf9114_00000000/cance
   "id": "job_6acf9114_00000000",
   "kind": "img_gen",
   "status": "cancelled",
+  "cancel_requested": true,
   "created": 1775401200,
   "started": 1775401203,
   "completed": 1775401209,
