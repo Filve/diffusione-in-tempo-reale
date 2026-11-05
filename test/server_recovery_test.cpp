@@ -6,7 +6,8 @@
 //   cc -c thirdparty/zip.c -o zip.o
 //   c++ -std=c++17 -Iexamples -Iexamples/server -Iinclude -Ithirdparty -Isrc test/server_recovery_test.cpp
 //       examples/server/recovery.cpp examples/common/common.cpp examples/common/log.cpp
-//       examples/common/media_io.cpp examples/common/profile.cpp zip.o
+//       examples/common/media_io.cpp examples/common/media_metadata.cpp examples/common/generation_metadata.cpp
+//       examples/common/profile.cpp zip.o
 //       -Lbuild/bin -lstable-diffusion -Wl,-rpath,build/bin -pthread -o server_recovery_test
 // Run: ./server_recovery_test ; exit code 0 = all checks passed.
 #include <atomic>
@@ -65,6 +66,7 @@ struct Load {
     std::string backend;
     std::string params_backend;
     bool eager_load;
+    std::string model_path;
 
     Level level() const {
         if (backend == "cpu") {
@@ -87,6 +89,7 @@ struct Load {
 struct Env {
     std::vector<Load> loads;
     std::function<GenerationFailure(const Load&)> load_result;  // code NONE = the model loads
+    std::function<void(const Load&)> on_create;                 // runs when the keeper asks the library for a context
     GenerationFailure next_failure;                             // what the library reports for the attempt that failed
     Clock::time_point now = Clock::now();
     bool accelerator      = true;
@@ -103,8 +106,12 @@ struct Env {
                       params.batched_cfg,
                       params.backend != nullptr ? params.backend : "",
                       params.params_backend != nullptr ? params.params_backend : "",
-                      params.eager_load};
+                      params.eager_load,
+                      params.model_path != nullptr ? params.model_path : ""};
             loads.push_back(load);
+            if (on_create) {
+                on_create(load);
+            }
             const GenerationFailure result = load_result ? load_result(load) : ok_result;
             if (result.code != SD_ERROR_NONE) {
                 failure = result;
@@ -730,6 +737,154 @@ static void test_threads() {
     CHECK(counter(health, "step_downs") >= 1 && health["status"] == "degraded", "the steps down of one request serve the next ones");
 }
 
+// The model catalog of the server asks the keeper to replace the model, so that a model picked there is protected
+// like the one given on the command line.
+static void test_load_unload() {
+    SDContextParams other = base_params();
+    other.model_path      = "other.safetensors";
+
+    {
+        Env env;
+        ContextKeeper keeper(base_params(), Level::MAX, settings(), env.hooks());
+        GenerationFailure failure;
+        keeper.start(failure);
+
+        bool model_while_creating = true;
+        env.on_create             = [&](const Load&) { model_while_creating = keeper.has_model(); };
+        CHECK(keeper.load(other, failure) && keeper.has_model(), "load replaces the model");
+        CHECK(env.loads.size() == 2 && env.loads[1].model_path == "other.safetensors" && env.loads[1].level() == Level::MAX,
+              "with the one that was asked for, at the profile the server was started with");
+        CHECK(!model_while_creating, "the old context is freed before the new one is created");
+
+        Seen seen;
+        std::string ran_on;
+        CHECK(run_with(
+                  keeper, env, seen,
+                  [&](const ContextKeeper::ContextView& view) {
+                      ran_on = view.params != nullptr ? view.params->model_path : "";
+                      return ok_result;
+                  },
+                  failure),
+              "a request runs after the change");
+        CHECK(ran_on == "other.safetensors", "on the new model");
+    }
+    {
+        Env env;
+        ContextKeeper keeper(base_params(), Level::MAX, settings(), env.hooks());
+        GenerationFailure failure;
+        keeper.start(failure);
+        CHECK(keeper.describe_ladder() == "max > balanced > lite > lite-disk > lite-cpu", "the ladder of the first model");
+        SDContextParams explicit_set = base_params();
+        explicit_set.memory_guard    = 90;
+        explicit_set.clip_on_cpu     = true;
+        explicit_set.params_backend  = "disk";
+        CHECK(keeper.load(explicit_set, failure) && keeper.describe_ladder() == "max > lite > lite-cpu",
+              "the ladder is built again from the options of the new model");
+    }
+    {
+        Env env;
+        ContextKeeper keeper(base_params(), Level::MAX, settings(), env.hooks());
+        GenerationFailure failure;
+        keeper.start(failure);
+        keeper.load(other, failure);
+        Seen seen;
+        int attempts  = 0;
+        const bool ok = run_with(keeper, env, seen, [&](const ContextKeeper::ContextView&) { return ++attempts == 1 ? oom() : ok_result; }, failure);
+        CHECK(ok && seen.levels == std::vector<Level>({Level::MAX, Level::BALANCED}),
+              "a request on the new model that runs out of memory steps down like on the first one");
+        CHECK(env.loads.size() == 3 && env.loads[2].model_path == "other.safetensors", "and the lighter profile loads the same file");
+        CHECK(keeper.health_json()["status"] == "degraded", "the health reports the lighter profile");
+    }
+    {
+        Env env;
+        env.load_result = [](const Load& load) { return load.level() < Level::LITE ? oom() : ok_result; };
+        ContextKeeper keeper(base_params(), Level::MAX, settings(), env.hooks());
+        GenerationFailure failure;
+        keeper.start(failure);
+        CHECK(keeper.health_json()["profile"] == "lite", "the first model needed the lite profile");
+        env.load_result = nullptr;
+        CHECK(keeper.load(other, failure) && env.loads.back().level() == Level::MAX,
+              "the next model starts again from the profile the server was started with");
+        const json health = keeper.health_json();
+        CHECK(health["status"] == "ok" && health["profile"] == "max" && health["next_promotion_seconds"].is_null(),
+              "nothing is left of the step down of the previous model");
+    }
+    {
+        Env env;
+        ContextKeeper keeper(base_params(), Level::MAX, settings(), env.hooks());
+        GenerationFailure failure;
+        keeper.start(failure);
+        Seen served;
+        run_with(keeper, env, served, succeed, failure);
+
+        env.load_result        = [](const Load& load) { return load.model_path == "broken.safetensors" ? model_file_failure() : ok_result; };
+        SDContextParams broken = base_params();
+        broken.model_path      = "broken.safetensors";
+        CHECK(!keeper.load(broken, failure) && failure.code == SD_ERROR_MODEL_FILE, "a model that cannot be loaded is reported with its cause");
+        CHECK(!keeper.has_model() && keeper.status_name() == std::string("no_model"), "and no model is left loaded");
+        const size_t loads = env.loads.size();
+        Seen refused;
+        CHECK(!run_with(keeper, env, refused, succeed, failure) && failure.code == SD_ERROR_INVALID_ARGUMENT && refused.levels.empty(),
+              "requests are refused until a model is loaded");
+        CHECK(keeper.load(other, failure) && keeper.has_model() && env.loads.size() == loads + 1, "load can be called again after a failure");
+        const json health = keeper.health_json();
+        CHECK(counter(health, "requests") == 2 && counter(health, "succeeded") == 1 && counter(health, "failed") == 1,
+              "the counters are kept across the changes of model");
+    }
+    {
+        Env env;
+        ContextKeeper keeper(base_params(), Level::MAX, settings(), env.hooks());
+        GenerationFailure failure;
+        keeper.start(failure);
+        keeper.unload();
+        CHECK(!keeper.has_model() && keeper.status_name() == std::string("no_model") && keeper.health_json()["model_loaded"] == false,
+              "unload frees the model");
+        Seen seen;
+        CHECK(!run_with(keeper, env, seen, succeed, failure) && failure.code == SD_ERROR_INVALID_ARGUMENT && seen.levels.empty(),
+              "and requests are refused after it");
+        keeper.unload();
+        CHECK(!keeper.has_model(), "unloading twice is harmless");
+        CHECK(keeper.load(base_params(), failure) && keeper.has_model() && env.loads.size() == 2, "a model can be loaded again");
+    }
+    {
+        Env env;
+        ContextKeeper keeper(base_params(), Level::MAX, settings(), env.hooks());
+        GenerationFailure failure;
+        keeper.start(failure);
+
+        std::atomic<bool> done{false};
+        std::atomic<int> readings{0};
+        std::vector<std::thread> readers;
+        for (int t = 0; t < 3; t++) {
+            readers.emplace_back([&] {
+                while (!done) {
+                    const json health = keeper.health_json();
+                    (void)health["status"];
+                    (void)keeper.describe_ladder();
+                    (void)keeper.can_step_down();
+                    (void)keeper.status_name();
+                    (void)keeper.has_model();
+                    ++readings;
+                }
+            });
+        }
+        for (int i = 0; i < 150; i++) {
+            if (i % 3 == 0) {
+                keeper.unload();
+            } else {
+                keeper.load(i % 2 == 0 ? other : base_params(), failure);
+            }
+        }
+        done = true;
+        for (auto& reader : readers) {
+            reader.join();
+        }
+        CHECK(readings.load() > 0, "the health, the ladder and the status were read while the model changed");
+        CHECK(keeper.load(other, failure) && keeper.has_model() && keeper.describe_ladder() == "max > balanced > lite > lite-disk > lite-cpu",
+              "and the keeper still works after 150 changes");
+    }
+}
+
 static GenerationFailure cancelled_failure() {
     return failure_of(SD_ERROR_CANCELLED, "the generation was cancelled");
 }
@@ -1074,6 +1229,7 @@ int main() {
     test_reporting();
     test_backend_choice();
     test_threads();
+    test_load_unload();
     test_cancel();
     test_cancel_threads();
 

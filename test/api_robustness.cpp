@@ -124,11 +124,13 @@ int main() {
     CHECK(sd_get_last_error(message, sizeof(message)) == SD_ERROR_MODEL_FILE && strstr(message, "nonexistent") != nullptr,
           "a missing model is a model file error that names the file");
 
-    sd_image_t* images = (sd_image_t*)0x1;
-    int image_count    = 7;
-    CHECK(!generate_image(nullptr, nullptr, &images, &image_count) && images == nullptr && image_count == 0,
-          "generate_image(null) fails and clears the outputs");
+    sd_image_generation_result_t* result = (sd_image_generation_result_t*)0x1;
+    CHECK(!generate_image(nullptr, nullptr, &result) && result == nullptr,
+          "generate_image(null) fails and clears the result");
     CHECK(sd_get_last_error(message, sizeof(message)) == SD_ERROR_INVALID_ARGUMENT, "generate_image(null) is an invalid argument");
+    CHECK(!generate_image(nullptr, nullptr, nullptr) &&
+              sd_get_last_error(message, sizeof(message)) == SD_ERROR_INVALID_ARGUMENT,
+          "generate_image without a place for the result is an invalid argument");
 
     std::thread other([&] {
         CHECK(sd_get_last_error(nullptr, 0) == SD_ERROR_NONE, "the error state belongs to the thread that made the call");
